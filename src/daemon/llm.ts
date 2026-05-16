@@ -21,7 +21,7 @@ const GATEWAY_SYSTEM_PROMPT = `你是一个 AI 调度助手 (Hone Gateway)。
 回复用中文，简洁直接。`
 
 export interface GatewayLLMResponse {
-  action: 'reply' | 'dispatch' | 'schedule'
+  action: 'reply' | 'dispatch' | 'schedule' | 'browser'
   reply?: string
   task?: string
 }
@@ -53,6 +53,13 @@ export async function gatewayLLM(userMessage: string): Promise<GatewayLLMRespons
       /日程|定时|每天|每周|提醒|安排/.test(userMessage)
     ) {
       return { action: 'schedule', reply: text }
+    }
+
+    if (
+      text.includes('browser_action') || text.includes('browser_navigate') ||
+      /网页|浏览器|浏览|打开链接|发帖|发微博|发推|表单|自动填写|登录网站|post.*tweet|web.*task|navigate.*url|fill.*form/i.test(userMessage)
+    ) {
+      return { action: 'browser', task: userMessage }
     }
 
     return { action: 'reply', reply: text }

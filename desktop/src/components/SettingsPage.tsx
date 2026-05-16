@@ -4,7 +4,7 @@ import { type SettingsData, type SkillInfo, type McpInfo } from '../data/mock';
 import { type ThemeName } from '../hooks/useTheme';
 import { isTauri } from '../tauri/useTauri';
 
-type Section = 'provider' | 'gateway' | 'data' | 'skills' | 'mcp' | 'appearance' | 'about';
+type Section = 'provider' | 'gateway' | 'data' | 'skills' | 'mcp' | 'browser' | 'appearance' | 'about';
 
 const navItems: { key: Section; zh: string; en: string }[] = [
   { key: 'provider', zh: '提供方', en: 'Provider' },
@@ -12,6 +12,7 @@ const navItems: { key: Section; zh: string; en: string }[] = [
   { key: 'data', zh: '数据', en: 'Data' },
   { key: 'skills', zh: '技能', en: 'Skills' },
   { key: 'mcp', zh: 'MCP', en: 'MCP Servers' },
+  { key: 'browser', zh: '浏览器', en: 'Browser' },
   { key: 'appearance', zh: '外观', en: 'Appearance' },
   { key: 'about', zh: '关于', en: 'About' },
 ];
@@ -45,6 +46,10 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
   const [autoStart, setAutoStart] = useState(settings.gatewayAutoStart ?? false);
   const [workspace, setWorkspace] = useState(settings.workspaceDir ?? '');
   const [logRetention, setLogRetention] = useState(settings.logRetention ?? '30');
+  const [browserEnabled, setBrowserEnabled] = useState(settings.browserEnabled ?? false);
+  const [guiModelUrl, setGuiModelUrl] = useState(settings.guiModelUrl ?? '');
+  const [browserHeadless, setBrowserHeadless] = useState(settings.browserHeadless ?? true);
+  const [browserMaxSteps, setBrowserMaxSteps] = useState(settings.browserMaxSteps ?? '15');
   const [showDanger, setShowDanger] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [skills, setSkills] = useState<SkillInfo[]>(() => {
@@ -98,11 +103,15 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
         localPort,
         workspaceDir: workspace,
         logRetention,
+        browserEnabled,
+        guiModelUrl,
+        browserHeadless,
+        browserMaxSteps,
       });
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     }, 600);
-  }, [provider, apiKeyDraft, model, autoStart, relayUrl, localPort, workspace, logRetention, setSettings]);
+  }, [provider, apiKeyDraft, model, autoStart, relayUrl, localPort, workspace, logRetention, browserEnabled, guiModelUrl, browserHeadless, browserMaxSteps, setSettings]);
 
   useEffect(() => { autoSave(); }, [autoSave]);
 
@@ -147,6 +156,10 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
       localPort: '18789',
       workspaceDir: '',
       logRetention: '30',
+      browserEnabled: false,
+      guiModelUrl: '',
+      browserHeadless: true,
+      browserMaxSteps: '15',
     });
     setApiKeyDraft('');
     setRelayUrl('');
@@ -156,6 +169,10 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
     setProvider('DeepSeek');
     setLogRetention('30');
     setAutoStart(false);
+    setBrowserEnabled(false);
+    setGuiModelUrl('');
+    setBrowserHeadless(true);
+    setBrowserMaxSteps('15');
     setSkills([]);
     setMcps([]);
     try { localStorage.removeItem('hone-skills'); } catch {}
@@ -572,6 +589,55 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
     </div>
   );
 
+  const renderBrowser = () => (
+    <div style={s.section}>
+      <h2 style={s.title}>{t('浏览器自动化', 'Browser Automation')}</h2>
+      <p style={s.desc}>{t('配置浏览器代理和 GUI 视觉模型，让 Hone Gateway 24/7 自动完成网页任务。', 'Configure the browser agent and GUI vision model for autonomous web tasks.')}</p>
+
+      <div style={s.row}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13, fontWeight: 500 }}>{t('启用浏览器代理', 'Enable Browser Agent')}</div>
+          <div style={{ fontSize: 12, color: 'var(--hone-muted)' }}>{t('需要先安装 Playwright。在项目目录运行 npm install playwright。', 'Requires Playwright. Run npm install playwright in the project directory.')}</div>
+        </div>
+        <div style={s.toggleTrack(browserEnabled)} onClick={() => setBrowserEnabled(!browserEnabled)}>
+          <div style={s.toggleThumb(browserEnabled)} />
+        </div>
+      </div>
+
+      <label style={s.label}>{t('GUI 模型 URL', 'GUI Model URL')}</label>
+      <input
+        style={{ ...s.input, marginBottom: 16 }}
+        value={guiModelUrl}
+        onChange={(e) => setGuiModelUrl(e.target.value)}
+        placeholder="http://localhost:8000/v1/chat/completions"
+      />
+      <p style={{ fontSize: 12, color: 'var(--hone-muted)', marginTop: -12, marginBottom: 16 }}>
+        {t('OpenAI 兼容的视觉模型 API。留空使用 DOM 降级模式（仅文本）。', 'OpenAI-compatible vision model API. Leave empty for DOM fallback (text-only).')}
+      </p>
+
+      <div style={{ ...s.row, marginBottom: 8 }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13, fontWeight: 500 }}>{t('无头模式', 'Headless Mode')}</div>
+          <div style={{ fontSize: 12, color: 'var(--hone-muted)' }}>{t('浏览器在后台运行，不显示窗口。', 'Run browser in the background without a visible window.')}</div>
+        </div>
+        <div style={s.toggleTrack(browserHeadless)} onClick={() => setBrowserHeadless(!browserHeadless)}>
+          <div style={s.toggleThumb(browserHeadless)} />
+        </div>
+      </div>
+
+      <label style={s.label}>{t('最大步数', 'Max Steps')}</label>
+      <select
+        style={{ ...s.select, marginBottom: 16, width: 120 }}
+        value={browserMaxSteps}
+        onChange={(e) => setBrowserMaxSteps(e.target.value)}
+      >
+        {['5', '10', '15', '20', '30'].map(n => (
+          <option key={n} value={n}>{n}</option>
+        ))}
+      </select>
+    </div>
+  );
+
   const renderContent = () => {
     switch (section) {
       case 'provider': return renderProvider();
@@ -579,6 +645,7 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
       case 'data': return renderData();
       case 'skills': return renderSkills();
       case 'mcp': return renderMcp();
+      case 'browser': return renderBrowser();
       case 'appearance': return renderAppearance();
       case 'about': return renderAbout();
     }

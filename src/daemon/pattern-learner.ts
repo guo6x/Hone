@@ -22,7 +22,7 @@ import * as path from 'path'
 
 export interface ActivityLogEntry {
   ts: number
-  type: 'cli_session' | 'gateway_event' | 'schedule_trigger' | 'tool_call'
+  type: 'cli_session' | 'gateway_event' | 'schedule_trigger' | 'tool_call' | 'web_task'
   detail: string
   project?: string
   duration?: number

@@ -61,6 +61,10 @@ export interface SettingsData {
   localPort: string;
   workspaceDir: string;
   logRetention: string;
+  browserEnabled: boolean;
+  guiModelUrl: string;
+  browserHeadless: boolean;
+  browserMaxSteps: string;
 }
 
 export interface GatewayMessage {

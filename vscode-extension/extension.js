@@ -9,7 +9,7 @@
  */
 
 const vscode = require('vscode');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
 
 // ── Activation ──
 
@@ -160,7 +160,7 @@ function getWorkspaceRoot(): string | undefined {
 function handleGatewayStatus(channel) {
   const cli = getHoneCli();
   const cwd = getWorkspaceRoot();
-  exec(`${cli} gateway status`, { timeout: 5000, cwd }, (error, stdout, stderr) => {
+  execFile(cli, ['gateway', 'status'], { timeout: 5000, cwd }, (error, stdout, stderr) => {
     if (error) {
       vscode.window.showWarningMessage(`Hone Gateway 未运行。运行 ${cli} gateway start 启动。`);
     } else {
@@ -177,9 +177,9 @@ function handleGatewayStatus(channel) {
  * Send a prompt to Hone CLI and show result in output channel.
  */
 async function sendToHone(prompt, channel) {
-  const escaped = prompt.replace(/"/g, '\\"');
   const cli = getHoneCli();
-  const cmd = `${cli} -p "${escaped}" --god-mode`;
+  // Use execFile to avoid shell injection — prompt passed as argument
+  const args = ['-p', prompt, '--god-mode'];
 
   vscode.window.withProgress(
     {
@@ -190,7 +190,7 @@ async function sendToHone(prompt, channel) {
     async () => {
       return new Promise((resolve) => {
         const cwd = getWorkspaceRoot();
-        exec(cmd, { maxBuffer: 10 * 1024 * 1024, timeout: 120000, cwd }, (error, stdout, stderr) => {
+        execFile(cli, args, { maxBuffer: 10 * 1024 * 1024, timeout: 120000, cwd }, (error, stdout, stderr) => {
           if (error && !stdout) {
             channel.appendLine(`[Hone] 错误: ${error.message}`);
             vscode.window.showErrorMessage(`Hone 执行失败: ${error.message}`);

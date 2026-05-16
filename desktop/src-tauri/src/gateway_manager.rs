@@ -88,7 +88,26 @@ pub struct GatewayConfig {
     /// Model name to use (e.g. "deepseek-v3", "gpt-4o")
     #[serde(default)]
     pub model: String,
+
+    /// Enable browser automation agent
+    #[serde(default)]
+    pub browser_enabled: bool,
+
+    /// GUI vision model API URL (OpenAI-compatible)
+    #[serde(default)]
+    pub gui_model_url: String,
+
+    /// Run browser in headless mode
+    #[serde(default = "default_true")]
+    pub browser_headless: bool,
+
+    /// Max browser agent steps per task
+    #[serde(default = "default_max_steps")]
+    pub browser_max_steps: u32,
 }
+
+fn default_true() -> bool { true }
+fn default_max_steps() -> u32 { 15 }
 
 fn default_relay_url() -> String {
     "wss://hone-relay.marsailleippi79.workers.dev/connect/default".to_string()
@@ -109,6 +128,10 @@ impl Default for GatewayConfig {
             provider: String::new(),
             api_key: String::new(),
             model: String::new(),
+            browser_enabled: false,
+            gui_model_url: String::new(),
+            browser_headless: true,
+            browser_max_steps: 15,
         }
     }
 }
@@ -208,6 +231,20 @@ impl GatewayManager {
         if !self.config.model.is_empty() {
             cmd.env("HONE_MODEL", &self.config.model);
         }
+        // Browser automation env vars
+        if self.config.browser_enabled {
+            cmd.env("HONE_BROWSER_ENABLED", "true");
+        }
+        if !self.config.gui_model_url.is_empty() {
+            cmd.env("HONE_GUI_MODEL_URL", &self.config.gui_model_url);
+        }
+        if !self.config.browser_headless {
+            cmd.env("HONE_BROWSER_HEADLESS", "false");
+        }
+        cmd.env(
+            "HONE_BROWSER_MAX_STEPS",
+            self.config.browser_max_steps.to_string(),
+        );
         windows_git_bash::apply_to_command(&mut cmd);
 
         // Set the platform machine-name env var.

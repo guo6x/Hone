@@ -16,6 +16,8 @@ import { getGatewayTools } from './tools.js'
 import { createScheduler, stopScheduler, loadSchedules, saveSchedules } from './scheduler.js'
 import { gatewayLLM } from './llm.js'
 import { getPatternSuggestions, type ActivityLogEntry } from './pattern-learner.js'
+import { createBrowserAgent, type ConfirmCallback, type StepCallback } from './browser/agent.js'
+import type { BrowserAgent } from './browser/types.js'
 
 const HEARTBEAT_INTERVAL_MS = 30_000
 const RECONNECT_DELAY_MS = 2000
@@ -37,12 +39,15 @@ export interface GatewayState {
   connected: boolean
   schedules: Map<string, ScheduleEntry>
   clients: Map<string, ClientInfo>
+  pendingConfirmations: Map<string, { description: string; resolve: (approved: boolean) => void }>
+  pendingConfirmations: Map<string, { description: string; resolve: (approved: boolean) => void }>
   pendingPairings: Map<string, { clientId: string; code: string; resolve: (approved: boolean) => void }>
   reconnectAttempts: number
   heartbeatTimer: ReturnType<typeof setInterval> | null
   schedulerState: ReturnType<typeof createScheduler> | null
   patternTimer: ReturnType<typeof setInterval> | null
   running: boolean
+  browserAgent: BrowserAgent | null
 }
 
 interface ClientInfo {
@@ -57,6 +62,28 @@ function log(config: GatewayConfig, msg: string): void {
   }
 }
 
+// Audit logging: write web_task events to ~/.hone/logs/YYYY-MM-DD.json
+async function logActivity(type: ActivityLogEntry['type'], detail: string): Promise<void> {
+  try {
+    const { writeFile, mkdir, readFile } = await import('fs/promises')
+    const { join } = await import('path')
+    const home = process.env.HOME || process.env.USERPROFILE || '~'
+    const logDir = join(home, '.hone', 'logs')
+    await mkdir(logDir, { recursive: true })
+
+    const today = new Date().toISOString().slice(0, 10)
+    const logFile = join(logDir, `${today}.json`)
+
+    let entries: ActivityLogEntry[] = []
+    try {
+      entries = JSON.parse(await readFile(logFile, 'utf-8'))
+    } catch {}
+
+    entries.push({ ts: Date.now(), type, detail })
+    await writeFile(logFile, JSON.stringify(entries))
+  } catch {}
+}
+
 function sendJSON(ws: WebSocket, data: unknown): void {
   if (ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify(data))
@@ -67,6 +94,7 @@ function createGatewayContext(state: GatewayState): GatewayContext {
   return {
     schedules: state.schedules,
     pendingPairings: state.pendingPairings,
+    browserAgent: state.browserAgent,
     persistSchedules: () => saveSchedules(state.schedules),
     dispatchTask: async (task: string) => {
       // Dispatch to CLI: send a message via relay that triggers local CLI execution
@@ -84,15 +112,14 @@ function createGatewayContext(state: GatewayState): GatewayContext {
       })
 
       try {
-        const { exec } = await import('child_process')
+        const { execFile } = await import('child_process')
         const { promisify } = await import('util')
-        const execAsync = promisify(exec)
-        
+        const execFileAsync = promisify(execFile)
+
         const nodePath = process.execPath
         const cliScript = process.argv[1]
-        const safeTask = task.replace(/"/g, '\\"')
-        
-        const { stdout, stderr } = await execAsync(`"${nodePath}" "${cliScript}" -p "${safeTask}"`)
+
+        const { stdout, stderr } = await execFileAsync(nodePath, [cliScript, '-p', task])
         return stdout || stderr || '执行完毕'
       } catch (err: any) {
         return `CLI 任务执行失败: ${err.message || err}`
@@ -119,12 +146,55 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
     connected: false,
     schedules: loadSchedules(),
     clients: new Map(),
+    pendingConfirmations: new Map(),
     pendingPairings: new Map(),
     reconnectAttempts: 0,
     heartbeatTimer: null,
     schedulerState: null,
     patternTimer: null,
     running: true,
+    browserAgent: null, // set below after callbacks are created
+  }
+
+  // Initialize browser agent (null if HONE_BROWSER_ENABLED !== 'true')
+  const onConfirm: ConfirmCallback = async (taskId, description) => {
+    return new Promise((resolve) => {
+      state.pendingConfirmations.set(taskId, { description, resolve })
+      broadcast(state, {
+        type: 'browser_confirm_required',
+        taskId,
+        description,
+        ts: new Date().toISOString(),
+      })
+      setTimeout(() => {
+        if (state.pendingConfirmations.has(taskId)) {
+          state.pendingConfirmations.delete(taskId)
+          resolve(false)
+        }
+      }, 60_000)
+    })
+  }
+  const onStep: StepCallback = (_taskId, step) => {
+    // Steps are broadcast via the relay
+  }
+  const llmCall: import('./browser/agent.js').LLMCallback = async (prompt) => {
+    const provider = getProvider()
+    const resp = await provider.createMessage({
+      model: process.env.HONE_MODEL || 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: prompt }],
+      maxTokens: 512,
+      temperature: 0.1,
+    })
+    const content = resp.content
+    if (typeof content === 'string') return content
+    if (Array.isArray(content)) return content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+    return JSON.stringify(content)
+  }
+  const browserAgent = createBrowserAgent(onConfirm, onStep, llmCall)
+  state.browserAgent = browserAgent
+
+  if (browserAgent) {
+    console.error(`[Gateway] 浏览器代理已启用 (GUI model: ${process.env.HONE_GUI_MODEL_URL || 'DOM 降级模式'})`)
   }
 
   const gatewayCtx = createGatewayContext(state)
@@ -134,11 +204,40 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
   state.schedulerState = createScheduler(state.schedules, gatewayCtx, async (entry: ScheduleEntry) => {
     log(config, `Schedule triggered: ${entry.text}`)
     try {
-      const intent = await gatewayLLM(`执行日程任务: ${entry.task}`)
-      let finalResult = intent.reply || '已执行'
-      
-      if (intent.action === 'dispatch') {
-        finalResult = await gatewayCtx.dispatchTask(intent.task || entry.task)
+      let finalResult: string
+
+      // Route web: prefixed tasks to browser agent
+      if (entry.task.startsWith('web:') && state.browserAgent) {
+        const webTask = entry.task.slice(4).trim()
+        const result = await state.browserAgent.executeTask({
+          id: `web_${entry.id}`,
+          profileName: 'default',
+          task: webTask,
+          riskLevel: 'low',
+        })
+        logActivity('web_task', `${result.status}: ${webTask.slice(0, 80)}`)
+        finalResult = result.status === 'success'
+          ? `浏览器任务完成: ${result.finalUrl || ''} (${result.steps.length} 步)`
+          : `浏览器任务失败: ${result.error || result.status}`
+      } else if (entry.task.startsWith('web:') && !state.browserAgent) {
+        finalResult = '浏览器代理未启用，无法执行网页任务'
+      } else {
+        const intent = await gatewayLLM(`执行日程任务: ${entry.task}`)
+        finalResult = intent.reply || '已执行'
+
+        if (intent.action === 'dispatch') {
+          finalResult = await gatewayCtx.dispatchTask(intent.task || entry.task)
+        } else if (intent.action === 'browser' && state.browserAgent) {
+          const result = await state.browserAgent.executeTask({
+            id: `browser_${entry.id}`,
+            profileName: 'default',
+            task: intent.task || entry.task,
+            riskLevel: 'low',
+          })
+          finalResult = result.status === 'success'
+            ? `浏览器任务完成: ${result.finalUrl || ''}`
+            : `浏览器任务失败: ${result.error || result.status}`
+        }
       }
 
       broadcast(state, {
@@ -352,6 +451,52 @@ async function handleMessage(
             })
             break
           }
+          case 'browser': {
+            if (!state.browserAgent) {
+              sendJSON(state.ws!, {
+                type: 'message',
+                target: 'client',
+                clientId: replyClientId,
+                payload: { text: '浏览器代理未启用。请在设置中启用 HONE_BROWSER_ENABLED=true' },
+                ts: new Date().toISOString(),
+              })
+              break
+            }
+            sendJSON(state.ws!, {
+              type: 'browser_task_started',
+              task: intent.task || text,
+              ts: new Date().toISOString(),
+            })
+
+            // Execute browser task (non-blocking — result sent via relay)
+            const browserTask = intent.task || text
+            state.browserAgent.executeTask({
+              id: `browser_${Date.now()}`,
+              profileName: 'default',
+              task: browserTask,
+              riskLevel: 'low',
+            }).then(result => {
+              logActivity('web_task', `${result.status}: ${browserTask.slice(0, 80)}`)
+              sendJSON(state.ws!, {
+                type: 'browser_task_result',
+                taskId: result.taskId,
+                status: result.status,
+                finalUrl: result.finalUrl,
+                steps: result.steps.length,
+                durationMs: result.durationMs,
+                error: result.error,
+                ts: new Date().toISOString(),
+              })
+            }).catch(err => {
+              sendJSON(state.ws!, {
+                type: 'browser_task_result',
+                status: 'failed',
+                error: err.message || String(err),
+                ts: new Date().toISOString(),
+              })
+            })
+            break
+          }
         }
       } catch (err) {
         sendJSON(state.ws!, {
@@ -426,9 +571,22 @@ async function handleMessage(
       break
     }
 
+    case 'browser_confirm': {
+      // User confirmed/denied a high-risk browser action from the UI
+      const pending = state.pendingConfirmations.get(msg.taskId)
+      if (pending) {
+        state.pendingConfirmations.delete(msg.taskId)
+        pending.resolve(!!msg.approved)
+        log(config, `Browser confirm: ${msg.taskId} approved=${msg.approved}`)
+      }
+      break
+    }
+
     case 'schedule_created':
     case 'task_dispatched':
-    case 'notification': {
+    case 'notification':
+    case 'browser_task_started':
+    case 'browser_task_result': {
       // Internal messages, already handled
       break
     }
@@ -449,6 +607,9 @@ export async function stopGateway(state: GatewayState): Promise<void> {
   }
   if (state.schedulerState) {
     stopScheduler(state.schedulerState)
+  }
+  if (state.browserAgent) {
+    await state.browserAgent.shutdown()
   }
   if (state.ws) {
     state.ws.close()

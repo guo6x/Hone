@@ -163,6 +163,7 @@ export interface Translations {
   gwMsg1: string;
   gwMsg2: string;
   gwMsg3: string;
+  gwConnected: string;
 
   // Device Pairing
   pairTitle: string;
@@ -196,6 +197,38 @@ export interface Translations {
   mcpError: string;
   mcpConfigLabel: string;
   mcpToolsLabel: string;
+
+  // Browser
+  tabWebtask: string;
+  browserSettings: string;
+  browserSettingsTitle: string;
+  browserSettingsDesc: string;
+  browserEnabledLabel: string;
+  browserEnabledDesc: string;
+  browserGuiModelLabel: string;
+  browserGuiModelDesc: string;
+  browserHeadlessLabel: string;
+  browserHeadlessDesc: string;
+  browserMaxStepsLabel: string;
+  browserMaxStepsDesc: string;
+  webtaskTitle: string;
+  webtaskDesc: string;
+  webtaskInput: string;
+  webtaskUrl: string;
+  webtaskSubmit: string;
+  webtaskSubmitting: string;
+  webtaskLowRisk: string;
+  webtaskMediumRisk: string;
+  webtaskHighRisk: string;
+  webtaskStep: string;
+  webtaskSteps: string;
+  webtaskSuccess: string;
+  webtaskFailed: string;
+  webtaskTimeout: string;
+  webtaskCancelled: string;
+  webtaskEmpty: string;
+  webtaskEmptyDesc: string;
+  webtaskPlaceholder: string;
 }
 
 const zh: Translations = {
@@ -344,6 +377,7 @@ const zh: Translations = {
   gwMsg1: '今天早上 9:00 的代码审查已自动完成，3 个 PR 通过审查，0 个需要修改。',
   gwMsg2: '需要我帮你把这周的所有 PR 汇总成 changelog 吗？',
   gwMsg3: 'Server-DEV 的 token 用量接近上限（80%），建议调整 maxTokens 或升级计划。',
+  gwConnected: '已连接到中继，Gateway 就绪。有什么需要我帮你做的？',
   pairTitle: '连接 CLI 实例',
   pairDesc: '通过本地网络、SSH 或 Cloudflare Tunnel 连接运行 Hone Agent 的机器。',
   pairLocal: '本地网络',
@@ -373,6 +407,37 @@ const zh: Translations = {
   mcpError: '连接失败',
   mcpConfigLabel: '配置',
   mcpToolsLabel: '工具数',
+  // Browser
+  tabWebtask: '网页任务',
+  browserSettings: '浏览器',
+  browserSettingsTitle: '浏览器自动化',
+  browserSettingsDesc: '配置 Playwright 浏览器和 GUI 视觉模型，让 Hone 自动完成网页操作。',
+  browserEnabledLabel: '启用浏览器代理',
+  browserEnabledDesc: '开启后 Hone Gateway 可执行网页自动化任务。需要安装 Playwright。',
+  browserGuiModelLabel: 'GUI 模型 URL',
+  browserGuiModelDesc: '视觉模型 API 端点（OpenAI 兼容），留空则使用 DOM 降级模式。',
+  browserHeadlessLabel: '无头模式',
+  browserHeadlessDesc: '浏览器在后台运行，不显示窗口。关闭可观察自动操作过程。',
+  browserMaxStepsLabel: '最大步数',
+  browserMaxStepsDesc: '每个任务最多执行的浏览器操作步数。',
+  webtaskTitle: '网页任务',
+  webtaskDesc: '用自然语言描述网页操作，Hone 自动用浏览器完成。',
+  webtaskInput: '描述你要做的网页操作…',
+  webtaskUrl: '起始网址（可选）',
+  webtaskSubmit: '执行',
+  webtaskSubmitting: '执行中…',
+  webtaskLowRisk: '低风险',
+  webtaskMediumRisk: '中风险',
+  webtaskHighRisk: '高风险',
+  webtaskStep: '步',
+  webtaskSteps: '步',
+  webtaskSuccess: '任务完成',
+  webtaskFailed: '任务失败',
+  webtaskTimeout: '超时',
+  webtaskCancelled: '已取消',
+  webtaskEmpty: '还没有执行过网页任务',
+  webtaskEmptyDesc: '让 Hone 自动打开网页、填写表单、发布内容。输入自然语言任务描述即可开始。',
+  webtaskPlaceholder: '说说你想让 Hone 在网页上做什么…',
 };
 
 const en: Translations = {
@@ -521,6 +586,7 @@ const en: Translations = {
   gwMsg1: "Today's 9:00 AM code review completed automatically — 3 PRs passed, 0 need changes.",
   gwMsg2: 'Would you like me to compile all this week\'s PRs into a changelog?',
   gwMsg3: 'Server-DEV token usage is approaching the limit (80%), consider adjusting maxTokens or upgrading your plan.',
+  gwConnected: 'Connected to relay, Gateway is ready. What can I do for you?',
   pairTitle: 'Connect CLI Instance',
   pairDesc: 'Connect a machine running Hone Agent via local network, SSH, or Cloudflare Tunnel.',
   pairLocal: 'Local Network',
@@ -550,6 +616,37 @@ const en: Translations = {
   mcpError: 'Connection Error',
   mcpConfigLabel: 'Config',
   mcpToolsLabel: 'Tools',
+  // Browser
+  tabWebtask: 'Web Tasks',
+  browserSettings: 'Browser',
+  browserSettingsTitle: 'Browser Automation',
+  browserSettingsDesc: 'Configure Playwright browser and GUI vision model for autonomous web tasks.',
+  browserEnabledLabel: 'Enable Browser Agent',
+  browserEnabledDesc: 'When enabled, Hone Gateway can execute web automation tasks. Requires Playwright.',
+  browserGuiModelLabel: 'GUI Model URL',
+  browserGuiModelDesc: 'Vision model API endpoint (OpenAI-compatible). Leave empty for DOM fallback mode.',
+  browserHeadlessLabel: 'Headless Mode',
+  browserHeadlessDesc: 'Run browser in background. Disable to watch automation in action.',
+  browserMaxStepsLabel: 'Max Steps',
+  browserMaxStepsDesc: 'Maximum browser actions per task.',
+  webtaskTitle: 'Web Tasks',
+  webtaskDesc: 'Describe a web task in natural language. Hone will execute it autonomously.',
+  webtaskInput: 'Describe what to do on the web…',
+  webtaskUrl: 'Starting URL (optional)',
+  webtaskSubmit: 'Run',
+  webtaskSubmitting: 'Running…',
+  webtaskLowRisk: 'Low Risk',
+  webtaskMediumRisk: 'Medium Risk',
+  webtaskHighRisk: 'High Risk',
+  webtaskStep: 'step',
+  webtaskSteps: 'steps',
+  webtaskSuccess: 'Task completed',
+  webtaskFailed: 'Task failed',
+  webtaskTimeout: 'Timed out',
+  webtaskCancelled: 'Cancelled',
+  webtaskEmpty: 'No web tasks run yet',
+  webtaskEmptyDesc: 'Let Hone browse the web, fill forms, and post content. Describe what you need in natural language.',
+  webtaskPlaceholder: 'Tell Hone what to do on the web…',
 };
 
 export const LANG: Record<Lang, Translations> = { zh, en };

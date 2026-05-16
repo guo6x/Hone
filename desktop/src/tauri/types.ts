@@ -11,6 +11,10 @@ export interface GatewayConfig {
   api_key?: string;
   model?: string;
   data_dir?: string;
+  browser_enabled?: boolean;
+  gui_model_url?: string;
+  browser_headless?: boolean;
+  browser_max_steps?: number;
 }
 
 export type GatewayStatus =

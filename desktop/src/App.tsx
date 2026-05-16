@@ -6,10 +6,11 @@ import Dashboard from './components/Dashboard';
 import GatewayChat from './components/GatewayChat';
 import ScheduleManager from './components/ScheduleManager';
 import CanvasViewer from './components/CanvasViewer';
+import WebTaskRunner from './components/WebTaskRunner';
 import { SettingsPage } from './components/SettingsPage';
 import StatusBar from './components/StatusBar';
 import { DevicePairingModal } from './components/DevicePairingModal';
-import { useMachines, useDiscovery, useSchedules, isTauri, useTauriConfig } from './tauri/useTauri';
+import { useMachines, useDiscovery, useSchedules, isTauri, useTauriConfig, useGateway } from './tauri/useTauri';
 import type { DiscoveredGateway } from './tauri/types';
 import {
   type MachineInfo,
@@ -19,7 +20,7 @@ import {
   type SettingsData,
 } from './data/mock';
 
-type ViewName = 'dashboard' | 'gateway' | 'schedule' | 'canvas' | 'settings';
+type ViewName = 'dashboard' | 'gateway' | 'schedule' | 'canvas' | 'webtask' | 'settings';
 type PageState = 'loaded' | 'loading' | 'error';
 
 export default function App() {
@@ -30,6 +31,15 @@ export default function App() {
   // Tauri IPC hooks (falls back to mock when not in Tauri)
   const { machines, addMachine, removeMachine } = useMachines();
   const { gateways: discoveredGateways, scanning, scan } = useDiscovery();
+  const { start: ipcGatewayStart } = useGateway();
+
+  // Auto-start Gateway daemon on app launch
+  useEffect(() => {
+    const autoStart = settings.gatewayAutoStart;
+    if (autoStart && isTauri()) {
+      ipcGatewayStart(settings.workspaceDir || 'hone', settings.relayUrl);
+    }
+  }, []); // only on mount
 
   // Dashboard state
   const [activeMachine, setActiveMachine] = useState<string | null>(null);
@@ -59,7 +69,7 @@ export default function App() {
   const GATEWAY_DEFAULTS = {
     relayUrl: 'wss://hone-relay.marsailleippi79.workers.dev/connect/default',
     localPort: '18789',
-    gatewayAutoStart: false,
+    gatewayAutoStart: true,
   } as const;
 
   const { config: tauriConfig, save: saveTauriConfig } = useTauriConfig();
@@ -72,17 +82,25 @@ export default function App() {
       ...GATEWAY_DEFAULTS,
       workspaceDir: '',
       logRetention: '30',
+      browserEnabled: false,
+      guiModelUrl: '',
+      browserHeadless: true,
+      browserMaxSteps: '15',
     };
     // Load extra fields from localStorage (never GatewayConfig fields)
     try {
       const saved = localStorage.getItem('hone-settings-extra');
       if (saved) {
-        const { provider, apiKey, model, workspaceDir, logRetention } = JSON.parse(saved);
+        const { provider, apiKey, model, workspaceDir, logRetention, browserEnabled, guiModelUrl, browserHeadless, browserMaxSteps } = JSON.parse(saved);
         if (provider) defaults.provider = provider;
         if (apiKey) defaults.apiKey = apiKey;
         if (model) defaults.model = model;
         if (workspaceDir) defaults.workspaceDir = workspaceDir;
         if (logRetention) defaults.logRetention = logRetention;
+        if (browserEnabled !== undefined) defaults.browserEnabled = browserEnabled;
+        if (guiModelUrl !== undefined) defaults.guiModelUrl = guiModelUrl;
+        if (browserHeadless !== undefined) defaults.browserHeadless = browserHeadless;
+        if (browserMaxSteps !== undefined) defaults.browserMaxSteps = browserMaxSteps;
       }
     } catch {}
     return defaults;
@@ -112,6 +130,10 @@ export default function App() {
         model: next.model,
         workspaceDir: next.workspaceDir,
         logRetention: next.logRetention,
+        browserEnabled: next.browserEnabled,
+        guiModelUrl: next.guiModelUrl,
+        browserHeadless: next.browserHeadless,
+        browserMaxSteps: next.browserMaxSteps,
       }));
     } catch {}
     // Tauri (all fields including provider settings)
@@ -124,6 +146,10 @@ export default function App() {
         provider: next.provider,
         api_key: next.apiKey,
         model: next.model,
+        browser_enabled: next.browserEnabled,
+        gui_model_url: next.guiModelUrl,
+        browser_headless: next.browserHeadless,
+        browser_max_steps: parseInt(next.browserMaxSteps, 10) || 15,
       }, next.workspaceDir || '');
     }
   }, [saveTauriConfig, tauriConfig]);
@@ -190,7 +216,7 @@ export default function App() {
 
         <div style={styles.main}>
           <div style={styles.viewTabs}>
-            {(['dashboard', 'gateway', 'schedule', 'canvas', 'settings'] as ViewName[]).map(v => (
+            {(['dashboard', 'gateway', 'schedule', 'canvas', 'webtask', 'settings'] as ViewName[]).map(v => (
               <button
                 key={v}
                 style={styles.viewTab(activeView === v)}
@@ -266,6 +292,13 @@ export default function App() {
             <CanvasViewer
               lang={lang}
               sessions={[]}
+            />
+          )}
+
+          {activeView === 'webtask' && (
+            <WebTaskRunner
+              lang={lang}
+              relayUrl={settings.relayUrl}
             />
           )}
 

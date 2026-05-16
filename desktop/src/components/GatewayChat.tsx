@@ -18,7 +18,7 @@ const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl }) => 
   const t = LANG[lang];
   const { start: ipcStart, stop: ipcStop } = useGateway();
   const [status, setStatus] = useState<GatewayStatus>({
-    status: 'offline',
+    status: 'starting',
     uptime: '—',
     version: '—',
   });
@@ -31,6 +31,14 @@ const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl }) => 
   const wsRef = useRef<WebSocket | null>(null);
   const clientIdRef = useRef<string>('');
   const registeredRef = useRef(false);
+
+  // Auto-start: trigger WebSocket connect on mount
+  // (Gateway daemon is started by App.tsx — here we just connect)
+  useEffect(() => {
+    intentionalStopRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    setStatus({ status: 'starting', uptime: '—', version: '—' });
+  }, []); // only on mount
 
   // Auto-reconnect state
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -125,8 +133,8 @@ const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl }) => 
             setStatus((prev) => ({ ...prev, status: 'online', uptime: '0d 0h 0m' }));
             if (messages.length === 0) {
               setMessages([
-                { id: 'gw1', from: 'gateway', text: t.gwWelcome, time: now },
-                { id: 'gw2', from: 'gateway', text: t.gwMsg1, time: formatTime() },
+                { id: 'gw1', from: 'system', text: t.gwWelcome, time: now },
+                { id: 'gw2', from: 'system', text: t.gwConnected, time: formatTime() },
               ]);
             }
             break;

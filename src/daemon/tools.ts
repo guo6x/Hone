@@ -7,6 +7,7 @@ import { getMemoryTool } from '../memory/auto-memory.js'
 import { getSkillCreateTool } from '../skills/skill_create.js'
 import type { PersistedSchedule } from './scheduler.js'
 import { saveSchedules } from './scheduler.js'
+import type { BrowserAgent } from './browser/types.js'
 
 export interface ScheduleEntry {
   id: string
@@ -29,6 +30,7 @@ export interface GatewayContext {
   dispatchTask(task: string): Promise<string>
   sendNotification(msg: string): void
   persistSchedules(): void
+  browserAgent: BrowserAgent | null
 }
 
 export function getGatewayTools(ctx: GatewayContext): Tool[] {
@@ -166,5 +168,94 @@ export function getGatewayTools(ctx: GatewayContext): Tool[] {
     },
     getMemoryTool(),
     getSkillCreateTool(),
+    {
+      name: 'browser_navigate',
+      description: 'Navigate the browser to a URL. Opens the page in a persistent browser profile.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Full URL to navigate to' },
+          profile: { type: 'string', description: 'Browser profile name (defaults to "default")' },
+        },
+        required: ['url'],
+      },
+      isEnabled: () => ctx.browserAgent !== null,
+      checkPermissions: async () => ({ behavior: 'passthrough' as const }),
+      execute: async (input: any) => {
+        if (!ctx.browserAgent) return { content: [{ type: 'text', text: '浏览器代理未启用。请设置 HONE_BROWSER_ENABLED=true' }] }
+        const state = await ctx.browserAgent.navigate(input.profile || 'default', input.url)
+        return { content: [{ type: 'text', text: `已导航到: ${state.title} (${state.url})` }] }
+      },
+    },
+    {
+      name: 'browser_action',
+      description: 'Execute a web automation task in the browser using natural language, e.g. "搜索AI新闻", "发一条微博: 今天天气真好"',
+      input_schema: {
+        type: 'object',
+        properties: {
+          task: { type: 'string', description: 'Natural language description of the web task' },
+          profile: { type: 'string', description: 'Browser profile name (defaults to "default")' },
+          startUrl: { type: 'string', description: 'Optional starting URL' },
+          riskLevel: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Risk level (default: "low")' },
+        },
+        required: ['task'],
+      },
+      isEnabled: () => ctx.browserAgent !== null,
+      checkPermissions: async () => ({ behavior: 'passthrough' as const }),
+      execute: async (input: any) => {
+        if (!ctx.browserAgent) return { content: [{ type: 'text', text: '浏览器代理未启用。请设置 HONE_BROWSER_ENABLED=true' }] }
+        const result = await ctx.browserAgent.executeTask({
+          id: `browser_${Date.now()}`,
+          profileName: input.profile || 'default',
+          task: input.task,
+          startUrl: input.startUrl,
+          riskLevel: input.riskLevel || 'low',
+        })
+        if (result.status === 'success') {
+          return { content: [{ type: 'text', text: `浏览器任务完成: ${result.finalUrl || ''} (${result.steps.length} 步, ${(result.durationMs / 1000).toFixed(1)}s)` }] }
+        }
+        return { content: [{ type: 'text', text: `浏览器任务失败: ${result.error || result.status} (${result.steps.length} 步)` }] }
+      },
+    },
+    {
+      name: 'browser_screenshot',
+      description: 'Take a screenshot of the current browser page',
+      input_schema: {
+        type: 'object',
+        properties: {
+          profile: { type: 'string', description: 'Browser profile name (defaults to "default")' },
+        },
+      },
+      isEnabled: () => ctx.browserAgent !== null,
+      checkPermissions: async () => ({ behavior: 'passthrough' as const }),
+      execute: async (input: any) => {
+        if (!ctx.browserAgent) return { content: [{ type: 'text', text: '浏览器代理未启用。' }] }
+        const base64 = await ctx.browserAgent.screenshot(input.profile || 'default')
+        return {
+          content: [
+            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } },
+            { type: 'text', text: '当前页面截图' },
+          ],
+        }
+      },
+    },
+    {
+      name: 'browser_extract',
+      description: 'Extract structured text content from the current browser page',
+      input_schema: {
+        type: 'object',
+        properties: {
+          profile: { type: 'string', description: 'Browser profile name (defaults to "default")' },
+          selector: { type: 'string', description: 'CSS selector to extract from (defaults to body text)' },
+        },
+      },
+      isEnabled: () => ctx.browserAgent !== null,
+      checkPermissions: async () => ({ behavior: 'passthrough' as const }),
+      execute: async (input: any) => {
+        if (!ctx.browserAgent) return { content: [{ type: 'text', text: '浏览器代理未启用。' }] }
+        const text = await ctx.browserAgent.extract(input.profile || 'default', input.selector || 'body')
+        return { content: [{ type: 'text', text: text.slice(0, 4000) }] }
+      },
+    },
   ]
 }

@@ -79,6 +79,7 @@
     "marked": "*",
     "p-map": "*",
     "picomatch": "*",
+    "playwright": "^1.60.0",
     "proper-lockfile": "*",
     "qrcode": "*",
     "react": "*",
