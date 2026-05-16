@@ -1,0 +1,43 @@
+mod gateway_manager;
+mod machine_registry;
+mod ssh_tunnel;
+mod mdns_discovery;
+mod scheduler;
+mod commands;
+
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None::<Vec<&str>>,
+        ))
+        .setup(commands::setup)
+        .invoke_handler(tauri::generate_handler![
+            commands::gateway_start,
+            commands::gateway_stop,
+            commands::gateway_status,
+            commands::gateway_uptime,
+            commands::machines_list,
+            commands::machine_add,
+            commands::machine_remove,
+            commands::machine_update_status,
+            commands::discover_gateways,
+            commands::ssh_connect,
+            commands::ssh_disconnect,
+            commands::ssh_execute,
+            commands::get_config,
+            commands::save_config,
+            commands::schedules_list,
+            commands::schedules_save,
+            commands::autostart_is_enabled,
+            commands::autostart_toggle,
+            commands::execution_log_list,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running Hone Desktop");
+}

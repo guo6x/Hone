@@ -1,0 +1,18 @@
+{
+  "name": "Hone",
+  "short_name": "Hone",
+  "description": "Mobile client for Hone AI gateway",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#0C0E12",
+  "background_color": "#0C0E12",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

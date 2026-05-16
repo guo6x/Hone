@@ -1,0 +1,305 @@
+/**
+ * Enhanced scheduler with full cron support and disk persistence.
+ *
+ * Supports standard cron expressions:
+ *   "* * * * *"   (minute hour day month weekday)
+ *   "star/5 * * * *" (step values)
+ *   "1-5 * * * *" (ranges)
+ *   "1,3,5 * * *" (lists)
+ *   "1-5,10-15/2 * * *" (combined)
+ */
+
+import * as fs from 'fs'
+import * as path from 'path'
+import type { ScheduleEntry, GatewayContext } from './tools.js'
+
+// ── Cron parser ──
+
+const FIELD_NAMES = ['minute', 'hour', 'day', 'month', 'weekday'] as const
+const FIELD_CONSTRAINTS: Record<string, [number, number]> = {
+  minute: [0, 59],
+  hour: [0, 23],
+  day: [1, 31],
+  month: [1, 12],
+  weekday: [0, 6],
+}
+
+// Named values
+const MONTH_NAMES: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+}
+const WEEKDAY_NAMES: Record<string, number> = {
+  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
+}
+
+/**
+ * Parse a single cron field into a matcher function.
+ * Supports: star, star/N, N, N-M, N,M,O, N-M/step, named values
+ */
+function parseField(field: string, name: string): (val: number) => boolean {
+  const [min, max] = FIELD_CONSTRAINTS[name]
+  const parts = field.split(',')
+
+  const matchers = parts.map(part => {
+    let step = 1
+    if (part.includes('/')) {
+      const [range, stepStr] = part.split('/')
+      part = range
+      step = parseInt(stepStr, 10)
+      if (isNaN(step) || step < 1) step = 1
+    }
+
+    if (part === '*') {
+      return (val: number) => (val - min) % step === 0
+    }
+
+    if (part.includes('-')) {
+      let [rangeStart, rangeEnd] = part.split('-')
+      let startNum = resolveName(rangeStart, name)
+      let endNum = resolveName(rangeEnd, name)
+      if (startNum === null || endNum === null) return () => false
+      return (val: number) => val >= startNum! && val <= endNum! && (val - startNum!) % step === 0
+    }
+
+    const exactNum = resolveName(part, name)
+    if (exactNum === null) return () => false
+
+    // Only validate step for single values: step===1 means exact match, step>1 means "every Nth from this value"
+    return (val: number) => val === exactNum
+  })
+
+  return (val: number) => matchers.some(m => m(val))
+}
+
+function resolveName(value: string, fieldName: string): number | null {
+  const lower = value.toLowerCase()
+  if (fieldName === 'month' && MONTH_NAMES[lower] !== undefined) return MONTH_NAMES[lower]
+  if (fieldName === 'weekday' && WEEKDAY_NAMES[lower] !== undefined) return WEEKDAY_NAMES[lower]
+  const num = parseInt(value, 10)
+  if (isNaN(num)) return null
+  return num
+}
+
+/**
+ * Parse a cron expression into individual field matchers.
+ * Returns null if the expression is invalid.
+ */
+function parseCron(expression: string): ((now: Date) => boolean) | null {
+  const fields = expression.trim().split(/\s+/)
+  if (fields.length !== 5) return null
+
+  try {
+    const matchers = fields.map((f, i) => parseField(f, FIELD_NAMES[i]))
+
+    return (now: Date): boolean => {
+      const values = [
+        now.getMinutes(),
+        now.getHours(),
+        now.getDate(),
+        now.getMonth() + 1,
+        now.getDay(),
+      ]
+      return values.every((v, i) => matchers[i](v))
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Validate a cron expression. Returns the cleaned expression or null.
+ */
+export function validateCron(expression: string): string | null {
+  const fn = parseCron(expression)
+  return fn ? expression.trim() : null
+}
+
+/**
+ * Get next trigger time for a cron expression, up to `maxLookaheadMs` from now.
+ */
+export function nextCronTime(expression: string, maxLookaheadMs: number = 7 * 24 * 3600_000): number | null {
+  const fn = parseCron(expression)
+  if (!fn) return null
+
+  const now = new Date()
+  const end = now.getTime() + maxLookaheadMs
+  // Check every minute
+  const cursor = new Date(now)
+  cursor.setSeconds(0, 0)
+
+  for (let t = cursor.getTime() + 60_000; t < end; t += 60_000) {
+    const d = new Date(t)
+    if (fn(d)) return t
+  }
+  return null
+}
+
+// ── Schedule persistence ──
+
+export interface PersistedSchedule {
+  id: string
+  text: string
+  trigger: { type: string; cron?: string; ms?: number; at?: number }
+  task: string
+  delivery: 'notify' | 'execute' | 'both'
+  enabled: boolean
+  createdAt: number
+  lastTriggeredAt?: number
+  lastStatus?: 'ok' | 'fail'
+}
+
+function getStorePath(): string {
+  // Use HONE_DATA_DIR if set (Tauri desktop manages the daemon), otherwise ~/.hone
+  if (process.env.HONE_DATA_DIR) {
+    const dir = process.env.HONE_DATA_DIR
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    return path.join(dir, 'schedules.json')
+  }
+  const home = process.env.HOME || process.env.USERPROFILE || '~'
+  const dir = path.join(home, '.hone')
+  return path.join(dir, 'schedules.json')
+}
+
+export function loadSchedules(): Map<string, ScheduleEntry> {
+  const maps = new Map<string, ScheduleEntry>()
+  try {
+    const data = fs.readFileSync(getStorePath(), 'utf-8')
+    const entries: PersistedSchedule[] = JSON.parse(data)
+    for (const e of entries) {
+      const trigger = e.trigger.type === 'cron'
+        ? { type: 'cron' as const, cron: e.trigger.cron || '* * * * *' }
+        : e.trigger.type === 'interval'
+          ? { type: 'interval' as const, ms: e.trigger.ms || 3600_000 }
+          : { type: 'one-time' as const, at: e.trigger.at || Date.now() }
+
+      maps.set(e.id, {
+        id: e.id,
+        text: e.text,
+        trigger,
+        task: e.task,
+        delivery: e.delivery,
+        enabled: e.enabled,
+        createdAt: e.createdAt,
+        lastTriggeredAt: e.lastTriggeredAt,
+        lastStatus: e.lastStatus,
+      })
+    }
+    console.error(`[Scheduler] 从磁盘加载了 ${maps.size} 条日程`)
+  } catch {
+    // File doesn't exist or is corrupt — start fresh
+  }
+  return maps
+}
+
+export function saveSchedules(schedules: Map<string, ScheduleEntry>): void {
+  try {
+    const dir = path.dirname(getStorePath())
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+
+    const entries: PersistedSchedule[] = []
+    for (const [, e] of schedules) {
+      entries.push({
+        id: e.id,
+        text: e.text,
+        trigger: e.trigger.type === 'cron'
+          ? { type: 'cron', cron: e.trigger.cron }
+          : e.trigger.type === 'interval'
+            ? { type: 'interval', ms: e.trigger.ms }
+            : { type: 'one-time', at: e.trigger.at },
+        task: e.task,
+        delivery: e.delivery,
+        enabled: e.enabled,
+        createdAt: e.createdAt,
+        lastTriggeredAt: e.lastTriggeredAt,
+        lastStatus: e.lastStatus,
+      })
+    }
+    fs.writeFileSync(getStorePath(), JSON.stringify(entries, null, 2), 'utf-8')
+  } catch (err) {
+    console.error(`[Scheduler] 保存日程失败: ${err}`)
+  }
+}
+
+// ── Scheduler state ──
+
+interface SchedulerState {
+  schedules: Map<string, ScheduleEntry>
+  timers: Map<string, ReturnType<typeof setTimeout>>
+  cronCache: Map<string, (now: Date) => boolean>
+  ctx: GatewayContext
+  onTrigger: (entry: ScheduleEntry) => Promise<void>
+}
+
+const CHECK_INTERVAL_MS = 30_000
+
+export function createScheduler(
+  schedules: Map<string, ScheduleEntry>,
+  ctx: GatewayContext,
+  onTrigger: (entry: ScheduleEntry) => Promise<void>,
+): SchedulerState {
+  const state: SchedulerState = {
+    schedules,
+    timers: new Map(),
+    cronCache: new Map(),
+    ctx,
+    onTrigger,
+  }
+
+  const interval = setInterval(() => checkAll(state), CHECK_INTERVAL_MS)
+  state.timers.set('__global__', interval as unknown as ReturnType<typeof setTimeout>)
+
+  // Initial check after a short delay
+  setTimeout(() => checkAll(state), 2000)
+
+  return state
+}
+
+function checkAll(state: SchedulerState): void {
+  const now = new Date()
+  for (const [, entry] of state.schedules) {
+    if (!entry.enabled) continue
+
+    let shouldTrigger = false
+
+    if (entry.trigger.type === 'cron') {
+      let matcher = state.cronCache.get(entry.trigger.cron)
+      if (!matcher) {
+        const fn = parseCron(entry.trigger.cron)
+        if (!fn) continue // Invalid cron expression
+        matcher = fn
+        state.cronCache.set(entry.trigger.cron, fn)
+      }
+      shouldTrigger = matcher(now)
+    } else if (entry.trigger.type === 'interval') {
+      const lastTrigger = entry.lastTriggeredAt || 0
+      shouldTrigger = now.getTime() - lastTrigger >= entry.trigger.ms
+    } else if (entry.trigger.type === 'one-time') {
+      const lastTrigger = entry.lastTriggeredAt || 0
+      shouldTrigger = lastTrigger === 0 && now.getTime() >= entry.trigger.at
+    }
+
+    if (shouldTrigger) {
+      // Prevent double-fire within the same minute
+      const lastTrigger = entry.lastTriggeredAt || 0
+      if (now.getTime() - lastTrigger < 60_000) continue
+
+      entry.lastTriggeredAt = now.getTime()
+      entry.lastStatus = undefined
+      void state.onTrigger(entry).then(() => {
+        // Persist after each trigger
+        saveSchedules(state.schedules)
+      })
+    }
+  }
+}
+
+export function stopScheduler(state: SchedulerState): void {
+  for (const [, timer] of state.timers) {
+    clearTimeout(timer)
+  }
+  state.timers.clear()
+  state.cronCache.clear()
+  // Final save on shutdown
+  saveSchedules(state.schedules)
+}

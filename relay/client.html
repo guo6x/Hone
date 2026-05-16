@@ -1,0 +1,948 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover, maximum-scale=1.0">
+<meta name="theme-color" content="#0C0E12">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Hone">
+<meta name="description" content="Hone mobile client — connect to your AI gateway">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/favicon.svg">
+<title>Hone</title>
+<style>
+  :root {
+    --bg: #0C0E12;
+    --surface: #13161C;
+    --surfaceRaised: #1A1E26;
+    --surfaceOverlay: #222733;
+    --text: #E4E8F0;
+    --muted: #6B7285;
+    --border: #252A36;
+    --accent: #D4A853;
+    --accentHover: #E0B963;
+    --accentMuted: #24201A;
+    --success: #2ECC80;
+    --successMuted: #162720;
+    --danger: #F45858;
+    --dangerMuted: #241818;
+    --warning: #D4A853;
+    --warningMuted: #24201A;
+    --codeBg: #0F131A;
+    --scrim: rgba(0,0,0,0.65);
+    --radius: 12px;
+    --radius-sm: 8px;
+    --radius-xs: 6px;
+    --safe-top: env(safe-area-inset-top);
+    --safe-bottom: env(safe-area-inset-bottom);
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body {
+    height: 100%; width: 100%;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Noto Sans SC", sans-serif;
+    background: var(--bg); color: var(--text);
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-font-smoothing: antialiased;
+    -webkit-user-select: none; user-select: none;
+  }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  ::selection { background: var(--accent); color: var(--bg); }
+
+  /* ── Connect Screen ── */
+  #connect-screen {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100%; padding: 24px; gap: 16px;
+    padding-top: calc(24px + var(--safe-top));
+  }
+  #connect-screen.hidden { display: none; }
+
+  .logo-block {
+    display: flex; flex-direction: column; align-items: center; gap: 8px; margin-bottom: 20px;
+  }
+  .logo-icon {
+    width: 64px; height: 64px; border-radius: 18px;
+    background: linear-gradient(135deg, #D4A853, #A07830);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 20px rgba(212,168,83,0.25);
+  }
+  .logo-icon svg { width: 36px; height: 36px; }
+  .logo-text {
+    font-size: 24px; font-weight: 800; letter-spacing: 2px;
+    background: linear-gradient(135deg, #D4A853, #E8C97A);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .logo-sub { font-size: 12px; color: var(--muted); }
+
+  .field {
+    width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 4px;
+  }
+  .field label {
+    font-size: 12px; color: var(--muted); font-weight: 500; padding-left: 2px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .field input {
+    width: 100%; padding: 13px 14px;
+    border-radius: var(--radius-sm); border: 1px solid var(--border);
+    background: var(--surface); color: var(--text);
+    font-size: 15px; outline: none; font-family: inherit;
+    transition: border-color 0.2s;
+    -webkit-user-select: text; user-select: text;
+  }
+  .field input:focus { border-color: var(--accent); }
+  .field input::placeholder { color: #3a3f4a; }
+
+  .btn-primary {
+    width: 100%; max-width: 360px; padding: 14px;
+    border: none; border-radius: var(--radius-sm);
+    background: linear-gradient(135deg, #D4A853, #B89040);
+    color: #0C0E12; font-size: 16px; font-weight: 700;
+    cursor: pointer; transition: all 0.15s;
+    margin-top: 4px; letter-spacing: 0.5px;
+  }
+  .btn-primary:active { transform: scale(0.98); opacity: 0.9; }
+  .btn-primary:disabled { background: #3a3f4a; color: #6B7285; cursor: not-allowed; transform: none; opacity: 1; }
+
+  #connect-status { font-size: 13px; min-height: 20px; transition: color 0.2s; }
+  #connect-status.connected { color: var(--success); }
+  #connect-status.error { color: var(--danger); }
+
+  /* ── Main Screen ── */
+  #main-screen {
+    display: none; flex-direction: column; height: 100%;
+  }
+  #main-screen.active { display: flex; }
+
+  /* Top Bar */
+  #topbar {
+    display: flex; align-items: center; padding: 10px 14px; gap: 10px;
+    background: var(--surfaceRaised); border-bottom: 1px solid var(--border);
+    flex-shrink: 0; padding-top: calc(10px + var(--safe-top));
+  }
+  #topbar .logo-sm {
+    font-size: 16px; font-weight: 700;
+    background: linear-gradient(135deg, #D4A853, #E0B963);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  #topbar .dot {
+    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+    background: var(--success); transition: background 0.3s;
+  }
+  #topbar .dot.offline { background: var(--danger); }
+  #topbar .machine {
+    flex:1; font-size: 12px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .topbar-btn {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    padding: 5px 10px; border-radius: var(--radius-xs); font-size: 11px;
+    cursor: pointer; transition: all 0.15s; white-space: nowrap; font-family: inherit;
+  }
+  .topbar-btn:active { background: var(--surfaceOverlay); color: var(--text); }
+
+  /* Offline Banner */
+  #offline-banner {
+    display: none; background: var(--dangerMuted); color: var(--danger);
+    text-align: center; padding: 6px; font-size: 12px; flex-shrink: 0;
+    font-weight: 500;
+  }
+  #offline-banner.show { display: block; }
+
+  /* Message Area */
+  #messages {
+    flex: 1; overflow-y: auto; padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 8px;
+    -webkit-overflow-scrolling: touch;
+  }
+  #messages .spacer { flex: 1; min-height: 4px; }
+
+  .msg {
+    max-width: 85%; padding: 10px 14px; border-radius: 16px;
+    font-size: 14px; line-height: 1.55; word-break: break-word;
+    animation: msgIn 0.25s ease-out;
+  }
+  @keyframes msgIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .msg.gateway {
+    align-self: flex-start;
+    background: var(--surfaceRaised); color: var(--text);
+    border-bottom-left-radius: 4px;
+  }
+  .msg.user {
+    align-self: flex-end;
+    background: linear-gradient(135deg, #D4A853, #B89040); color: #0C0E12;
+    border-bottom-right-radius: 4px; font-weight: 500;
+  }
+  .msg .time {
+    display: block; font-size: 10px; margin-top: 4px; opacity: 0.6;
+    font-weight: 400;
+  }
+  .sys {
+    font-size: 11px; color: var(--muted); text-align: center;
+    padding: 2px 8px; animation: msgIn 0.2s ease-out;
+    max-width: 90%; align-self: center;
+  }
+  .sys .label {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    font-size: 10px; margin-right: 4px; letter-spacing: 0.3px;
+    background: var(--accentMuted); color: var(--accent);
+  }
+  .sys .label.completed { background: var(--successMuted); color: var(--success); }
+  .sys .label.error { background: var(--dangerMuted); color: var(--danger); }
+
+  /* Typing indicator */
+  .typing {
+    align-self: flex-start; padding: 10px 14px;
+    display: flex; gap: 4px; align-items: center;
+  }
+  .typing span {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+    animation: bounce 0.6s infinite alternate;
+  }
+  .typing span:nth-child(2) { animation-delay: 0.15s; }
+  .typing span:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes bounce {
+    from { opacity: 0.3; transform: translateY(0); }
+    to   { opacity: 1; transform: translateY(-4px); }
+  }
+
+  /* Input Bar */
+  #input-bar {
+    display: flex; gap: 8px; padding: 10px 14px;
+    background: var(--surfaceRaised); border-top: 1px solid var(--border);
+    flex-shrink: 0; padding-bottom: calc(10px + var(--safe-bottom));
+  }
+  #input-bar input {
+    flex:1; padding: 11px 16px;
+    border-radius: 22px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text);
+    font-size: 15px; outline: none; font-family: inherit;
+    transition: border-color 0.2s;
+    -webkit-user-select: text; user-select: text;
+  }
+  #input-bar input:focus { border-color: var(--accent); }
+  #input-bar input::placeholder { color: #3a3f4a; }
+  #btn-send {
+    width: 42px; height: 42px; border-radius: 50%; flex-shrink: 0;
+    border: none; background: var(--accent); color: #0C0E12;
+    font-size: 18px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: background 0.2s, transform 0.1s;
+  }
+  #btn-send:active { transform: scale(0.9); }
+  #btn-send:disabled { background: #3a3f4a; color: #6B7285; cursor: not-allowed; transform: none; }
+
+  /* ── Schedule Modal ── */
+  #schedule-overlay {
+    display: none; position: fixed; inset: 0; z-index: 100;
+    background: var(--scrim); justify-content: center; align-items: flex-end;
+  }
+  #schedule-overlay.active { display: flex; }
+  #schedule-panel {
+    width: 100%; max-width: 500px; max-height: 80vh;
+    background: var(--surfaceRaised); border-radius: 16px 16px 0 0;
+    padding: 20px 18px; display: flex; flex-direction: column; gap: 14px;
+    animation: slideUp 0.25s ease-out;
+    padding-bottom: calc(20px + var(--safe-bottom));
+  }
+  @keyframes slideUp {
+    from { transform: translateY(100%); }
+    to   { transform: translateY(0); }
+  }
+  #schedule-panel h2 {
+    font-size: 17px; font-weight: 700; text-align: center;
+    color: var(--text);
+  }
+  #schedule-panel .row { display: flex; gap: 8px; }
+  #schedule-panel .row input {
+    flex:1; padding: 11px 14px;
+    border-radius: var(--radius-sm); border: 1px solid var(--border);
+    background: var(--surface); color: var(--text);
+    font-size: 14px; outline: none; font-family: inherit;
+    -webkit-user-select: text; user-select: text;
+  }
+  #schedule-panel .row input:focus { border-color: var(--accent); }
+  #schedule-panel .btn-sm {
+    padding: 11px 16px; border: none; border-radius: var(--radius-sm);
+    background: var(--accent); color: #0C0E12; font-size: 13px; font-weight: 600;
+    cursor: pointer; white-space: nowrap; font-family: inherit;
+  }
+  #schedule-panel .btn-sm:active { opacity: 0.8; }
+  #schedule-panel .close-btn {
+    align-self: center; background: none; border: none;
+    color: var(--muted); font-size: 14px; cursor: pointer;
+    padding: 8px 16px; font-family: inherit;
+  }
+  #schedule-list {
+    list-style: none; overflow-y: auto; max-height: 260px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  #schedule-list li {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--surface); border-radius: var(--radius-xs); padding: 10px 12px;
+    font-size: 13px;
+  }
+  #schedule-list li .text { flex:1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #schedule-list li .toggle {
+    width: 40px; height: 24px; border-radius: 12px; flex-shrink: 0;
+    background: var(--border); position: relative; cursor: pointer;
+    transition: background 0.2s;
+  }
+  #schedule-list li .toggle.on { background: var(--accent); }
+  #schedule-list li .toggle::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 20px; height: 20px; border-radius: 50%; background: #fff;
+    transition: transform 0.2s;
+  }
+  #schedule-list li .toggle.on::after { transform: translateX(16px); }
+  #schedule-list li .del {
+    background: none; border: none; color: var(--danger); font-size: 20px;
+    cursor: pointer; padding: 0 4px; line-height: 1; flex-shrink: 0;
+  }
+
+  /* Quick actions */
+  #quick-actions {
+    display: flex; gap: 6px; padding: 8px 14px; overflow-x: auto;
+    flex-shrink: 0; -webkit-overflow-scrolling: touch;
+  }
+  #quick-actions.hidden { display: none; }
+  .quick-chip {
+    flex-shrink: 0; padding: 6px 14px; border-radius: 16px;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--muted); font-size: 12px; cursor: pointer;
+    white-space: nowrap; font-family: inherit;
+    transition: all 0.15s;
+  }
+  .quick-chip:active { background: var(--accentMuted); border-color: var(--accent); color: var(--accent); }
+
+  /* PWA install prompt */
+  #install-banner {
+    display: none; position: fixed; bottom: 0; left: 0; right: 0; z-index: 200;
+    background: var(--surfaceRaised); border-top: 1px solid var(--accent);
+    padding: 12px 16px; padding-bottom: calc(12px + var(--safe-bottom));
+    flex-direction: row; align-items: center; gap: 12px;
+  }
+  #install-banner.show { display: flex; }
+  #install-banner .text { flex:1; font-size: 13px; }
+  #install-banner .text strong { color: var(--accent); }
+  #install-banner button {
+    padding: 8px 18px; border-radius: var(--radius-xs); border: none;
+    background: var(--accent); color: #0C0E12; font-weight: 600;
+    font-size: 13px; cursor: pointer; font-family: inherit;
+  }
+  #install-banner .dismiss {
+    background: none; border: none; color: var(--muted); font-size: 20px;
+    cursor: pointer; padding: 4px;
+  }
+
+  /* Connection lost toast */
+  #toast {
+    position: fixed; top: 60px; left: 50%; transform: translateX(-50%); z-index: 300;
+    padding: 10px 20px; border-radius: 20px; background: var(--dangerMuted);
+    color: var(--danger); font-size: 13px; font-weight: 500;
+    opacity: 0; transition: opacity 0.3s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<!-- ── Connect Screen ── -->
+<div id="connect-screen">
+  <div class="logo-block">
+    <div class="logo-icon">
+      <svg viewBox="0 0 32 32" fill="none">
+        <path d="M6,26 L6,22 L26,22 L26,26 Z" fill="#0C0E12" opacity="0.8"/>
+        <path d="M10,10 L22,10 L24,22 L8,22 Z" fill="#0C0E12" opacity="0.3"/>
+        <circle cx="19" cy="11" r="1" fill="#0C0E12" opacity="0.6"/>
+      </svg>
+    </div>
+    <div class="logo-text">HONE</div>
+    <div class="logo-sub">Mobile Client</div>
+  </div>
+
+  <div class="field">
+    <label for="relay-url">Relay</label>
+    <input id="relay-url" type="text" placeholder="wss://your-relay.workers.dev" autocomplete="url" enterkeyhint="next">
+  </div>
+  <div class="field">
+    <label for="pairing-code">Pairing Code</label>
+    <input id="pairing-code" type="text" placeholder="6-digit code" maxlength="6" autocomplete="off" inputmode="numeric" pattern="[0-9]*" enterkeyhint="go">
+  </div>
+  <button class="btn-primary" id="btn-connect" onclick="connect()">Connect</button>
+  <div id="connect-status">Not connected</div>
+</div>
+
+<!-- ── Main Screen ── -->
+<div id="main-screen">
+  <div id="topbar">
+    <span class="logo-sm">HONE</span>
+    <span class="dot" id="status-dot"></span>
+    <span class="machine" id="machine-name"></span>
+    <button class="topbar-btn" onclick="showSchedule()" title="Schedules">Schedules</button>
+    <button class="topbar-btn" onclick="disconnect()">Leave</button>
+  </div>
+  <div id="offline-banner">Gateway offline — reconnecting...</div>
+  <div id="messages"><div class="spacer"></div></div>
+  <div id="quick-actions" class="hidden">
+    <button class="quick-chip" onclick="quickAction('What is my git status?')">git status</button>
+    <button class="quick-chip" onclick="quickAction('Run the tests')">Run tests</button>
+    <button class="quick-chip" onclick="quickAction('Check recent PRs')">Recent PRs</button>
+  </div>
+  <div id="input-bar">
+    <input id="msg-input" type="text" placeholder="Message..." autocomplete="off" enterkeyhint="send">
+    <button id="btn-send" onclick="sendMessage()" aria-label="Send">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+    </button>
+  </div>
+</div>
+
+<!-- ── Schedule Modal ── -->
+<div id="schedule-overlay" onclick="if(event.target===this)hideSchedule()">
+  <div id="schedule-panel">
+    <h2>Schedules</h2>
+    <div class="row">
+      <input id="schedule-input" type="text" placeholder="e.g. Check PRs every morning at 9" autocomplete="off">
+      <button class="btn-sm" onclick="createSchedule()">Create</button>
+    </div>
+    <ul id="schedule-list"></ul>
+    <button class="close-btn" onclick="hideSchedule()">Close</button>
+  </div>
+</div>
+
+<!-- ── Install Banner ── -->
+<div id="install-banner">
+  <span class="text"><strong>Hone</strong> — install to home screen</span>
+  <button onclick="installPWA()">Install</button>
+  <button class="dismiss" onclick="dismissInstall()">×</button>
+</div>
+
+<!-- ── Toast ── -->
+<div id="toast"></div>
+
+<script>
+(function() {
+  'use strict';
+
+  /* ─── PWA Install ─── */
+  let deferredPrompt = null;
+  window.addEventListener('beforeinstallprompt', function(e) {
+    e.preventDefault();
+    deferredPrompt = e;
+    if (!localStorage.getItem('hone_pwa_dismissed')) {
+      document.getElementById('install-banner').classList.add('show');
+    }
+  });
+  window.installPWA = function() {
+    if (deferredPrompt) {
+      deferredPrompt.prompt();
+      deferredPrompt.userChoice.then(function(r) {
+        if (r.outcome === 'accepted') {
+          document.getElementById('install-banner').classList.remove('show');
+        }
+        deferredPrompt = null;
+      });
+    }
+  };
+  window.dismissInstall = function() {
+    document.getElementById('install-banner').classList.remove('show');
+    localStorage.setItem('hone_pwa_dismissed', '1');
+  };
+
+  /* ─── State ─── */
+  const state = {
+    ws: null,
+    connected: false, registered: false,
+    clientId: null, gatewayInfo: null,
+    lastHeartbeat: 0,
+    reconnectTimer: null, reconnectDelay: 1000,
+    heartbeatTimer: null,
+    schedules: [],
+    lang: navigator.language.startsWith('zh') ? 'zh' : 'en'
+  };
+
+  const t = {
+    connecting: { zh: '连接中...', en: 'Connecting...' },
+    connected: { zh: '已连接', en: 'Connected' },
+    disconnected: { zh: '已断开', en: 'Disconnected' },
+    notConnected: { zh: '未连接', en: 'Not connected' },
+    reconnecting: { zh: '重新连接中...', en: 'Reconnecting...' },
+    needUrl: { zh: '请输入中继地址', en: 'Enter relay URL' },
+    needCode: { zh: '请输入配对码', en: 'Enter pairing code' },
+    codeDigits: { zh: '配对码必须为6位数字', en: 'Code must be 6 digits' },
+    pairFailed: { zh: '配对失败：配对码无效或网关拒绝', en: 'Pairing failed: invalid code or gateway denied' },
+    badFormat: { zh: '连接被关闭：消息格式错误', en: 'Connection closed: bad message format' },
+    connError: { zh: '无法创建连接', en: 'Cannot create connection' },
+    waiting: { zh: '等待网关批准...', en: 'Waiting for gateway approval...' },
+    taskStarted: { zh: '任务开始', en: 'Task started' },
+    taskDone: { zh: '已完成', en: 'Completed' },
+    taskErr: { zh: '错误', en: 'Error' },
+    scheduleCreated: { zh: '定时任务已创建', en: 'Schedule created' },
+    scheduleTriggered: { zh: '定时任务触发: ', en: 'Schedule triggered: ' },
+    noSchedules: { zh: '暂无定时任务', en: 'No schedules' },
+    gatewayOffline: { zh: '网关离线 — 重连中...', en: 'Gateway offline — reconnecting...' },
+  };
+  function tr(key) { const v = t[key]; return v ? (v[state.lang] || v.en) : key; }
+  function now() {
+    const d = new Date();
+    return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+  }
+
+  /* ─── DOM ─── */
+  const $ = (s) => document.querySelector(s);
+  const connectScreen = $('#connect-screen');
+  const mainScreen = $('#main-screen');
+  const relayInput = $('#relay-url');
+  const codeInput = $('#pairing-code');
+  const btnConnect = $('#btn-connect');
+  const connectStatus = $('#connect-status');
+  const statusDot = $('#status-dot');
+  const machineName = $('#machine-name');
+  const messagesEl = $('#messages');
+  const msgInput = $('#msg-input');
+  const btnSend = $('#btn-send');
+  const offlineBanner = $('#offline-banner');
+  const quickActions = $('#quick-actions');
+  const scheduleOverlay = $('#schedule-overlay');
+  const scheduleInput = $('#schedule-input');
+  const scheduleList = $('#schedule-list');
+  const toast = $('#toast');
+
+  /* ─── localStorage ─── */
+  relayInput.value = localStorage.getItem('hone_relay_url') || '';
+  codeInput.value = localStorage.getItem('hone_pairing_code') || '';
+
+  /* ─── Toast ─── */
+  let toastTimer = null;
+  function showToast(text) {
+    toast.textContent = text;
+    toast.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function() { toast.classList.remove('show'); }, 3000);
+  }
+
+  /* ─── Connect / Disconnect ─── */
+  window.connect = function() {
+    const url = relayInput.value.trim();
+    const code = codeInput.value.trim();
+
+    if (!url) { showToast(tr('needUrl')); return; }
+    if (!code) { showToast(tr('needCode')); return; }
+    if (code.length !== 6 || !/^\d{6}$/.test(code)) { showToast(tr('codeDigits')); return; }
+
+    localStorage.setItem('hone_relay_url', url);
+    localStorage.setItem('hone_pairing_code', code);
+
+    setStatus(tr('connecting'), '');
+    btnConnect.disabled = true;
+    btnConnect.textContent = tr('connecting');
+
+    openSocket(url, code);
+  };
+
+  window.disconnect = function() {
+    cleanup();
+    mainScreen.classList.remove('active');
+    connectScreen.classList.remove('hidden');
+    btnConnect.disabled = false;
+    btnConnect.textContent = 'Connect';
+    setStatus(tr('disconnected'), '');
+    messagesEl.innerHTML = '<div class="spacer"></div>';
+    state.schedules = [];
+    renderSchedules();
+    quickActions.classList.add('hidden');
+  };
+
+  function cleanup() {
+    if (state.ws) {
+      state.ws.onclose = null;
+      state.ws.close(4000, 'Client disconnect');
+      state.ws = null;
+    }
+    clearTimeout(state.reconnectTimer);
+    clearInterval(state.heartbeatTimer);
+    state.connected = false;
+    state.registered = false;
+    state.clientId = null;
+    state.gatewayInfo = null;
+    state.reconnectDelay = 1000;
+  }
+
+  function openSocket(url, code) {
+    if (state.ws) {
+      state.ws.onclose = null;
+      state.ws.close(4000);
+    }
+
+    let ws;
+    try { ws = new WebSocket(url); }
+    catch (e) { onConnFail(tr('connError')); return; }
+
+    state.ws = ws;
+
+    ws.onopen = function() {
+      setStatus(tr('waiting'), '');
+      ws.send(JSON.stringify({ type: 'register', role: 'client', pairingCode: code }));
+    };
+
+    ws.onmessage = function(e) {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch (err) { return; }
+      handleMessage(msg);
+    };
+
+    ws.onclose = function(evt) {
+      if (state.registered) {
+        state.connected = false;
+        state.registered = false;
+        setGatewayOffline(true);
+        showToast(tr('gatewayOffline'));
+      }
+      if (evt.code === 4003) { onConnFail(tr('pairFailed')); return; }
+      if (evt.code === 4000) { onConnFail(tr('badFormat')); return; }
+      if (evt.code !== 4000 || state.registered) scheduleReconnect(url, code);
+    };
+
+    ws.onerror = function() {};
+  }
+
+  function scheduleReconnect(url, code) {
+    clearTimeout(state.reconnectTimer);
+    if (state.reconnectDelay > 30000) state.reconnectDelay = 30000;
+    state.reconnectTimer = setTimeout(function() {
+      setStatus(tr('reconnecting') + ' (' + (state.reconnectDelay/1000) + 's)', '');
+      openSocket(url, code);
+      state.reconnectDelay = Math.min(state.reconnectDelay * 2, 30000);
+    }, state.reconnectDelay);
+  }
+
+  function onConnFail(msg) {
+    state.ws = null;
+    setStatus(msg, 'error');
+    btnConnect.disabled = false;
+    btnConnect.textContent = 'Connect';
+    scheduleReconnect(relayInput.value.trim(), codeInput.value.trim());
+  }
+
+  /* ─── Message Handling ─── */
+  function handleMessage(msg) {
+    state.lastHeartbeat = Date.now();
+
+    switch (msg.type) {
+
+    case 'registered':
+      state.registered = true;
+      state.connected = true;
+      state.clientId = msg.clientId || null;
+      state.reconnectDelay = 1000;
+      state.gatewayInfo = msg.gateway || null;
+
+      connectScreen.classList.add('hidden');
+      mainScreen.classList.add('active');
+      btnConnect.disabled = false;
+      btnConnect.textContent = 'Connect';
+      setStatus(tr('connected'), 'connected');
+      setGatewayOffline(false);
+
+      const name = state.gatewayInfo
+        ? (state.gatewayInfo.machineName || state.gatewayInfo.machineId || 'Gateway')
+        : (msg.machineName || 'Connected');
+      machineName.textContent = name;
+      statusDot.classList.remove('offline');
+      quickActions.classList.remove('hidden');
+      startHeartbeatCheck();
+
+      // Welcome message
+      addMessage('gateway', 'Connected to ' + name + '. How can I help you?', now());
+      break;
+
+    case 'pairing_required':
+      setStatus(tr('waiting'), '');
+      break;
+
+    case 'message':
+      if (msg.from === 'gateway' && msg.payload) {
+        addMessage('gateway', msg.payload.text || JSON.stringify(msg.payload), now());
+        removeTyping();
+      }
+      break;
+
+    case 'task_started':
+      addSystem(msg.description || tr('taskStarted'), 'started');
+      addTyping();
+      break;
+
+    case 'task_progress':
+      addSystem(msg.status || 'Processing...', '');
+      break;
+
+    case 'task_complete':
+      removeTyping();
+      addSystem((msg.result || tr('taskDone')), 'completed');
+      break;
+
+    case 'heartbeat':
+      state.lastHeartbeat = Date.now();
+      setGatewayOffline(false);
+      if (msg.machineName) machineName.textContent = msg.machineName;
+      break;
+
+    case 'gateway_disconnected':
+      setGatewayOffline(true);
+      showToast(msg.message || tr('gatewayOffline'));
+      break;
+
+    case 'schedule_created':
+      state.schedules.push({ id: msg.scheduleId, text: msg.description || msg.scheduleId, on: true });
+      renderSchedules();
+      addSystem(tr('scheduleCreated'), 'completed');
+      break;
+
+    case 'schedule_triggered':
+      addSystem(tr('scheduleTriggered') + (msg.task || msg.scheduleId), 'started');
+      break;
+
+    case 'schedule_list':
+      if (Array.isArray(msg.schedules)) {
+        state.schedules = msg.schedules;
+        renderSchedules();
+      }
+      break;
+
+    case 'ping':
+      // Respond with pong
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: 'pong' }));
+      }
+      break;
+    }
+  }
+
+  /* ─── Render ─── */
+  function addMessage(type, text, time) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + type;
+    div.textContent = text;
+    if (time) {
+      const ts = document.createElement('span');
+      ts.className = 'time';
+      ts.textContent = time;
+      div.appendChild(ts);
+    }
+    messagesEl.appendChild(div);
+    scrollBottom();
+  }
+
+  function addSystem(text, label) {
+    const div = document.createElement('div');
+    div.className = 'sys';
+    if (label) {
+      const span = document.createElement('span');
+      span.className = 'label ' + label;
+      span.textContent = label === 'completed' ? tr('taskDone') : label === 'error' ? tr('taskErr') : tr('taskStarted');
+      div.appendChild(span);
+    }
+    div.appendChild(document.createTextNode(' ' + text));
+    messagesEl.appendChild(div);
+    scrollBottom();
+  }
+
+  let typingEl = null;
+  function addTyping() {
+    if (typingEl) return;
+    typingEl = document.createElement('div');
+    typingEl.className = 'typing';
+    typingEl.innerHTML = '<span></span><span></span><span></span>';
+    messagesEl.appendChild(typingEl);
+    scrollBottom();
+  }
+  function removeTyping() {
+    if (typingEl) { typingEl.remove(); typingEl = null; }
+  }
+
+  function scrollBottom() {
+    requestAnimationFrame(function() {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+  }
+
+  function setStatus(text, cls) {
+    connectStatus.textContent = text;
+    connectStatus.className = cls || '';
+  }
+
+  function setGatewayOffline(isOffline) {
+    if (isOffline) {
+      statusDot.classList.add('offline');
+      offlineBanner.classList.add('show');
+    } else {
+      statusDot.classList.remove('offline');
+      offlineBanner.classList.remove('show');
+    }
+  }
+
+  function startHeartbeatCheck() {
+    state.lastHeartbeat = Date.now();
+    clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = setInterval(function() {
+      if (!state.connected && !state.registered) return;
+      if (Date.now() - state.lastHeartbeat > 45000) {
+        setGatewayOffline(true);
+      }
+    }, 5000);
+  }
+
+  /* ─── Send Message ─── */
+  window.sendMessage = function() {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    const text = msgInput.value.trim();
+    if (!text) return;
+
+    addMessage('user', text, now());
+    msgInput.value = '';
+    msgInput.focus();
+    addTyping();
+
+    state.ws.send(JSON.stringify({
+      type: 'message',
+      target: 'gateway',
+      payload: { text: text }
+    }));
+  };
+
+  window.quickAction = function(text) {
+    msgInput.value = text;
+    sendMessage();
+  };
+
+  msgInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }
+  });
+
+  // Also allow Enter on connect screen inputs
+  codeInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); connect(); }
+  });
+  relayInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); codeInput.focus(); }
+  });
+
+  /* ─── Schedule UI ─── */
+  window.showSchedule = function() {
+    scheduleOverlay.classList.add('active');
+    scheduleInput.focus();
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      state.ws.send(JSON.stringify({ type: 'schedule_list' }));
+    }
+  };
+
+  window.hideSchedule = function() {
+    scheduleOverlay.classList.remove('active');
+  };
+
+  window.createSchedule = function() {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    const text = scheduleInput.value.trim();
+    if (!text) return;
+
+    const payload = { text: text };
+    const cronPattern = detectCron(text);
+    if (cronPattern) {
+      payload.trigger = 'cron';
+      payload.cron = cronPattern;
+      payload.task = text;
+    }
+
+    state.ws.send(JSON.stringify({ type: 'schedule_create', payload: payload }));
+    scheduleInput.value = '';
+  };
+
+  window.toggleSchedule = function(id) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    const s = state.schedules.find(function(x) { return x.id === id; });
+    if (!s) return;
+    s.on = !s.on;
+    renderSchedules();
+    state.ws.send(JSON.stringify({
+      type: s.on ? 'schedule_enable' : 'schedule_disable',
+      scheduleId: id
+    }));
+  };
+
+  window.deleteSchedule = function(id) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    state.ws.send(JSON.stringify({ type: 'schedule_delete', scheduleId: id }));
+    state.schedules = state.schedules.filter(function(x) { return x.id !== id; });
+    renderSchedules();
+  };
+
+  function renderSchedules() {
+    scheduleList.innerHTML = '';
+    if (state.schedules.length === 0) {
+      const li = document.createElement('li');
+      li.style.justifyContent = 'center';
+      li.style.color = 'var(--muted)';
+      li.textContent = tr('noSchedules');
+      scheduleList.appendChild(li);
+      return;
+    }
+    state.schedules.forEach(function(s) {
+      const li = document.createElement('li');
+      const textSpan = document.createElement('span');
+      textSpan.className = 'text';
+      textSpan.textContent = s.text || s.id;
+      const toggle = document.createElement('span');
+      toggle.className = 'toggle' + (s.on ? ' on' : '');
+      toggle.onclick = function() { toggleSchedule(s.id); };
+      const del = document.createElement('button');
+      del.className = 'del';
+      del.textContent = '×';
+      del.onclick = function() { deleteSchedule(s.id); };
+      li.appendChild(textSpan);
+      li.appendChild(toggle);
+      li.appendChild(del);
+      scheduleList.appendChild(li);
+    });
+  }
+
+  function detectCron(text) {
+    const t2 = text.toLowerCase();
+    const hourMatch = t2.match(/每[天日]\s*(\d{1,2})\s*点/);
+    if (hourMatch) return '0 ' + hourMatch[1] + ' * * *';
+    if (/每天\s*早上/.test(t2)) {
+      const hm = t2.match(/早上\s*(\d{1,2})/);
+      return '0 ' + (hm ? hm[1] : '9') + ' * * *';
+    }
+    if (/每天\s*下午/.test(t2)) {
+      const hm = t2.match(/下午\s*(\d{1,2})/);
+      return '0 ' + (hm ? parseInt(hm[1]) + 12 : '15') + ' * * *';
+    }
+    const weekMatch = t2.match(/每[周週]\s*([一二三四五六日])/);
+    if (weekMatch) {
+      const dowMap = { '一':'1','二':'2','三':'3','四':'4','五':'5','六':'6','日':'0' };
+      return '0 9 * * ' + (dowMap[weekMatch[1]] || '1');
+    }
+    if (/每小时/.test(t2)) return '0 * * * *';
+    if (/每分钟/.test(t2)) return '* * * * *';
+    return null;
+  }
+
+  /* ─── Service Worker Registration ─── */
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(function() {});
+  }
+
+  /* ─── Auto-connect ─── */
+  if (relayInput.value && codeInput.value && codeInput.value.length === 6 && /^\d{6}$/.test(codeInput.value)) {
+    setTimeout(connect, 500);
+  }
+})();
+</script>
+</body>
+</html>

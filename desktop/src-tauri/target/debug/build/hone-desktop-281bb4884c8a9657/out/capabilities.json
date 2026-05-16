@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capability set for Hone Desktop","local":true,"windows":["main"],"permissions":["core:default","core:window:default","shell:allow-open","notification:default","dialog:default","fs:default","process:default"]}}

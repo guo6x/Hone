@@ -1,0 +1,114 @@
+{
+  "name": "hone-vscode",
+  "displayName": "Hone",
+  "description": "Hone AI 编程助手 — VS Code 插件",
+  "version": "0.2.0",
+  "publisher": "hone",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Programming Languages", "Other"],
+  "activationEvents": [
+    "onCommand:hone.explain",
+    "onCommand:hone.optimize",
+    "onCommand:hone.review",
+    "onCommand:hone.ask",
+    "onView:hone.sidebar"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "hone.explain",
+        "title": "Hone: 解释代码"
+      },
+      {
+        "command": "hone.optimize",
+        "title": "Hone: 优化代码"
+      },
+      {
+        "command": "hone.review",
+        "title": "Hone: 审查代码"
+      },
+      {
+        "command": "hone.ask",
+        "title": "Hone: 自定义提问"
+      },
+      {
+        "command": "hone.openDashboard",
+        "title": "Hone: 打开控制台"
+      },
+      {
+        "command": "hone.gatewayStatus",
+        "title": "Hone: 检查 Gateway 状态"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "hone.explain",
+          "group": "hone",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "hone.optimize",
+          "group": "hone",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "hone.review",
+          "group": "hone",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "hone.ask",
+          "group": "hone"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "hone",
+          "title": "Hone",
+          "icon": "resources/hone.svg"
+        }
+      ]
+    },
+    "views": {
+      "hone": [
+        {
+          "id": "hone.sidebar",
+          "name": "对话"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Hone",
+      "properties": {
+        "hone.cliPath": {
+          "type": "string",
+          "default": "hone",
+          "description": "Path to the hone CLI executable. Use 'node /path/to/dist/cli.js' if hone is not globally installed."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "hone.explain",
+        "key": "ctrl+alt+e",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "hone.optimize",
+        "key": "ctrl+alt+o",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "hone.review",
+        "key": "ctrl+alt+r",
+        "when": "editorHasSelection"
+      }
+    ]
+  }
+}

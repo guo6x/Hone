@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1A1E26"/>
+      <stop offset="100%" stop-color="#0C0E12"/>
+    </linearGradient>
+    <linearGradient id="stone" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#D4A853"/>
+      <stop offset="100%" stop-color="#A07830"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="8" fill="url(#bg)"/>
+  <g transform="translate(16,18)">
+    <path d="M-10,-5 L10,-5 L12,6 L-12,6 Z" fill="url(#stone)"/>
+    <path d="M-10,-5 L-12,6 L-11,6 L-9,-5 Z" fill="#8B6914" opacity="0.5"/>
+  </g>
+  <!-- Single spark -->
+  <circle cx="11" cy="9" r="1.2" fill="#F0D68A" opacity="0.9"/>
+</svg>

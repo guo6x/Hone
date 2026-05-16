@@ -1,0 +1,13 @@
+import type { Command } from '../../commands.js'
+import { isEnvTruthy } from '../../utils/envUtils.js'
+
+const installGitHubApp = {
+  type: 'local-jsx',
+  name: 'install-github-app',
+  description: '为仓库配置 GitHub Actions 集成',
+  availability: ['claude-ai', 'console'],
+  isEnabled: () => !isEnvTruthy(process.env.DISABLE_INSTALL_GITHUB_APP_COMMAND),
+  load: () => import('./install-github-app.js'),
+} satisfies Command
+
+export default installGitHubApp

@@ -1,0 +1,42 @@
+[package]
+name = "hone-desktop"
+version = "0.2.1-alpha"
+description = "Hone Desktop — 全功能 AI 编程控制台"
+authors = ["Hone Team"]
+edition = "2021"
+
+[package.metadata]
+assets = []
+
+[package.metadata.tauri-winres]
+FileDescription = "Hone Desktop - AI Coding Console"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-process = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+ssh2 = "0.9"
+mdns-sd = "0.11"
+tungstenite = "0.24"
+tokio-tungstenite = "0.24"
+url = "2"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+dirs = "6"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

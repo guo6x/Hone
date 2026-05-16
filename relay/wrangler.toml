@@ -1,0 +1,24 @@
+name = "hone-relay"
+main = "worker.js"
+compatibility_date = "2025-05-14"
+
+[[durable_objects.bindings]]
+name = "RELAY_ROOM"
+class_name = "RelayRoom"
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["RelayRoom"]
+
+[vars]
+# Set AUTH_TOKEN in production to require gateway authentication.
+# Generate via: openssl rand -hex 32
+# AUTH_TOKEN = ""
+
+[env.production]
+vars = { AUTH_TOKEN = "" }
+
+# Routes (optional — can also use workers.dev subdomain)
+# [[routes]]
+# pattern = "relay.hone.dev/*"
+# zone_name = "hone.dev"

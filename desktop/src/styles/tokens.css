@@ -1,0 +1,113 @@
+:root {
+  /* Dark theme (default) */
+  --hone-bg: #0C0E12;
+  --hone-surface: #13161C;
+  --hone-surfaceRaised: #1A1E26;
+  --hone-surfaceOverlay: #222733;
+  --hone-text: #E4E8F0;
+  --hone-muted: #6B7285;
+  --hone-border: #252A36;
+  --hone-accent: #D4A853;
+  --hone-accentHover: #E0B963;
+  --hone-accentMuted: #24201A;
+  --hone-codeBg: #0F131A;
+  --hone-success: #2ECC80;
+  --hone-successMuted: #162720;
+  --hone-warning: #D4A853;
+  --hone-warningMuted: #24201A;
+  --hone-danger: #F45858;
+  --hone-dangerMuted: #241818;
+  --hone-scrim: rgba(0,0,0,0.65);
+  --hone-progressTrack: #1E2430;
+  --hone-mutedMuted: #171A20;
+}
+
+[data-theme="light"] {
+  --hone-bg: #F5F6F8;
+  --hone-surface: #FFFFFF;
+  --hone-surfaceRaised: #F0F1F3;
+  --hone-surfaceOverlay: #E8E9EC;
+  --hone-text: #1A1D26;
+  --hone-muted: #6B7280;
+  --hone-border: #D1D5DB;
+  --hone-accent: #B8860B;
+  --hone-accentHover: #9A7209;
+  --hone-accentMuted: #FEF3C7;
+  --hone-codeBg: #F9FAFB;
+}
+
+[data-theme="gold"] {
+  --hone-bg: #1A1810;
+  --hone-surface: #231F14;
+  --hone-surfaceRaised: #2D2818;
+  --hone-surfaceOverlay: #38301E;
+  --hone-text: #F0E8D0;
+  --hone-muted: #8A8060;
+  --hone-border: #3D341E;
+  --hone-accent: #E8B830;
+  --hone-accentHover: #F0C848;
+  --hone-accentMuted: #2D2410;
+  --hone-codeBg: #151208;
+}
+
+[data-theme="midnight"] {
+  --hone-bg: #0A0E1A;
+  --hone-surface: #0F1426;
+  --hone-surfaceRaised: #151B33;
+  --hone-surfaceOverlay: #1C2440;
+  --hone-text: #D0D8F0;
+  --hone-muted: #5A6A90;
+  --hone-border: #1E2A45;
+  --hone-accent: #6C8CFF;
+  --hone-accentHover: #8AA0FF;
+  --hone-accentMuted: #151D30;
+  --hone-codeBg: #080C18;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--hone-bg);
+  color: var(--hone-text);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Noto Sans SC', sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+@keyframes bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+
+::selection {
+  background: var(--hone-accent);
+  color: var(--hone-bg);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--hone-border);
+  border-radius: 3px;
+}
