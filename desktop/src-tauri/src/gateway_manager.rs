@@ -1,3 +1,4 @@
+use crate::windows_git_bash;
 use chrono::{DateTime, Utc};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -156,7 +157,10 @@ impl GatewayManager {
     /// environment variables `HONE_RELAY_URL`, `HONE_GATEWAY_PORT`, and
     /// the platform-appropriate machine-name variable.
     pub fn start(&mut self, hone_path: &str, relay_url: &str) -> Result<(), GatewayError> {
-        if matches!(self.status, GatewayStatus::Running | GatewayStatus::Starting) {
+        if matches!(
+            self.status,
+            GatewayStatus::Running | GatewayStatus::Starting
+        ) {
             return Err(GatewayError::AlreadyRunning);
         }
 
@@ -169,10 +173,7 @@ impl GatewayManager {
             .arg("start")
             .env("HONE_RELAY_URL", relay_url)
             .env("HONE_GOD_MODE", "1")
-            .env(
-                "HONE_GATEWAY_PORT",
-                self.config.local_port.to_string(),
-            )
+            .env("HONE_GATEWAY_PORT", self.config.local_port.to_string())
             .env(
                 "HONE_DATA_DIR",
                 dirs::data_dir()
@@ -191,8 +192,12 @@ impl GatewayManager {
         if !self.config.api_key.is_empty() {
             // Map generic api_key to provider-specific env var that CLI checks
             match self.config.provider.as_str() {
-                "openai" => { cmd.env("OPENAI_API_KEY", &self.config.api_key); }
-                "custom" => { cmd.env("HONE_CUSTOM_API_KEY", &self.config.api_key); }
+                "openai" => {
+                    cmd.env("OPENAI_API_KEY", &self.config.api_key);
+                }
+                "custom" => {
+                    cmd.env("HONE_CUSTOM_API_KEY", &self.config.api_key);
+                }
                 _ => {
                     // deepseek (default) or unknown
                     cmd.env("DEEPSEEK_API_KEY", &self.config.api_key);
@@ -203,6 +208,7 @@ impl GatewayManager {
         if !self.config.model.is_empty() {
             cmd.env("HONE_MODEL", &self.config.model);
         }
+        windows_git_bash::apply_to_command(&mut cmd);
 
         // Set the platform machine-name env var.
         #[cfg(windows)]
@@ -251,7 +257,10 @@ impl GatewayManager {
     /// On Unix the child receives SIGTERM with a 5-second grace period
     /// before SIGKILL.  On Windows `TerminateProcess` is used immediately.
     pub fn stop(&mut self) -> Result<(), GatewayError> {
-        if matches!(self.status, GatewayStatus::Stopped | GatewayStatus::Stopping) {
+        if matches!(
+            self.status,
+            GatewayStatus::Stopped | GatewayStatus::Stopping
+        ) {
             return Err(GatewayError::NotRunning);
         }
 
@@ -282,11 +291,7 @@ impl GatewayManager {
     }
 
     /// Stop (if running) and restart the Gateway daemon.
-    pub fn restart(
-        &mut self,
-        hone_path: &str,
-        relay_url: &str,
-    ) -> Result<(), GatewayError> {
+    pub fn restart(&mut self, hone_path: &str, relay_url: &str) -> Result<(), GatewayError> {
         info!("Restarting Hone Gateway");
         if self.is_running() {
             self.stop()?;

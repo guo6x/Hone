@@ -10,14 +10,15 @@
 // The CLI process output is captured and stored in-schedule so the frontend
 // can display history.
 
+use crate::windows_git_bash;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use tauri::Manager;
 use tokio::time::{interval, Duration};
 
 // ── Schedule types (mirrors frontend ScheduleInfo) ─────────────────────────
@@ -38,7 +39,7 @@ pub struct ScheduleInfo {
     pub last_run: Option<String>,
     #[serde(rename = "lastStatus")]
     pub last_status: Option<String>, // "success" | "fail" | null
-    pub delivery: String,            // "desktop" | "cli" | "session"
+    pub delivery: String, // "desktop" | "cli" | "session"
 }
 
 // ── Cron parser ────────────────────────────────────────────────────────────
@@ -47,7 +48,7 @@ pub struct ScheduleInfo {
 struct CronExpr {
     minutes: Vec<u32>,
     hours: Vec<u32>,
-    dom: Vec<u32>,   // day of month (1-31)
+    dom: Vec<u32>,    // day of month (1-31)
     months: Vec<u32>, // 1-12
     dow: Vec<u32>,    // day of week (0=Sun..6=Sat)
 }
@@ -171,11 +172,7 @@ struct SchedulerState {
 ///
 /// `relay_url` is optional — if provided the scheduler will also attempt
 /// to notify the relay when a task completes.
-pub fn spawn(
-    app_handle: tauri::AppHandle,
-    hone_path: String,
-    _relay_url: Option<String>,
-) {
+pub fn spawn(app_handle: tauri::AppHandle, hone_path: String, _relay_url: Option<String>) {
     let state = Arc::new(Mutex::new(SchedulerState::default()));
 
     tokio::spawn(async move {
@@ -303,10 +300,8 @@ fn load_schedules(app: &tauri::AppHandle) -> Result<Vec<ScheduleInfo>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let data =
-        std::fs::read_to_string(&path).map_err(|e| format!("read error: {}", e))?;
-    let schedules: Vec<ScheduleInfo> =
-        serde_json::from_str(&data).unwrap_or_default();
+    let data = std::fs::read_to_string(&path).map_err(|e| format!("read error: {}", e))?;
+    let schedules: Vec<ScheduleInfo> = serde_json::from_str(&data).unwrap_or_default();
     Ok(schedules)
 }
 
@@ -316,12 +311,16 @@ fn load_schedules(app: &tauri::AppHandle) -> Result<Vec<ScheduleInfo>, String> {
 fn execute_task(hone_path: &str, task: &str) -> Result<String, String> {
     let cli_js = format!("{}/dist/cli.js", hone_path);
 
-    info!("Scheduler: executing '{} {} -p \"{}\"'", "node", cli_js, task);
+    info!(
+        "Scheduler: executing '{} {} -p \"{}\"'",
+        "node", cli_js, task
+    );
 
-    let output = Command::new("node")
-        .arg(&cli_js)
-        .arg("-p")
-        .arg(task)
+    let mut cmd = Command::new("node");
+    cmd.arg(&cli_js).arg("-p").arg(task);
+    windows_git_bash::apply_to_command(&mut cmd);
+
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to spawn CLI: {}", e))?;
 
@@ -375,7 +374,11 @@ fn update_schedule_run(
     for s in &mut schedules {
         if s.id == schedule_id {
             s.last_run = Some(fired_at.to_rfc3339());
-            s.last_status = Some(if success { "success".into() } else { "fail".into() });
+            s.last_status = Some(if success {
+                "success".into()
+            } else {
+                "fail".into()
+            });
 
             // Compute next run by advancing 1 minute past the current fire
             // (simplistic — a production scheduler would compute the next

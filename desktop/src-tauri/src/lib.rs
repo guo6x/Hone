@@ -1,9 +1,10 @@
+mod commands;
 mod gateway_manager;
 mod machine_registry;
-mod ssh_tunnel;
 mod mdns_discovery;
 mod scheduler;
-mod commands;
+mod ssh_tunnel;
+mod windows_git_bash;
 
 pub fn run() {
     tauri::Builder::default()

@@ -1,5 +1,5 @@
-use tauri::{State, Manager, AppHandle};
 use std::sync::Mutex;
+use tauri::{AppHandle, Manager, State};
 
 use crate::gateway_manager::{GatewayConfig, GatewayManager, GatewayStatus};
 use crate::machine_registry::{MachineInfo, MachineRegistry, MachineStatus};
@@ -17,7 +17,10 @@ pub struct AppState {
 
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     use std::path::PathBuf;
-    let data_dir = app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
     let _ = std::fs::create_dir_all(&data_dir);
 
     // Try to guess the hone project root from the executable location
@@ -43,17 +46,10 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 /// Attempt to locate the hone project root directory.
 fn guess_hone_path(app: &tauri::App) -> Option<String> {
     // Try common locations relative to the executable
-    let exe_dir = app
-        .path()
-        .resource_dir()
-        .ok()?;
+    let exe_dir = app.path().resource_dir().ok()?;
 
     // Check if hone CLI exists at ../hone relative to the Tauri app
-    let candidate = exe_dir
-        .parent()?
-        .parent()?
-        .parent()?
-        .join("hone");
+    let candidate = exe_dir.parent()?.parent()?.parent()?.join("hone");
 
     if candidate.join("dist").join("cli.js").exists() {
         return Some(candidate.to_string_lossy().to_string());
@@ -79,7 +75,11 @@ pub async fn gateway_start(
     hone_path: String,
     relay_url: Option<String>,
 ) -> Result<String, String> {
-    log::info!("gateway_start called, hone_path={}, relay_url={:?}", hone_path, relay_url);
+    log::info!(
+        "gateway_start called, hone_path={}, relay_url={:?}",
+        hone_path,
+        relay_url
+    );
 
     // Persist hone_path for the scheduler
     {
@@ -170,10 +170,7 @@ pub async fn machines_list(state: State<'_, AppState>) -> Result<Vec<MachineInfo
 }
 
 #[tauri::command]
-pub async fn machine_add(
-    state: State<'_, AppState>,
-    info: MachineInfo,
-) -> Result<String, String> {
+pub async fn machine_add(state: State<'_, AppState>, info: MachineInfo) -> Result<String, String> {
     log::info!("machine_add called, name={}", info.name);
 
     let mut registry = state
@@ -187,10 +184,7 @@ pub async fn machine_add(
 }
 
 #[tauri::command]
-pub async fn machine_remove(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub async fn machine_remove(state: State<'_, AppState>, id: String) -> Result<(), String> {
     log::info!("machine_remove called, id={}", id);
 
     let mut registry = state
@@ -260,15 +254,8 @@ pub async fn discover_gateways(
 // ── SSH Tunnel Commands ──
 
 #[tauri::command]
-pub async fn ssh_connect(
-    state: State<'_, AppState>,
-    config: SshConfig,
-) -> Result<String, String> {
-    log::info!(
-        "ssh_connect called, host={}:{}",
-        config.host,
-        config.port
-    );
+pub async fn ssh_connect(state: State<'_, AppState>, config: SshConfig) -> Result<String, String> {
+    log::info!("ssh_connect called, host={}:{}", config.host, config.port);
 
     let mut ssh_opt = state
         .ssh
@@ -299,20 +286,15 @@ pub async fn ssh_disconnect(state: State<'_, AppState>) -> Result<(), String> {
         .map_err(|e| format!("Failed to acquire SSH lock: {}", e))?;
 
     match ssh_opt.take() {
-        Some(mut tunnel) => {
-            tunnel
-                .disconnect()
-                .map_err(|e| format!("SSH disconnect failed: {}", e))
-        }
+        Some(mut tunnel) => tunnel
+            .disconnect()
+            .map_err(|e| format!("SSH disconnect failed: {}", e)),
         None => Ok(()),
     }
 }
 
 #[tauri::command]
-pub async fn ssh_execute(
-    state: State<'_, AppState>,
-    command: String,
-) -> Result<String, String> {
+pub async fn ssh_execute(state: State<'_, AppState>, command: String) -> Result<String, String> {
     log::info!("ssh_execute called");
 
     let mut ssh_opt = state
@@ -367,7 +349,7 @@ pub struct ScheduleInfo {
     pub id: String,
     pub title: String,
     pub desc: String,
-    pub trigger: String,  // "cron" | "interval" | "once"
+    pub trigger: String, // "cron" | "interval" | "once"
     pub cron: String,
     #[serde(rename = "triggerLabel")]
     pub trigger_label: String,
@@ -377,12 +359,15 @@ pub struct ScheduleInfo {
     #[serde(rename = "lastRun")]
     pub last_run: Option<String>,
     #[serde(rename = "lastStatus")]
-    pub last_status: Option<String>,  // "success" | "fail" | null
-    pub delivery: String,  // "desktop" | "cli" | "session"
+    pub last_status: Option<String>, // "success" | "fail" | null
+    pub delivery: String, // "desktop" | "cli" | "session"
 }
 
 fn schedules_path(app: &tauri::AppHandle) -> std::path::PathBuf {
-    let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
     data_dir.join("schedules.json")
 }
 
@@ -392,24 +377,24 @@ pub async fn schedules_list(app: tauri::AppHandle) -> Result<Vec<ScheduleInfo>, 
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let data = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read schedules: {}", e))?;
-    let schedules: Vec<ScheduleInfo> = serde_json::from_str(&data)
-        .unwrap_or_default();
+    let data =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read schedules: {}", e))?;
+    let schedules: Vec<ScheduleInfo> = serde_json::from_str(&data).unwrap_or_default();
     Ok(schedules)
 }
 
 #[tauri::command]
-pub async fn schedules_save(app: tauri::AppHandle, schedules: Vec<ScheduleInfo>) -> Result<(), String> {
+pub async fn schedules_save(
+    app: tauri::AppHandle,
+    schedules: Vec<ScheduleInfo>,
+) -> Result<(), String> {
     let path = schedules_path(&app);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create data dir: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create data dir: {}", e))?;
     }
     let json = serde_json::to_string_pretty(&schedules)
         .map_err(|e| format!("Failed to serialize schedules: {}", e))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("Failed to write schedules: {}", e))
+    std::fs::write(&path, json).map_err(|e| format!("Failed to write schedules: {}", e))
 }
 
 // ── Auto-start Commands ──
@@ -442,7 +427,9 @@ pub async fn autostart_toggle(app: tauri::AppHandle, enable: bool) -> Result<boo
 // ── Execution Log Commands ──
 
 #[tauri::command]
-pub async fn execution_log_list(app: tauri::AppHandle) -> Result<Vec<crate::scheduler::ExecutionLog>, String> {
+pub async fn execution_log_list(
+    app: tauri::AppHandle,
+) -> Result<Vec<crate::scheduler::ExecutionLog>, String> {
     let path = app
         .path()
         .app_data_dir()
@@ -455,7 +442,6 @@ pub async fn execution_log_list(app: tauri::AppHandle) -> Result<Vec<crate::sche
 
     let data = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read execution log: {}", e))?;
-    let logs: Vec<crate::scheduler::ExecutionLog> = serde_json::from_str(&data)
-        .unwrap_or_default();
+    let logs: Vec<crate::scheduler::ExecutionLog> = serde_json::from_str(&data).unwrap_or_default();
     Ok(logs)
 }

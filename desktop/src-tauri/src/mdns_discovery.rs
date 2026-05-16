@@ -39,8 +39,8 @@ impl MdnsDiscovery {
         use mdns_sd::{ServiceDaemon, ServiceEvent};
 
         let (tx, rx) = mpsc::channel(32);
-        let daemon = ServiceDaemon::new()
-            .map_err(|e| DiscoveryError::ServiceError(e.to_string()))?;
+        let daemon =
+            ServiceDaemon::new().map_err(|e| DiscoveryError::ServiceError(e.to_string()))?;
 
         let receiver = daemon
             .browse(&self.service_type)
