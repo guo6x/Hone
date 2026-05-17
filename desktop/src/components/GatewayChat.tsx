@@ -8,13 +8,14 @@ interface Props {
   theme: string;
   honePath?: string;
   relayUrl?: string;
+  onBuddyEvent?: (event: string, payload?: any) => void;
 }
 
 function formatTime(): string {
   return `${String(new Date().getHours()).padStart(2, '0')}:${String(new Date().getMinutes()).padStart(2, '0')}`;
 }
 
-const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl }) => {
+const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl, onBuddyEvent }) => {
   const t = LANG[lang];
   const { start: ipcStart, stop: ipcStop } = useGateway();
   const [status, setStatus] = useState<GatewayStatus>({
@@ -147,9 +148,23 @@ const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl }) => 
                 time: now,
               }]);
               setStatus((prev) => ({ ...prev, status: 'online' }));
+              onBuddyEvent?.('message', msg.payload);
             }
             break;
+          case 'buddy_event':
+            onBuddyEvent?.(msg.event, msg.payload);
+            break;
+          case 'task_started':
+            onBuddyEvent?.('working', msg);
+            break;
+          case 'browser_task_started':
+            onBuddyEvent?.('working', msg);
+            break;
+          case 'browser_task_result':
+            onBuddyEvent?.(msg.status === 'success' ? 'success' : 'error', msg);
+            break;
           case 'task_complete':
+            onBuddyEvent?.('success', msg);
             if (msg.result) {
               setMessages((prev) => [...prev, {
                 id: 'g' + Date.now(),

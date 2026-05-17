@@ -41,13 +41,33 @@ const WebTaskRunner: React.FC<Props> = ({ lang, relayUrl }) => {
   const wsRef = useRef<WebSocket | null>(null);
   const clientIdRef = useRef(`web_${Date.now()}`);
   const registeredRef = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const MAX_RECONNECT_ATTEMPTS = 10;
+  const BASE_RECONNECT_DELAY_MS = 2000;
 
-  // Auto-connect to relay
+  // Auto-connect to relay with reconnect
   useEffect(() => {
     if (!relayUrl) return;
 
+    let stopped = false;
+
+    const clearTimer = () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+
     const connect = () => {
-      const ws = new WebSocket(relayUrl);
+      if (stopped) return;
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(relayUrl);
+      } catch {
+        scheduleReconnect();
+        return;
+      }
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -64,6 +84,7 @@ const WebTaskRunner: React.FC<Props> = ({ lang, relayUrl }) => {
 
           if (msg.type === 'registered') {
             registeredRef.current = true;
+            reconnectAttemptsRef.current = 0;
           }
 
           if (msg.type === 'browser_task_result') {
@@ -79,14 +100,12 @@ const WebTaskRunner: React.FC<Props> = ({ lang, relayUrl }) => {
             };
             setMessages(prev => {
               const updated = [...prev];
-              // Find last user message and attach result
               for (let i = updated.length - 1; i >= 0; i--) {
                 if (updated[i].from === 'user' && !updated[i].result) {
                   updated[i] = { ...updated[i], result: taskResult };
                   break;
                 }
               }
-              // Add agent response
               const statusText = taskResult.status === 'success'
                 ? `任务完成！${taskResult.finalUrl ? ` 最终页面: ${taskResult.finalUrl}` : ''} (${taskResult.steps} 步, ${((taskResult.durationMs || 0) / 1000).toFixed(1)}s)`
                 : `任务失败: ${taskResult.error || taskResult.status}`;
@@ -116,13 +135,39 @@ const WebTaskRunner: React.FC<Props> = ({ lang, relayUrl }) => {
       ws.onclose = () => {
         wsRef.current = null;
         registeredRef.current = false;
+        if (!stopped) scheduleReconnect();
       };
 
-      ws.onerror = () => {};
+      ws.onerror = () => {
+        // onclose will fire after this
+      };
+    };
+
+    const scheduleReconnect = () => {
+      if (stopped) return;
+      if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) return;
+
+      clearTimer();
+      reconnectAttemptsRef.current++;
+      const delay = Math.min(
+        BASE_RECONNECT_DELAY_MS * Math.pow(2, reconnectAttemptsRef.current - 1),
+        30_000,
+      );
+      reconnectTimerRef.current = setTimeout(() => {
+        reconnectTimerRef.current = null;
+        connect();
+      }, delay);
     };
 
     connect();
-    return () => { wsRef.current?.close(); };
+
+    return () => {
+      stopped = true;
+      clearTimer();
+      wsRef.current?.close();
+      wsRef.current = null;
+      registeredRef.current = false;
+    };
   }, [relayUrl]);
 
   useEffect(() => {

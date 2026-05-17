@@ -253,9 +253,12 @@ export function getLogoDisplayData(): {
   const cwd = serverUrl
     ? `${displayPath} in ${serverUrl.replace(/^https?:\/\//, '')}`
     : displayPath
-  const billingType = isClaudeAISubscriber()
-    ? getSubscriptionName()
-    : 'API Usage Billing'
+  // Hone users always use API keys, never show Anthropic billing
+  const billingType = process.env.USER_TYPE === 'hone'
+    ? ''
+    : isClaudeAISubscriber()
+      ? getSubscriptionName()
+      : ''
   const agentName = getInitialSettings().agent
 
   return {

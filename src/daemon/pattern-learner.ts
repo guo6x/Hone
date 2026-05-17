@@ -113,18 +113,18 @@ function weekdayHistogram(entries: ActivityLogEntry[], type: string): Map<number
 }
 
 /**
- * Find the most common value in a histogram
+ * Find the key with the highest value in a histogram
  */
-function peakHour(hist: Map<number, number>): { hour: number; count: number } {
-  let bestHour = 0
-  let bestCount = 0
-  for (const [h, c] of hist) {
+function findPeak(hist: Map<number, number>): { key: number; count: number } {
+  let bestKey = 0
+  let bestCount = -1
+  for (const [k, c] of hist) {
     if (c > bestCount) {
       bestCount = c
-      bestHour = h
+      bestKey = k
     }
   }
-  return { hour: bestHour, count: bestCount }
+  return { key: bestKey, count: bestCount }
 }
 
 // ── Main detection pipeline ──
@@ -161,18 +161,18 @@ export function detectPatterns(logs?: ActivityLogEntry[]): DetectedPattern[] {
       cliStarts.map(e => ({ ts: e.ts, type: 'cli_session', detail: '' })),
       'cli_session'
     )
-    const peak = peakHour(hist)
+    const peak = findPeak(hist)
     if (peak.count >= 3) {
       const confidence = Math.min(0.9, peak.count / cliStarts.length + dataAgeDays / 30)
       patterns.push({
         type: 'work_start_time',
-        description: `用户通常在 ${peak.hour}:00 开始工作`,
+        description: `用户通常在 ${peak.key}:00 开始工作`,
         confidence,
         evidence: cliStarts.slice(0, 5).map(e => `  ${e.day} — ${e.hour}:00`),
         suggestedSchedule: {
-          text: `每天早上 ${peak.hour - 1}:45 检查今日任务`,
+          text: `每天早上 ${peak.key - 1}:45 检查今日任务`,
           task: '检查待办事项并总结',
-          cron: `45 ${Math.max(0, peak.hour - 1)} * * *`,
+          cron: `45 ${Math.max(0, peak.key - 1)} * * *`,
         },
       })
     }
@@ -186,19 +186,19 @@ export function detectPatterns(logs?: ActivityLogEntry[]): DetectedPattern[] {
 
   if (deployActions.length >= 3) {
     const dayHist = weekdayHistogram(deployActions, 'tool_call')
-    const peak = peakHour(dayHist)
+    const peak = findPeak(dayHist)
     const weekdayNames = ['日', '一', '二', '三', '四', '五', '六']
     patterns.push({
       type: 'deployment_day',
-      description: `用户经常在周${weekdayNames[peak.hour]}进行部署`,
+      description: `用户经常在周${weekdayNames[peak.key]}进行部署`,
       confidence: Math.min(0.7, deployActions.length / 5 + dataAgeDays / 30),
       evidence: deployActions.slice(0, 3).map(e =>
         `  ${new Date(e.ts).toISOString()} — ${e.detail.slice(0, 80)}`
       ),
       suggestedSchedule: {
-        text: `每${weekdayNames[peak.hour] === '日' || weekdayNames[peak.hour] === '六' ? '个工作日' : '周' + weekdayNames[peak.hour]}部署提醒`,
+        text: `每${weekdayNames[peak.key] === '日' || weekdayNames[peak.key] === '六' ? '个工作日' : '周' + weekdayNames[peak.key]}部署提醒`,
         task: '检查部署状态并通知',
-        cron: `0 10 * * ${peak.hour}`,
+        cron: `0 10 * * ${peak.key}`,
       },
     })
   }

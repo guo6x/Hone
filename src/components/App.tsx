@@ -5,12 +5,19 @@ import { StatsProvider, type StatsStore } from '../context/stats.js';
 import { type AppState, AppStateProvider } from '../state/AppState.js';
 import { onChangeAppState } from '../state/onChangeAppState.js';
 import type { FpsMetrics } from '../utils/fpsTracker.js';
+import { useCliBuddySync } from '../buddy/buddySync.js';
+
 type Props = {
   getFpsMetrics: () => FpsMetrics | undefined;
   stats?: StatsStore;
   initialState: AppState;
   children: React.ReactNode;
 };
+
+function BuddySync() {
+  useCliBuddySync();
+  return null;
+}
 
 /**
  * Top-level wrapper for interactive sessions.
@@ -26,7 +33,10 @@ export function App(t0) {
   } = t0;
   let t1;
   if ($[0] !== children || $[1] !== initialState) {
-    t1 = <AppStateProvider initialState={initialState} onChangeAppState={onChangeAppState}>{children}</AppStateProvider>;
+    t1 = <AppStateProvider initialState={initialState} onChangeAppState={onChangeAppState}>
+      <BuddySync />
+      {children}
+    </AppStateProvider>;
     $[0] = children;
     $[1] = initialState;
     $[2] = t1;

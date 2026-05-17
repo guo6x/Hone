@@ -2,3 +2,16 @@ node_modules/
 dist/
 *.node
 .DS_Store
+
+# Desktop build artifacts
+desktop/target2/
+desktop/release/
+desktop/src-tauri/target/
+
+# Temp / scratch
+~/
+scratch/
+
+# Backup / build output
+*.backup
+*.vsix

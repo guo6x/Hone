@@ -126,6 +126,9 @@ const result = await Bun.build({
     '@anthropic-ai/bedrock-sdk',
     '@anthropic-ai/vertex-sdk',
     '@anthropic-ai/foundry-sdk',
+    'playwright',
+    'playwright-core',
+    'chromium-bidi',
   ],
   plugins: [
     {

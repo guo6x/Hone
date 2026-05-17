@@ -9,6 +9,7 @@ import CanvasViewer from './components/CanvasViewer';
 import WebTaskRunner from './components/WebTaskRunner';
 import { SettingsPage } from './components/SettingsPage';
 import StatusBar from './components/StatusBar';
+import HoneBuddy, { BuddyState } from './components/HoneBuddy';
 import { DevicePairingModal } from './components/DevicePairingModal';
 import { useMachines, useDiscovery, useSchedules, isTauri, useTauriConfig, useGateway } from './tauri/useTauri';
 import type { DiscoveredGateway } from './tauri/types';
@@ -32,14 +33,6 @@ export default function App() {
   const { machines, addMachine, removeMachine } = useMachines();
   const { gateways: discoveredGateways, scanning, scan } = useDiscovery();
   const { start: ipcGatewayStart } = useGateway();
-
-  // Auto-start Gateway daemon on app launch
-  useEffect(() => {
-    const autoStart = settings.gatewayAutoStart;
-    if (autoStart && isTauri()) {
-      ipcGatewayStart(settings.workspaceDir || 'hone', settings.relayUrl);
-    }
-  }, []); // only on mount
 
   // Dashboard state
   const [activeMachine, setActiveMachine] = useState<string | null>(null);
@@ -73,6 +66,19 @@ export default function App() {
   } as const;
 
   const { config: tauriConfig, save: saveTauriConfig } = useTauriConfig();
+
+  // Auto-start Gateway daemon after Tauri config is loaded
+  useEffect(() => {
+    if (!tauriConfig) return;
+    if (!isTauri()) return;
+
+    const autoStart = tauriConfig.auto_start ?? true;
+    if (!autoStart) return;
+
+    const relayUrl = tauriConfig.relay_url || 'wss://hone-relay.marsailleippi79.workers.dev/connect/default';
+    const honePath = (tauriConfig as any).data_dir || 'hone';
+    ipcGatewayStart(honePath, relayUrl);
+  }, [tauriConfig]); // wait for config load, then run once
 
   const [settings, setSettings] = useState<SettingsData>(() => {
     const defaults: SettingsData = {
@@ -134,6 +140,7 @@ export default function App() {
         guiModelUrl: next.guiModelUrl,
         browserHeadless: next.browserHeadless,
         browserMaxSteps: next.browserMaxSteps,
+        buddySpecies: next.buddySpecies,
       }));
     } catch {}
     // Tauri (all fields including provider settings)
@@ -194,6 +201,48 @@ export default function App() {
       saveSchedules(next);
     }
   }, [scheduleModal.editing]);
+
+  // Buddy state
+  const [buddyState, setBuddyState] = useState<BuddyState>('idle');
+  const [buddyText, setBuddyText] = useState<string | undefined>();
+
+  const handleBuddyEvent = useCallback((event: string, payload?: any) => {
+    console.log('[App] Buddy Event:', event, payload);
+    switch (event) {
+      case 'thinking':
+        setBuddyState('thinking');
+        setBuddyText(payload?.text || '正在思考...');
+        break;
+      case 'working':
+        setBuddyState('working');
+        setBuddyText(payload?.text || '正在工作...');
+        break;
+      case 'success':
+        setBuddyState('success');
+        setBuddyText(payload?.text || '搞定！');
+        setTimeout(() => setBuddyState('idle'), 3000);
+        break;
+      case 'error':
+        setBuddyState('error');
+        setBuddyText(payload?.text || '出错了');
+        setTimeout(() => setBuddyState('idle'), 5000);
+        break;
+      case 'suggestion':
+        setBuddyState('suggestion');
+        setBuddyText(payload?.text || '我有一个建议');
+        break;
+      case 'idle':
+        setBuddyState('idle');
+        break;
+      case 'message':
+        // Reaction to gateway messages
+        if (buddyState === 'idle') {
+          setBuddyState('thinking');
+          setTimeout(() => setBuddyState('idle'), 1000);
+        }
+        break;
+    }
+  }, [buddyState]);
 
   return (
     <div style={styles.appShell}>
@@ -257,6 +306,7 @@ export default function App() {
               theme={theme}
               honePath={settings.workspaceDir || ''}
               relayUrl={settings.relayUrl}
+              onBuddyEvent={handleBuddyEvent}
             />
           )}
 
@@ -310,25 +360,29 @@ export default function App() {
               onClose={() => setPairingModal(false)}
               onPaired={async (info: { name: string; method: string; host: string; port: number; code: string; username?: string }) => {
                 if (isTauri() && info) {
-                  const now = new Date().toISOString();
-                  const method: { Local: { pairing_code: string } } | { Ssh: { host: string; port: number; username: string } } | { Tunnel: { host: string; port: number } } =
-                    info.method === 'local'
-                      ? { Local: { pairing_code: info.code || '' } }
-                      : info.method === 'ssh'
-                      ? { Ssh: { host: info.host, port: info.port, username: info.username || '' } }
-                      : { Tunnel: { host: info.host, port: info.port } };
-                  await addMachine({
-                    name: info.name,
-                    host: info.host,
-                    port: info.port,
-                    method,
-                    status: 'Online' as const,
-                    sessions: 0,
-                    os: '',
-                    cpu: '',
-                    last_seen: now,
-                    added_at: now,
-                  });
+                  try {
+                    const now = new Date().toISOString();
+                    const method: { Local: { pairing_code: string } } | { Ssh: { host: string; port: number; username: string } } | { Tunnel: { host: string; port: number } } =
+                      info.method === 'local'
+                        ? { Local: { pairing_code: info.code || '' } }
+                        : info.method === 'ssh'
+                        ? { Ssh: { host: info.host, port: info.port, username: info.username || '' } }
+                        : { Tunnel: { host: info.host, port: info.port } };
+                    await addMachine({
+                      name: info.name,
+                      host: info.host,
+                      port: info.port,
+                      method,
+                      status: 'Online' as const,
+                      sessions: 0,
+                      os: '',
+                      cpu: '',
+                      last_seen: now,
+                      added_at: now,
+                    });
+                  } catch (e) {
+                    console.error('Failed to add machine:', e);
+                  }
                 }
                 setPairingModal(false);
               }}
@@ -347,6 +401,24 @@ export default function App() {
               lang={lang}
             />
           )}
+
+          <HoneBuddy 
+            state={buddyState} 
+            text={buddyText} 
+            species={settings.buddySpecies as any || 'robot'}
+            onAction={(action) => {
+              if (action === 'pet') {
+                setBuddyState('success');
+                setBuddyText('摸摸头~');
+                setTimeout(() => setBuddyState('idle'), 2000);
+              }
+            }}
+            // Dynamically adjust position based on view
+            style={{ 
+              right: activeView === 'gateway' ? 320 : 40,
+              transition: 'right 0.3s ease' 
+            }}
+          />
         </div>
       </div>
     </div>

@@ -20,7 +20,8 @@ import type {
 } from './types.js'
 import * as playwright from './playwright-runner.js'
 import { queryGUIModel, NoVisionModelError, type VisionModelConfig } from './gui-model.js'
-import { extractPage, buildFallbackPrompt, parseFallbackResponse } from './dom-fallback.js'
+import { extractPage } from './playwright-runner.js'
+import { buildFallbackPrompt, parseFallbackResponse } from './dom-fallback.js'
 
 /** Callback to request user confirmation for high-risk actions. */
 export type ConfirmCallback = (taskId: string, description: string) => Promise<boolean>
@@ -55,6 +56,7 @@ export class BrowserAgent implements BrowserAgentInterface {
   async executeTask(task: GUITask): Promise<GUITaskResult> {
     const startTime = Date.now()
     const maxSteps = task.maxSteps || this.config.maxSteps
+    const taskTimeoutMs = (task.timeoutMs || this.config.defaultTimeout * 5) // default 5 mins
     const steps: GUIStep[] = []
 
     try {
@@ -64,6 +66,17 @@ export class BrowserAgent implements BrowserAgentInterface {
       }
 
       for (let i = 0; i < maxSteps; i++) {
+        // Global task timeout check
+        if (Date.now() - startTime > taskTimeoutMs) {
+          return {
+            taskId: task.id,
+            status: 'timeout',
+            steps,
+            durationMs: Date.now() - startTime,
+            error: `Global task timeout after ${taskTimeoutMs}ms`,
+          }
+        }
+
         const stepStart = Date.now()
 
         // Get current page state
@@ -109,7 +122,7 @@ export class BrowserAgent implements BrowserAgentInterface {
         const step: GUIStep = {
           stepNumber: i + 1,
           action,
-          screenshotBase64: screenshotBase64.slice(0, 200), // thumbnail only
+          screenshotBase64, // full screenshot for client preview
           timestamp: new Date().toISOString(),
           durationMs: Date.now() - actionStart,
         }

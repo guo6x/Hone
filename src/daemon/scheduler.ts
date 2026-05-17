@@ -280,11 +280,28 @@ function checkAll(state: SchedulerState): void {
     }
 
     if (shouldTrigger) {
-      // Prevent double-fire within the same minute
+      // Prevent double-fire within the same minute or overlap
       const lastTrigger = entry.lastTriggeredAt || 0
-      if (now.getTime() - lastTrigger < 60_000) continue
+      const nowMs = now.getTime()
 
-      entry.lastTriggeredAt = now.getTime()
+      // CRITICAL: Robust double-fire protection
+      // For cron tasks (* * * * *), we check if we've already run in this specific minute.
+      if (entry.trigger.type === 'cron') {
+        const lastRunDate = new Date(lastTrigger)
+        if (
+          lastRunDate.getMinutes() === now.getMinutes() &&
+          lastRunDate.getHours() === now.getHours() &&
+          lastRunDate.getDate() === now.getDate() &&
+          lastRunDate.getMonth() === now.getMonth()
+        ) {
+          continue
+        }
+      } else {
+        // For intervals/one-time, standard 60s debounce is fine
+        if (nowMs - lastTrigger < 60_000) continue
+      }
+
+      entry.lastTriggeredAt = nowMs
       entry.lastStatus = undefined
       void state.onTrigger(entry).then(() => {
         // Persist after each trigger

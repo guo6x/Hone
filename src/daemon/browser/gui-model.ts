@@ -6,7 +6,7 @@
  * Reuses the existing provider chain for API calls.
  * Falls back to DOM-based extraction when no vision model is configured.
  */
-import { getProvider } from '../services/providers/index.js'
+import { getProvider } from '../../services/providers/index.js'
 import type { GUIAction, GUITask } from './types.js'
 
 const GUI_SYSTEM_PROMPT = `You are a vision-based web agent. Your task is to control a browser to complete user requests.

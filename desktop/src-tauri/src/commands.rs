@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+use tauri::{Manager, State};
 
 use crate::gateway_manager::{GatewayConfig, GatewayManager, GatewayStatus};
 use crate::machine_registry::{MachineInfo, MachineRegistry, MachineStatus};
@@ -295,20 +295,72 @@ pub async fn ssh_disconnect(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn ssh_execute(state: State<'_, AppState>, command: String) -> Result<String, String> {
-    log::info!("ssh_execute called");
+    log::warn!("ssh_execute called: {}", command);
 
-    let mut ssh_opt = state
-        .ssh
-        .lock()
-        .map_err(|e| format!("Failed to acquire SSH lock: {}", e))?;
+    // Take the session out of the tunnel while holding the lock, then drop the lock
+    let session_opt: Option<ssh2::Session> = {
+        let mut ssh_opt = state
+            .ssh
+            .lock()
+            .map_err(|e| format!("Failed to acquire SSH lock: {}", e))?;
 
-    let tunnel = ssh_opt
-        .as_mut()
-        .ok_or_else(|| "No active SSH tunnel".to_string())?;
+        let tunnel = ssh_opt
+            .as_mut()
+            .ok_or_else(|| "No active SSH tunnel".to_string())?;
 
-    tunnel
-        .execute(&command)
-        .map_err(|e| format!("SSH execute failed: {}", e))
+        tunnel.session.take()
+    };
+    // Lock dropped here — safe to await
+
+    let session_arc = std::sync::Arc::new(std::sync::Mutex::new(session_opt));
+    let arc_for_task = session_arc.clone();
+    let command_clone = command.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let session_opt = arc_for_task.lock().unwrap();
+        let session = session_opt.as_ref().ok_or("SSH session lost")?;
+
+        let mut channel = session
+            .channel_session()
+            .map_err(|e| format!("IO error: {}", e))?;
+
+        channel
+            .exec(&command_clone)
+            .map_err(|e| format!("IO error: {}", e))?;
+
+        let mut output = String::new();
+        use std::io::Read;
+        channel
+            .read_to_string(&mut output)
+            .map_err(|e| format!("IO error: {}", e))?;
+
+        channel
+            .wait_close()
+            .map_err(|e| format!("IO error: {}", e))?;
+
+        Ok(output)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    // Put the session back
+    match std::sync::Arc::try_unwrap(session_arc) {
+        Ok(mutex) => {
+            let put_back = mutex.into_inner().ok().flatten();
+            let mut ssh_opt = state
+                .ssh
+                .lock()
+                .map_err(|e| format!("Failed to acquire SSH lock: {}", e))?;
+            if let Some(tunnel) = ssh_opt.as_mut() {
+                tunnel.session = put_back;
+            }
+        }
+        Err(_) => {
+            // Session ref leaked — drop it, tunnel will reconnect if needed
+        }
+    }
+
+    result
 }
 
 // ── Settings Commands ──

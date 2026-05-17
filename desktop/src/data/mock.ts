@@ -65,6 +65,7 @@ export interface SettingsData {
   guiModelUrl: string;
   browserHeadless: boolean;
   browserMaxSteps: string;
+  buddySpecies?: string;
 }
 
 export interface GatewayMessage {

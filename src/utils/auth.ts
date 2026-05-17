@@ -353,6 +353,25 @@ export function getAnthropicApiKeyWithSource(
 }
 
 /**
+ * Check for any configured API key (DeepSeek, OpenAI, Anthropic, etc.)
+ * and return a simple status for the UI.
+ */
+export function getApiKeyStatus(): { hasKey: boolean; source: string } {
+  const keys = [
+    { key: process.env.DEEPSEEK_API_KEY, name: 'DEEPSEEK_API_KEY' },
+    { key: process.env.OPENAI_API_KEY, name: 'OPENAI_API_KEY' },
+    { key: process.env.HONE_API_KEY, name: 'HONE_API_KEY' },
+  ]
+  for (const k of keys) {
+    if (k.key) return { hasKey: true, source: k.name }
+  }
+  // Also check the Anthropic key source
+  const anthroKey = getAnthropicApiKeyWithSource()
+  if (anthroKey.key) return { hasKey: true, source: anthroKey.source }
+  return { hasKey: false, source: 'none' }
+}
+
+/**
  * Get the configured apiKeyHelper from settings.
  * In bare mode, only the --settings flag source is consulted — apiKeyHelper
  * from ~/.claude/settings.json or project settings is ignored.

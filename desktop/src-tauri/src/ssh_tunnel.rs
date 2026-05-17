@@ -46,7 +46,7 @@ pub enum TunnelError {
 
 pub struct SshTunnel {
     config: SshConfig,
-    session: Option<Session>,
+    pub(crate) session: Option<Session>,
     local_port: u16,
     remote_port: u16,
 }

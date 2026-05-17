@@ -1,3 +1,5 @@
+use tauri::Manager;
+
 mod commands;
 mod gateway_manager;
 mod machine_registry;
@@ -39,6 +41,14 @@ pub fn run() {
             commands::autostart_toggle,
             commands::execution_log_list,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                let state = window.state::<commands::AppState>();
+                if let Ok(mut gateway) = state.gateway.lock() {
+                    let _ = gateway.stop();
+                };
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running Hone Desktop");
 }

@@ -40,7 +40,6 @@ export interface GatewayState {
   schedules: Map<string, ScheduleEntry>
   clients: Map<string, ClientInfo>
   pendingConfirmations: Map<string, { description: string; resolve: (approved: boolean) => void }>
-  pendingConfirmations: Map<string, { description: string; resolve: (approved: boolean) => void }>
   pendingPairings: Map<string, { clientId: string; code: string; resolve: (approved: boolean) => void }>
   reconnectAttempts: number
   heartbeatTimer: ReturnType<typeof setInterval> | null
@@ -137,6 +136,15 @@ function createGatewayContext(state: GatewayState): GatewayContext {
 
 function broadcast(state: GatewayState, msg: unknown): void {
   sendJSON(state.ws!, msg)
+}
+
+function broadcastBuddyEvent(state: GatewayState, event: string, text?: string, data?: any): void {
+  broadcast(state, {
+    type: 'buddy_event',
+    event,
+    payload: { text, data },
+    ts: new Date().toISOString(),
+  })
 }
 
 export async function startGateway(config: GatewayConfig): Promise<GatewayState> {
@@ -262,6 +270,7 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
       const suggestions = getPatternSuggestions()
       if (suggestions.length > 0) {
         log(config, `Pattern learner found ${suggestions.length} suggestions`)
+        broadcastBuddyEvent(state, 'suggestion', suggestions[0].text, suggestions[0])
         for (const s of suggestions) {
           broadcast(state, {
             type: 'schedule_suggestion',
@@ -411,10 +420,12 @@ async function handleMessage(
       log(config, `Received message from ${msg.from || 'client'}: ${text.slice(0, 100)}`)
 
       try {
+        broadcastBuddyEvent(state, 'thinking', '正在思考意图...')
         const intent = await gatewayLLM(text)
 
         switch (intent.action) {
           case 'reply': {
+            broadcastBuddyEvent(state, 'idle')
             sendJSON(state.ws!, {
               type: 'message',
               target: 'client',
@@ -425,12 +436,7 @@ async function handleMessage(
             break
           }
           case 'dispatch': {
-            sendJSON(state.ws!, {
-              type: 'task_started',
-              task: intent.task,
-              ts: new Date().toISOString(),
-            })
-
+            // Buddy event handled inside gatewayCtx.dispatchTask
             const gatewayCtx = createGatewayContext(state)
             const result = await gatewayCtx.dispatchTask(intent.task || text)
 
@@ -442,6 +448,7 @@ async function handleMessage(
             break
           }
           case 'schedule': {
+            broadcastBuddyEvent(state, 'success', '日程已创建')
             sendJSON(state.ws!, {
               type: 'message',
               target: 'client',
@@ -453,6 +460,7 @@ async function handleMessage(
           }
           case 'browser': {
             if (!state.browserAgent) {
+              broadcastBuddyEvent(state, 'error', '浏览器代理未启用')
               sendJSON(state.ws!, {
                 type: 'message',
                 target: 'client',
@@ -462,6 +470,7 @@ async function handleMessage(
               })
               break
             }
+            // Buddy event handled inside executeTask (or similar)
             sendJSON(state.ws!, {
               type: 'browser_task_started',
               task: intent.task || text,
@@ -470,6 +479,7 @@ async function handleMessage(
 
             // Execute browser task (non-blocking — result sent via relay)
             const browserTask = intent.task || text
+            broadcastBuddyEvent(state, 'working', `网页任务: ${browserTask}`)
             state.browserAgent.executeTask({
               id: `browser_${Date.now()}`,
               profileName: 'default',
@@ -477,6 +487,10 @@ async function handleMessage(
               riskLevel: 'low',
             }).then(result => {
               logActivity('web_task', `${result.status}: ${browserTask.slice(0, 80)}`)
+              if (result.status === 'success') broadcastBuddyEvent(state, 'success', '网页任务完成')
+              else if (result.status === 'failed') broadcastBuddyEvent(state, 'error', `网页任务失败: ${result.error}`)
+              else broadcastBuddyEvent(state, 'idle')
+
               sendJSON(state.ws!, {
                 type: 'browser_task_result',
                 taskId: result.taskId,
@@ -488,6 +502,7 @@ async function handleMessage(
                 ts: new Date().toISOString(),
               })
             }).catch(err => {
+              broadcastBuddyEvent(state, 'error', `执行错误: ${err.message}`)
               sendJSON(state.ws!, {
                 type: 'browser_task_result',
                 status: 'failed',
@@ -499,6 +514,7 @@ async function handleMessage(
           }
         }
       } catch (err) {
+        broadcastBuddyEvent(state, 'error', '内部错误')
         sendJSON(state.ws!, {
           type: 'message',
           target: 'client',

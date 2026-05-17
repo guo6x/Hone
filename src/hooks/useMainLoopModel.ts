@@ -3,6 +3,7 @@ import { onGrowthBookRefresh } from '../services/analytics/growthbook.js'
 import { useAppState } from '../state/AppState.js'
 import {
   getDefaultMainLoopModelSetting,
+  getUserSpecifiedModelSetting,
   type ModelName,
   parseUserSpecifiedModel,
 } from '../utils/model/model.js'
@@ -28,6 +29,7 @@ export function useMainLoopModel(): ModelName {
   const model = parseUserSpecifiedModel(
     mainLoopModelForSession ??
       mainLoopModel ??
+      getUserSpecifiedModelSetting() ??
       getDefaultMainLoopModelSetting(),
   )
   return model

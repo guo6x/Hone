@@ -169,6 +169,9 @@ export type AppState = DeepImmutable<{
   companionReaction?: string
   // Timestamp of last /buddy pet ...CompanionSprite renders hearts while recent
   companionPetAt?: number
+  // Real-time buddy state from Gateway
+  buddyStatus?: 'idle' | 'thinking' | 'working' | 'success' | 'error' | 'suggestion'
+  buddyText?: string
   // TODO (ashwin): see if we can use utility-types DeepReadonly for this
   mcp: {
     clients: MCPServerConnection[]

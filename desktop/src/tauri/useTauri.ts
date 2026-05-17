@@ -219,14 +219,16 @@ export function useSchedules(): {
   }, []);
 
   const save = useCallback(async (s: ScheduleInfo[]) => {
+    const prev = schedules;
     setSchedules(s);
     if (!isTauri()) return;
     try {
       await api.schedulesSave(s);
     } catch (e) {
       console.error('Failed to save schedules:', e);
+      setSchedules(prev); // Rollback
     }
-  }, []);
+  }, [schedules]);
 
   return { schedules, save, loading };
 }

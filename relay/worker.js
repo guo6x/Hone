@@ -146,7 +146,7 @@ export class RelayRoom {
       case "task_started":
       case "task_progress":
       case "task_complete": {
-        this._broadcastToClients(msg);
+        this._broadcastToClients(ws, msg);
         break;
       }
 
@@ -161,7 +161,7 @@ export class RelayRoom {
         // If the message includes schedules[] data, it's a response from
         // the gateway — broadcast to approved clients.
         if (Array.isArray(msg.schedules)) {
-          this._broadcastToClients(msg);
+          this._broadcastToClients(ws, msg);
         } else {
           // Request from a client — forward to gateway.
           this._forwardToGateway(msg);
@@ -178,20 +178,20 @@ export class RelayRoom {
 
       case "schedule_created": {
         // Gateway created a schedule — broadcast to all approved clients
-        this._broadcastToClients(msg);
+        this._broadcastToClients(ws, msg);
         break;
       }
 
       case "schedule_triggered": {
         this._forwardToClient(msg, msg.clientId);
-        this._broadcastToClients(msg);
+        this._broadcastToClients(ws, msg);
         break;
       }
 
       // ----- Canvas streaming --------------------------------------------
 
       case "canvas_update": {
-        this._broadcastToClients(msg);
+        this._broadcastToClients(ws, msg);
         break;
       }
 
@@ -332,6 +332,7 @@ export class RelayRoom {
       pairingCode,
       approved: false,
       connectedAt: now,
+      lastPong: now,
     });
 
     this._send(ws, {
@@ -974,6 +975,51 @@ export default {
     if (match) {
       const sessionId = match[1];
       const id = env.RELAY_ROOM.idFromName(sessionId);
+      const stub = env.RELAY_ROOM.get(id);
+      return stub.fetch(request);
+    }
+
+    // Unknown path
+    return new Response("Not Found", { status: 404 });
+  },
+};
+_ROOM.idFromName(sessionId);
+      const stub = env.RELAY_ROOM.get(id);
+      return stub.fetch(request);
+    }
+
+    // Unknown path
+    return new Response("Not Found", { status: 404 });
+  },
+};
+tatus: "ok",
+        version: "v2",
+        time: new Date().toISOString(),
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // PWA root — serve the client HTML
+    if (path === "/" || path === "/index.html") {
+      return serveClientHTML();
+    }
+
+    // WebSocket upgrade — /connect/:sessionId
+    const match = path.match(/^\/connect\/([^/]+)$/);
+    if (match) {
+      const sessionId = match[1];
+      const id = env.RELAY_ROOM.idFromName(sessionId);
+      const stub = env.RELAY_ROOM.get(id);
+      return stub.fetch(request);
+    }
+
+    // Unknown path
+    return new Response("Not Found", { status: 404 });
+  },
+};
+_ROOM.idFromName(sessionId);
       const stub = env.RELAY_ROOM.get(id);
       return stub.fetch(request);
     }

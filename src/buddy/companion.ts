@@ -125,9 +125,16 @@ export function companionUserId(): string {
 // so species renames and SPECIES-array edits can't break stored companions,
 // and editing config.companion can't fake a rarity.
 export function getCompanion(): Companion | undefined {
-  const stored = getGlobalConfig().companion
+  const config = getGlobalConfig()
+  const stored = config.companion
   if (!stored) return undefined
   const { bones } = roll(companionUserId())
+  
+  // Override species if buddySpecies is set in config
+  if (config.buddySpecies && SPECIES.includes(config.buddySpecies as any)) {
+    stored.species = config.buddySpecies as any
+  }
+
   // bones last so stale bones fields in old-format configs get overridden
   return { ...stored, ...bones }
 }

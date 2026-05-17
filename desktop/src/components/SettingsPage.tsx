@@ -4,13 +4,14 @@ import { type SettingsData, type SkillInfo, type McpInfo } from '../data/mock';
 import { type ThemeName } from '../hooks/useTheme';
 import { isTauri } from '../tauri/useTauri';
 
-type Section = 'provider' | 'gateway' | 'data' | 'skills' | 'mcp' | 'browser' | 'appearance' | 'about';
+type Section = 'provider' | 'gateway' | 'data' | 'skills' | 'buddy' | 'mcp' | 'browser' | 'appearance' | 'about';
 
 const navItems: { key: Section; zh: string; en: string }[] = [
   { key: 'provider', zh: '提供方', en: 'Provider' },
   { key: 'gateway', zh: '网关', en: 'Gateway' },
   { key: 'data', zh: '数据', en: 'Data' },
   { key: 'skills', zh: '技能', en: 'Skills' },
+  { key: 'buddy', zh: '智能伙伴', en: 'AI Buddy' },
   { key: 'mcp', zh: 'MCP', en: 'MCP Servers' },
   { key: 'browser', zh: '浏览器', en: 'Browser' },
   { key: 'appearance', zh: '外观', en: 'Appearance' },
@@ -50,6 +51,7 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
   const [guiModelUrl, setGuiModelUrl] = useState(settings.guiModelUrl ?? '');
   const [browserHeadless, setBrowserHeadless] = useState(settings.browserHeadless ?? true);
   const [browserMaxSteps, setBrowserMaxSteps] = useState(settings.browserMaxSteps ?? '15');
+  const [buddySpecies, setBuddySpecies] = useState(settings.buddySpecies ?? 'robot');
   const [showDanger, setShowDanger] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [skills, setSkills] = useState<SkillInfo[]>(() => {
@@ -107,11 +109,12 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
         guiModelUrl,
         browserHeadless,
         browserMaxSteps,
+        buddySpecies,
       });
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     }, 600);
-  }, [provider, apiKeyDraft, model, autoStart, relayUrl, localPort, workspace, logRetention, browserEnabled, guiModelUrl, browserHeadless, browserMaxSteps, setSettings]);
+  }, [provider, apiKeyDraft, model, autoStart, relayUrl, localPort, workspace, logRetention, browserEnabled, guiModelUrl, browserHeadless, browserMaxSteps, buddySpecies, setSettings]);
 
   useEffect(() => { autoSave(); }, [autoSave]);
 
@@ -638,12 +641,34 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
     </div>
   );
 
+  const renderBuddy = () => (
+    <div style={s.section}>
+      <h2 style={s.title}>{t('🤖 智能伙伴', '🤖 AI Buddy')}</h2>
+      <p style={s.desc}>{t('选择一个你喜欢的 ASCII 宠物作为 AI 助手的化身。', 'Pick an ASCII pet as your AI avatar.')}</p>
+      <label style={s.label}>{t('伙伴品种', 'Buddy Species')}</label>
+      <select
+        style={{ ...s.select, marginBottom: 16 }}
+        value={buddySpecies}
+        onChange={(e) => setBuddySpecies(e.target.value)}
+      >
+        <option value="robot">Robot</option>
+        <option value="cat">Cat</option>
+        <option value="duck">Duck</option>
+        <option value="owl">Owl</option>
+        <option value="ghost">Ghost</option>
+        <option value="blob">Blob</option>
+        <option value="axolotl">Axolotl</option>
+      </select>
+    </div>
+  );
+
   const renderContent = () => {
     switch (section) {
       case 'provider': return renderProvider();
       case 'gateway': return renderGateway();
       case 'data': return renderData();
       case 'skills': return renderSkills();
+      case 'buddy': return renderBuddy();
       case 'mcp': return renderMcp();
       case 'browser': return renderBrowser();
       case 'appearance': return renderAppearance();

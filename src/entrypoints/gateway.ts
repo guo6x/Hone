@@ -88,6 +88,14 @@ async function main(): Promise<void> {
 
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
+  process.on('unhandledRejection', (reason) => {
+    console.error('\n[Gateway] 未处理的 Promise 拒绝:', reason)
+    shutdown()
+  })
+  process.on('uncaughtException', (error) => {
+    console.error('\n[Gateway] 未捕获的异常:', error)
+    shutdown()
+  })
 }
 
 main().catch(err => {
