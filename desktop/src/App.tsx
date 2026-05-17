@@ -11,7 +11,8 @@ import { SettingsPage } from './components/SettingsPage';
 import StatusBar from './components/StatusBar';
 import HoneBuddy, { BuddyState } from './components/HoneBuddy';
 import { DevicePairingModal } from './components/DevicePairingModal';
-import { useMachines, useDiscovery, useSchedules, isTauri, useTauriConfig, useGateway } from './tauri/useTauri';
+import { useMachines, useDiscovery, useSchedules, isTauri, useTauriConfig, useGateway, useHonePath } from './tauri/useTauri';
+import { useGatewayConnection } from './hooks/useGatewayConnection';
 import type { DiscoveredGateway } from './tauri/types';
 import {
   type MachineInfo,
@@ -19,6 +20,7 @@ import {
   type ScheduleInfo,
   type AiSuggestion,
   type SettingsData,
+  type StatusBarData,
 } from './data/mock';
 
 type ViewName = 'dashboard' | 'gateway' | 'schedule' | 'canvas' | 'webtask' | 'settings';
@@ -33,6 +35,7 @@ export default function App() {
   const { machines, addMachine, removeMachine } = useMachines();
   const { gateways: discoveredGateways, scanning, scan } = useDiscovery();
   const { start: ipcGatewayStart } = useGateway();
+  const { honePath: detectedHonePath } = useHonePath();
 
   // Dashboard state
   const [activeMachine, setActiveMachine] = useState<string | null>(null);
@@ -67,26 +70,17 @@ export default function App() {
 
   const { config: tauriConfig, save: saveTauriConfig } = useTauriConfig();
 
-  // Auto-start Gateway daemon after Tauri config is loaded
-  useEffect(() => {
-    if (!tauriConfig) return;
-    if (!isTauri()) return;
-
-    const autoStart = tauriConfig.auto_start ?? true;
-    if (!autoStart) return;
-
-    const relayUrl = tauriConfig.relay_url || 'wss://hone-relay.marsailleippi79.workers.dev/connect/default';
-    const honePath = (tauriConfig as any).data_dir || 'hone';
-    ipcGatewayStart(honePath, relayUrl);
-  }, [tauriConfig]); // wait for config load, then run once
-
   const [settings, setSettings] = useState<SettingsData>(() => {
     const defaults: SettingsData = {
       provider: 'deepseek',
       apiKey: '',
-      model: 'deepseek-v3',
+      model: 'deepseek-chat',
+      baseUrl: '',
+      customProviderName: '',
+      temperature: '',
+      maxTokens: '',
       ...GATEWAY_DEFAULTS,
-      workspaceDir: '',
+      workspaceDir: '', // Will be updated by Tauri config or manual user setting
       logRetention: '30',
       browserEnabled: false,
       guiModelUrl: '',
@@ -97,16 +91,16 @@ export default function App() {
     try {
       const saved = localStorage.getItem('hone-settings-extra');
       if (saved) {
-        const { provider, apiKey, model, workspaceDir, logRetention, browserEnabled, guiModelUrl, browserHeadless, browserMaxSteps } = JSON.parse(saved);
-        if (provider) defaults.provider = provider;
-        if (apiKey) defaults.apiKey = apiKey;
-        if (model) defaults.model = model;
-        if (workspaceDir) defaults.workspaceDir = workspaceDir;
-        if (logRetention) defaults.logRetention = logRetention;
-        if (browserEnabled !== undefined) defaults.browserEnabled = browserEnabled;
-        if (guiModelUrl !== undefined) defaults.guiModelUrl = guiModelUrl;
-        if (browserHeadless !== undefined) defaults.browserHeadless = browserHeadless;
-        if (browserMaxSteps !== undefined) defaults.browserMaxSteps = browserMaxSteps;
+        const parsed = JSON.parse(saved);
+        const keys: (keyof SettingsData)[] = [
+          'provider', 'apiKey', 'model', 'baseUrl', 'customProviderName',
+          'temperature', 'maxTokens', 'workspaceDir', 'logRetention',
+          'browserEnabled', 'guiModelUrl', 'browserHeadless', 'browserMaxSteps',
+          'buddySpecies',
+        ];
+        for (const k of keys) {
+          if (parsed[k] !== undefined) (defaults as any)[k] = parsed[k];
+        }
       }
     } catch {}
     return defaults;
@@ -121,10 +115,27 @@ export default function App() {
         relayUrl: tauriConfig.relay_url || GATEWAY_DEFAULTS.relayUrl,
         localPort: String(tauriConfig.local_port || GATEWAY_DEFAULTS.localPort),
         gatewayAutoStart: tauriConfig.auto_start ?? GATEWAY_DEFAULTS.gatewayAutoStart,
-        workspaceDir: (tauriConfig as any).data_dir || prev.workspaceDir,
+        // workspaceDir is where dist/cli.js lives. Prefer the user's saved value,
+        // otherwise fall back to the auto-detected hone project path.
+        workspaceDir: prev.workspaceDir || detectedHonePath || '',
       }));
     }
-  }, [tauriConfig]);
+  }, [tauriConfig, detectedHonePath]);
+
+  // Auto-start Gateway daemon after config and hone path resolve
+  useEffect(() => {
+    if (!tauriConfig) return;
+    if (!isTauri()) return;
+
+    const autoStart = tauriConfig.auto_start ?? true;
+    if (!autoStart) return;
+
+    const honePath = settings.workspaceDir || detectedHonePath || '';
+    if (!honePath) return;
+
+    const relayUrl = tauriConfig.relay_url || 'wss://hone-relay.marsailleippi79.workers.dev/connect/default';
+    ipcGatewayStart(honePath, relayUrl);
+  }, [tauriConfig, detectedHonePath, settings.workspaceDir]);
 
   // Persist: all settings → Tauri (authoritative), localStorage as fallback
   const persistSettings = useCallback((next: SettingsData) => {
@@ -134,6 +145,10 @@ export default function App() {
         provider: next.provider,
         apiKey: next.apiKey,
         model: next.model,
+        baseUrl: next.baseUrl,
+        customProviderName: next.customProviderName,
+        temperature: next.temperature,
+        maxTokens: next.maxTokens,
         workspaceDir: next.workspaceDir,
         logRetention: next.logRetention,
         browserEnabled: next.browserEnabled,
@@ -153,11 +168,15 @@ export default function App() {
         provider: next.provider,
         api_key: next.apiKey,
         model: next.model,
+        base_url: next.baseUrl || '',
+        custom_name: next.customProviderName || '',
+        temperature: parseFloat(next.temperature || '') || 0,
+        max_tokens: parseInt(next.maxTokens || '', 10) || 0,
         browser_enabled: next.browserEnabled,
         gui_model_url: next.guiModelUrl,
         browser_headless: next.browserHeadless,
         browser_max_steps: parseInt(next.browserMaxSteps, 10) || 15,
-      }, next.workspaceDir || '');
+      } as any, next.workspaceDir || '');
     }
   }, [saveTauriConfig, tauriConfig]);
 
@@ -201,6 +220,168 @@ export default function App() {
       saveSchedules(next);
     }
   }, [scheduleModal.editing]);
+
+  // ── Global gateway WebSocket connection (shared across all tabs) ────────
+  const connection = useGatewayConnection({
+    relayUrl: settings.relayUrl,
+    enabled: !!settings.relayUrl,
+  });
+
+  // ── Active sessions derived from task events ────────────────────────────
+  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  // ── StatusBar tokensToday: increments with each task complete ──────────
+  const [tokensToday, setTokensToday] = useState<number>(0);
+
+  // Subscribe to gateway events to maintain sessions / suggestions
+  useEffect(() => {
+    const unsub = connection.subscribe((msg) => {
+      switch (msg.type) {
+        case 'schedule_suggestion': {
+          // Convert daemon-side suggestion into AiSuggestion for the UI
+          const id = String((msg as any).id || `sg_${Date.now()}`);
+          const text = String((msg as any).text || '');
+          setSuggestions(prev => {
+            if (prev.find(s => s.id === id)) return prev;
+            const ai: AiSuggestion = {
+              id,
+              pattern: text,
+              patternEn: text,
+              acceptLabel: '采用',
+              acceptLabelEn: 'Accept',
+              dismissLabel: '忽略',
+              dismissLabelEn: 'Dismiss',
+            };
+            return [...prev, ai];
+          });
+          break;
+        }
+        case 'task_dispatched': {
+          const id = String((msg as any).taskId || `t_${Date.now()}`);
+          const task = String((msg as any).task || '');
+          setSessions(prev => {
+            if (prev.find(s => s.id === id)) return prev;
+            const machine = machines[0]?.name || 'Local';
+            const machineId = machines[0]?.id || 'local';
+            const next: SessionInfo = {
+              id,
+              machineId,
+              machineName: machine,
+              status: 'live',
+              task,
+              tokensUsed: '0',
+              elapsed: '0s',
+              sessionId: id,
+            };
+            return [next, ...prev].slice(0, 50);
+          });
+          break;
+        }
+        case 'task_complete': {
+          const id = String((msg as any).taskId || '');
+          setSessions(prev => prev.map(s => {
+            if (id && s.id !== id) return s;
+            if (!id && s.status !== 'live') return s;
+            return { ...s, status: 'done' as const };
+          }));
+          // Rough cumulative token estimate: result length / 4 chars per token.
+          const result = (msg as any).result;
+          const resultLen = typeof result === 'string'
+            ? result.length
+            : (result ? JSON.stringify(result).length : 0);
+          if (resultLen > 0) {
+            setTokensToday(prev => prev + Math.ceil(resultLen / 4));
+          }
+          break;
+        }
+        case 'browser_task_started': {
+          const id = `web_${Date.now()}`;
+          const task = String((msg as any).task || '');
+          const machine = machines[0]?.name || 'Local';
+          const machineId = machines[0]?.id || 'local';
+          const next: SessionInfo = {
+            id,
+            machineId,
+            machineName: machine,
+            status: 'live',
+            task: `web: ${task}`,
+            tokensUsed: '0',
+            elapsed: '0s',
+            sessionId: id,
+          };
+          setSessions(prev => [next, ...prev].slice(0, 50));
+          break;
+        }
+        case 'browser_task_result': {
+          setSessions(prev => prev.map(s =>
+            s.task.startsWith('web:') && s.status === 'live'
+              ? { ...s, status: 'done' as const }
+              : s,
+          ));
+          break;
+        }
+        case 'schedule_triggered': {
+          // Cron / interval fire — append as a completed session entry so the
+          // dashboard timeline shows what fired and when.
+          const id = String((msg as any).scheduleId || `sch_${Date.now()}`);
+          const text = String((msg as any).text || (msg as any).task || '');
+          const result = (msg as any).result;
+          const machine = machines[0]?.name || 'Local';
+          const machineId = machines[0]?.id || 'local';
+          const next: SessionInfo = {
+            id: `${id}_${Date.now()}`,
+            machineId,
+            machineName: machine,
+            status: 'done',
+            task: `⏰ ${text}`,
+            tokensUsed: '0',
+            elapsed: '—',
+            sessionId: id,
+          };
+          setSessions(prev => [next, ...prev].slice(0, 50));
+          if (result) {
+            const len = typeof result === 'string' ? result.length : JSON.stringify(result).length;
+            setTokensToday(prev => prev + Math.ceil(len / 4));
+          }
+          break;
+        }
+      }
+    });
+    return unsub;
+  }, [connection, machines]);
+
+  // ── StatusBar live data ─────────────────────────────────────────────────
+  const [gatewayUptimeSec, setGatewayUptimeSec] = useState<number | null>(null);
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const { gatewayUptime } = await import('./tauri/api');
+        const up = await gatewayUptime();
+        if (!cancelled) setGatewayUptimeSec(up);
+      } catch {}
+    };
+    refresh();
+    const t = setInterval(refresh, 5000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  function formatUptime(secs: number | null): string {
+    if (secs == null || secs < 0) return '—';
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    if (d > 0) return `${d}d ${h}h ${m}m`;
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m`;
+  }
+
+  const statusBarData: StatusBarData = {
+    uptime: formatUptime(gatewayUptimeSec),
+    latency: connection.latencyMs >= 0 ? `${connection.latencyMs}ms` : '—',
+    tokensToday: tokensToday.toLocaleString(),
+    lastBackup: lang === 'zh' ? '本地持久化' : 'Local',
+  };
 
   // Buddy state
   const [buddyState, setBuddyState] = useState<BuddyState>('idle');
@@ -248,7 +429,7 @@ export default function App() {
     <div style={styles.appShell}>
       <div style={styles.topBar}>
         <span style={styles.topBarBrand}>Hone</span>
-        <span style={styles.topBarVersion}>v0.2.1-alpha</span>
+        <span style={styles.topBarVersion}>v0.3.0-alpha</span>
       </div>
 
       <div style={styles.body}>
@@ -281,11 +462,11 @@ export default function App() {
               <Dashboard.Loading lang={lang} />
             ) : pageState === 'error' ? (
               <Dashboard.Error lang={lang} onRetry={() => setPageState('loaded')} />
-            ) : machines.length > 0 ? (
+            ) : (machines.length > 0 || sessions.length > 0) ? (
               <Dashboard
                 lang={lang}
                 machines={machines}
-                sessions={[]}
+                sessions={sessions}
                 filter={filter}
                 setFilter={setFilter}
                 sortBy={sortBy}
@@ -306,6 +487,7 @@ export default function App() {
               theme={theme}
               honePath={settings.workspaceDir || ''}
               relayUrl={settings.relayUrl}
+              connection={connection}
               onBuddyEvent={handleBuddyEvent}
             />
           )}
@@ -339,20 +521,17 @@ export default function App() {
           )}
 
           {activeView === 'canvas' && (
-            <CanvasViewer
-              lang={lang}
-              sessions={[]}
-            />
+            <CanvasViewer lang={lang} />
           )}
 
           {activeView === 'webtask' && (
             <WebTaskRunner
               lang={lang}
-              relayUrl={settings.relayUrl}
+              connection={connection}
             />
           )}
 
-          <StatusBar lang={lang} statusBar={{ uptime: '—', latency: '—', tokensToday: '0', lastBackup: '—' }} />
+          <StatusBar lang={lang} statusBar={statusBarData} />
 
           {pairingModal && (
             <DevicePairingModal
@@ -402,9 +581,9 @@ export default function App() {
             />
           )}
 
-          <HoneBuddy 
-            state={buddyState} 
-            text={buddyText} 
+          <HoneBuddy
+            state={buddyState}
+            text={buddyText}
             species={settings.buddySpecies as any || 'robot'}
             onAction={(action) => {
               if (action === 'pet') {
@@ -412,11 +591,6 @@ export default function App() {
                 setBuddyText('摸摸头~');
                 setTimeout(() => setBuddyState('idle'), 2000);
               }
-            }}
-            // Dynamically adjust position based on view
-            style={{ 
-              right: activeView === 'gateway' ? 320 : 40,
-              transition: 'right 0.3s ease' 
             }}
           />
         </div>

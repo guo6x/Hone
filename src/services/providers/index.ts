@@ -43,19 +43,38 @@ function detectProvider(): string {
 
 function createProvider(name: string): AIProvider {
   switch (name) {
-    case 'openai':
+    case 'openai': {
+      return createOpenAIProvider()
+    }
     case 'custom': {
-      // Custom provider 复用 OpenAI 兼容格式，使用不同的环境变量
-      const provider = createOpenAIProvider()
-      // 如果是 custom，覆盖名称和 base URL
-      if (name === 'custom') {
-        const customName = process.env.HONE_CUSTOM_NAME || 'Custom'
+      // Custom provider 使用独立的 HONE_CUSTOM_* 环境变量，与 OpenAI 隔离。
+      // 复用 OpenAI 兼容的 chat completions 调用逻辑，但参数全部来自 CUSTOM 命名空间。
+      const savedKey = process.env.OPENAI_API_KEY
+      const savedBase = process.env.OPENAI_BASE_URL
+      const savedModel = process.env.OPENAI_MODEL
+      try {
+        process.env.OPENAI_API_KEY =
+          process.env.HONE_CUSTOM_API_KEY || ''
+        process.env.OPENAI_BASE_URL =
+          process.env.HONE_CUSTOM_BASE_URL || 'https://api.openai.com'
+        if (process.env.HONE_CUSTOM_MODEL) {
+          process.env.OPENAI_MODEL = process.env.HONE_CUSTOM_MODEL
+        }
+        const provider = createOpenAIProvider()
         return {
           ...provider,
-          name: customName,
+          name: process.env.HONE_CUSTOM_NAME || 'Custom',
         }
+      } finally {
+        // Restore originals — provider closes over current env at creation,
+        // but other code may still rely on OPENAI_* being unchanged.
+        if (savedKey === undefined) delete process.env.OPENAI_API_KEY
+        else process.env.OPENAI_API_KEY = savedKey
+        if (savedBase === undefined) delete process.env.OPENAI_BASE_URL
+        else process.env.OPENAI_BASE_URL = savedBase
+        if (savedModel === undefined) delete process.env.OPENAI_MODEL
+        else process.env.OPENAI_MODEL = savedModel
       }
-      return provider
     }
     case 'deepseek':
     default:

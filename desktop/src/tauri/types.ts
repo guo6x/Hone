@@ -10,6 +10,10 @@ export interface GatewayConfig {
   provider?: string;
   api_key?: string;
   model?: string;
+  base_url?: string;
+  custom_name?: string;
+  temperature?: number;
+  max_tokens?: number;
   data_dir?: string;
   browser_enabled?: boolean;
   gui_model_url?: string;

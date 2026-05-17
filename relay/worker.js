@@ -209,6 +209,15 @@ export class RelayRoom {
         break;
       }
 
+      // ----- Client-initiated latency probe ------------------------------
+
+      case "ping": {
+        // Echo back so the client can measure round-trip latency.
+        // Preserves ts so the client can compute (now - ts).
+        this._send(ws, { type: "pong", ts: msg.ts });
+        break;
+      }
+
       // ----- Unknown type ------------------------------------------------
 
       default: {
@@ -975,51 +984,6 @@ export default {
     if (match) {
       const sessionId = match[1];
       const id = env.RELAY_ROOM.idFromName(sessionId);
-      const stub = env.RELAY_ROOM.get(id);
-      return stub.fetch(request);
-    }
-
-    // Unknown path
-    return new Response("Not Found", { status: 404 });
-  },
-};
-_ROOM.idFromName(sessionId);
-      const stub = env.RELAY_ROOM.get(id);
-      return stub.fetch(request);
-    }
-
-    // Unknown path
-    return new Response("Not Found", { status: 404 });
-  },
-};
-tatus: "ok",
-        version: "v2",
-        time: new Date().toISOString(),
-      }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    // PWA root — serve the client HTML
-    if (path === "/" || path === "/index.html") {
-      return serveClientHTML();
-    }
-
-    // WebSocket upgrade — /connect/:sessionId
-    const match = path.match(/^\/connect\/([^/]+)$/);
-    if (match) {
-      const sessionId = match[1];
-      const id = env.RELAY_ROOM.idFromName(sessionId);
-      const stub = env.RELAY_ROOM.get(id);
-      return stub.fetch(request);
-    }
-
-    // Unknown path
-    return new Response("Not Found", { status: 404 });
-  },
-};
-_ROOM.idFromName(sessionId);
       const stub = env.RELAY_ROOM.get(id);
       return stub.fetch(request);
     }

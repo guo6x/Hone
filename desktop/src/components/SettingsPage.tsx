@@ -18,8 +18,26 @@ const navItems: { key: Section; zh: string; en: string }[] = [
   { key: 'about', zh: '关于', en: 'About' },
 ];
 
-const providers = ['DeepSeek', 'OpenAI', 'Custom'] as const;
-const models = ['deepseek-v3', 'deepseek-r1', 'gpt-4o', 'gpt-4o-mini', 'custom...'];
+// Internal provider keys match those expected by Rust gateway_manager.rs.
+const providers = [
+  { key: 'deepseek', label: 'DeepSeek' },
+  { key: 'openai', label: 'OpenAI' },
+  { key: 'custom', label: 'Custom (OpenAI 兼容)' },
+] as const;
+
+// Suggested model names per provider — shown as quick-pick chips, but the
+// model field stays a free-text input so any model name is accepted.
+const MODEL_PRESETS: Record<string, string[]> = {
+  deepseek: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v3', 'deepseek-v4-pro'],
+  openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'o1-mini', 'o3-mini'],
+  custom: ['llama-3.3-70b', 'qwen2.5-72b', 'glm-4-plus', 'kimi-k2'],
+};
+
+const DEFAULT_BASE_URLS: Record<string, string> = {
+  deepseek: 'https://api.deepseek.com',
+  openai: 'https://api.openai.com',
+  custom: '',
+};
 
 const themes: { key: ThemeName; zh: string; en: string; colors: [string, string, string] }[] = [
   { key: 'dark', zh: '暗夜黑', en: 'Dark', colors: ['#1a1a2e', '#16213e', '#0f3460'] },
@@ -38,10 +56,20 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
   const [section, setSection] = useState<Section>('provider');
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [apiKeyDraft, setApiKeyDraft] = useState(settings.apiKey ?? '');
-  const [model, setModel] = useState('deepseek-v3');
+  const [model, setModel] = useState(settings.model ?? 'deepseek-chat');
   const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<string | null>(null);
-  const [provider, setProvider] = useState(settings.provider ?? 'DeepSeek');
+  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+  // Normalize legacy capitalized provider names from older configs.
+  const normProvider = (p: string) => {
+    const lower = (p || '').toLowerCase();
+    if (lower === 'deepseek' || lower === 'openai' || lower === 'custom') return lower;
+    return 'deepseek';
+  };
+  const [provider, setProvider] = useState<string>(normProvider(settings.provider));
+  const [baseUrl, setBaseUrl] = useState(settings.baseUrl ?? '');
+  const [customProviderName, setCustomProviderName] = useState(settings.customProviderName ?? '');
+  const [temperature, setTemperature] = useState(settings.temperature ?? '');
+  const [maxTokens, setMaxTokens] = useState(settings.maxTokens ?? '');
   const [relayUrl, setRelayUrl] = useState(settings.relayUrl ?? '');
   const [localPort, setLocalPort] = useState(settings.localPort ?? '18789');
   const [autoStart, setAutoStart] = useState(settings.gatewayAutoStart ?? false);
@@ -100,6 +128,10 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
         provider,
         apiKey: apiKeyDraft,
         model,
+        baseUrl,
+        customProviderName,
+        temperature,
+        maxTokens,
         gatewayAutoStart: autoStart,
         relayUrl,
         localPort,
@@ -114,24 +146,42 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     }, 600);
-  }, [provider, apiKeyDraft, model, autoStart, relayUrl, localPort, workspace, logRetention, browserEnabled, guiModelUrl, browserHeadless, browserMaxSteps, buddySpecies, setSettings]);
+  }, [provider, apiKeyDraft, model, baseUrl, customProviderName, temperature, maxTokens, autoStart, relayUrl, localPort, workspace, logRetention, browserEnabled, guiModelUrl, browserHeadless, browserMaxSteps, buddySpecies, setSettings]);
 
   useEffect(() => { autoSave(); }, [autoSave]);
 
   const t = (zh: string, en: string) => (lang === 'zh' ? zh : en);
 
-  const doTestConnection = () => {
+  const doTestConnection = async () => {
     setTesting(true);
     setTestResult(null);
-    // Provider connection is tested through the Gateway daemon at runtime.
-    // Here we save the configuration and confirm it's been persisted.
-    setTimeout(() => {
+
+    if (!isTauri()) {
       setTesting(false);
-      setTestResult(t(
-        '✓ 配置已保存。启动 Gateway 后将使用此提供商。',
-        '✓ Config saved. Gateway will use this provider on start.',
-      ));
-    }, 400);
+      setTestResult({
+        ok: false,
+        text: t('浏览器模式下无法测试 — 请使用桌面端。', 'Browser mode cannot test — use desktop app.'),
+      });
+      return;
+    }
+
+    try {
+      const { testProvider } = await import('../tauri/api');
+      const result = await testProvider({
+        provider,
+        apiKey: apiKeyDraft,
+        baseUrl: baseUrl || DEFAULT_BASE_URLS[provider] || '',
+        model,
+      });
+      setTestResult({ ok: true, text: result });
+    } catch (e: any) {
+      setTestResult({
+        ok: false,
+        text: `${t('连接失败', 'Failed')}: ${e?.message ?? String(e)}`,
+      });
+    } finally {
+      setTesting(false);
+    }
   };
 
   const handleCheckUpdate = () => {
@@ -142,8 +192,8 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
     setTimeout(() => {
       setCheckingUpdate(false);
       setUpdateStatus(t(
-        '✓ 当前版本 v0.2.1-alpha。更新检查功能即将上线。',
-        '✓ v0.2.1-alpha. Update check coming soon.',
+        '✓ 当前版本 v0.3.0-alpha。更新检查功能即将上线。',
+        '✓ v0.3.0-alpha. Update check coming soon.',
       ));
       setTimeout(() => setUpdateStatus(null), 4000);
     }, 600);
@@ -273,55 +323,148 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
     </div>
   );
 
-  const renderProvider = () => (
-    <div style={s.section}>
-      <h2 style={s.title}>{t('选择提供商', 'Choose Provider')}</h2>
-      <p style={s.desc}>{t('选择 AI 模型提供商并配置 API 密钥', 'Select an AI model provider and configure your API key.')}</p>
-      <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
-        {providers.map((p) => (
-          <button
-            key={p}
-            style={{
-              ...s.btn,
-              flex: 1,
-              background: provider === p ? 'var(--hone-surfaceRaised)' : 'var(--hone-surface)',
-              borderColor: provider === p ? 'var(--hone-accent)' : 'var(--hone-border)',
-            }}
-            onClick={() => setProvider(p)}
-          >
-            {p}
+  const renderProvider = () => {
+    const presets = MODEL_PRESETS[provider] || [];
+    const baseUrlPlaceholder = DEFAULT_BASE_URLS[provider] || 'https://your-endpoint.com';
+    return (
+      <div style={s.section}>
+        <h2 style={s.title}>{t('选择提供商', 'Choose Provider')}</h2>
+        <p style={s.desc}>{t('选择 AI 模型提供商并配置 API 密钥', 'Select an AI model provider and configure your API key.')}</p>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
+          {providers.map((p) => (
+            <button
+              key={p.key}
+              style={{
+                ...s.btn,
+                flex: 1,
+                background: provider === p.key ? 'var(--hone-surfaceRaised)' : 'var(--hone-surface)',
+                borderColor: provider === p.key ? 'var(--hone-accent)' : 'var(--hone-border)',
+              }}
+              onClick={() => setProvider(p.key)}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+
+        {provider === 'custom' && (
+          <>
+            <label style={s.label}>{t('提供商显示名', 'Provider Display Name')}</label>
+            <input
+              style={{ ...s.input, marginBottom: 16 }}
+              value={customProviderName}
+              onChange={(e) => setCustomProviderName(e.target.value)}
+              placeholder="Custom"
+            />
+          </>
+        )}
+
+        <label style={s.label}>{t('API Key', 'API Key')}</label>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+          <input
+            type={apiKeyVisible ? 'text' : 'password'}
+            style={s.input}
+            value={apiKeyDraft}
+            onChange={(e) => setApiKeyDraft(e.target.value)}
+            placeholder="sk-..."
+          />
+          <button style={s.btn} onClick={() => setApiKeyVisible(!apiKeyVisible)}>
+            {apiKeyVisible ? t('隐藏', 'Hide') : t('显示', 'Show')}
           </button>
-        ))}
-      </div>
-      <label style={s.label}>{t('API Key', 'API Key')}</label>
-      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+        </div>
+
+        <label style={s.label}>{t('Base URL (OpenAI 兼容)', 'Base URL (OpenAI compatible)')}</label>
         <input
-          type={apiKeyVisible ? 'text' : 'password'}
-          style={s.input}
-          value={apiKeyDraft}
-          onChange={(e) => setApiKeyDraft(e.target.value)}
-          placeholder="sk-..."
+          style={{ ...s.input, marginBottom: 4 }}
+          value={baseUrl}
+          onChange={(e) => setBaseUrl(e.target.value)}
+          placeholder={baseUrlPlaceholder}
         />
-        <button style={s.btn} onClick={() => setApiKeyVisible(!apiKeyVisible)}>
-          {apiKeyVisible ? t('隐藏', 'Hide') : t('显示', 'Show')}
-        </button>
+        <p style={{ fontSize: 12, color: 'var(--hone-muted)', marginTop: 0, marginBottom: 16 }}>
+          {t('留空使用默认。代理 / 中转 API / 第三方网关都填这里。', 'Leave empty for provider default. Use this for proxies, relays, or third-party gateways.')}
+        </p>
+
+        <label style={s.label}>{t('模型名', 'Model Name')}</label>
+        <input
+          style={{ ...s.input, marginBottom: 8 }}
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          placeholder={presets[0] || 'model-name'}
+        />
+        {presets.length > 0 && (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 16 }}>
+            {presets.map((m) => (
+              <button
+                key={m}
+                style={{
+                  ...s.btn,
+                  padding: '4px 10px', fontSize: 11,
+                  borderColor: model === m ? 'var(--hone-accent)' : 'var(--hone-border)',
+                  color: model === m ? 'var(--hone-accent)' : 'var(--hone-muted)',
+                }}
+                onClick={() => setModel(m)}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
+          <div style={{ flex: 1 }}>
+            <label style={s.label}>{t('温度', 'Temperature')}</label>
+            <input
+              type="number"
+              step="0.1"
+              min="0"
+              max="2"
+              style={s.input}
+              value={temperature}
+              onChange={(e) => setTemperature(e.target.value)}
+              placeholder="0.7"
+            />
+            <p style={{ fontSize: 11, color: 'var(--hone-muted)', marginTop: 4 }}>
+              {t('0-2，越高越发散。留空用默认。', '0–2, higher = more random. Empty = default.')}
+            </p>
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={s.label}>{t('最大输出 tokens', 'Max Output Tokens')}</label>
+            <input
+              type="number"
+              step="128"
+              min="0"
+              max="32768"
+              style={s.input}
+              value={maxTokens}
+              onChange={(e) => setMaxTokens(e.target.value)}
+              placeholder="4096"
+            />
+            <p style={{ fontSize: 11, color: 'var(--hone-muted)', marginTop: 4 }}>
+              {t('每次回复最多生成多少 token。留空用默认。', 'Cap per reply. Empty = default.')}
+            </p>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <button
+            style={{ ...s.btnAccent, opacity: testing ? 0.6 : 1 }}
+            disabled={testing}
+            onClick={doTestConnection}
+          >
+            {testing ? t('测试中...', 'Testing...') : t('🔌 测试连接', '🔌 Test Connection')}
+          </button>
+          {testResult && (
+            <span style={{
+              fontSize: 13,
+              color: testResult.ok ? 'var(--hone-success)' : 'var(--hone-danger)',
+            }}>
+              {testResult.text}
+            </span>
+          )}
+        </div>
       </div>
-      <label style={s.label}>{t('模型', 'Model')}</label>
-      <select style={{ ...s.select, marginBottom: 16 }} value={model} onChange={(e) => setModel(e.target.value)}>
-        {models.map((m) => <option key={m} value={m}>{m}</option>)}
-      </select>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        <button
-          style={{ ...s.btnAccent, opacity: testing ? 0.6 : 1 }}
-          disabled={testing}
-          onClick={doTestConnection}
-        >
-          {testing ? t('测试中...', 'Testing...') : t('🔌 测试连接', '🔌 Test Connection')}
-        </button>
-        {testResult && <span style={{ fontSize: 13, color: 'var(--hone-success)' }}>{testResult}</span>}
-      </div>
-    </div>
-  );
+    );
+  };
 
   const renderGateway = () => (
     <div style={s.section}>
@@ -566,7 +709,7 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
         <div style={s.row}>
           <span style={{ fontSize: 13, color: 'var(--hone-muted)', width: 100 }}>{t('版本', 'Version')}</span>
-          <span style={s.mono}>v0.2.1-alpha</span>
+          <span style={s.mono}>v0.3.0-alpha</span>
         </div>
         <div style={s.row}>
           <span style={{ fontSize: 13, color: 'var(--hone-muted)', width: 100 }}>{t('更新', 'Update')}</span>

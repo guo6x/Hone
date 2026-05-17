@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicedoc/tauri/refs/heads/dev/.schemas/capabilities.schema.json",
   "identifier": "default",
-  "description": "Default capability set for Hone Desktop",
+  "description": "Default capability set for Hone",
   "windows": ["main"],
   "permissions": [
     "core:default",

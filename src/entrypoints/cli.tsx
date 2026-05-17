@@ -322,27 +322,64 @@ async function main(): Promise<void> {
       process.exit(0)
     }
 
-    if (subcmd === 'approve') {
-      // For manual pairing approval: hone gateway approve <clientId>
+    if (subcmd === 'approve' || subcmd === 'deny') {
       const clientId = args[2]
       if (!clientId) {
-        console.log('用法: hone gateway approve <clientId>')
+        console.log(`用法: hone gateway ${subcmd} <clientId>`)
         console.log('运行 hone gateway pairings 查看待审批设备')
         process.exit(1)
       }
-      console.log(`已批准设备配对: ${clientId}`)
-      // TODO: send approval via relay WebSocket to pending pairing
-      console.log('提示: 当前需在 Gateway 交互会话中使用 /gateway approve')
+      try {
+        const fs = await import('fs/promises')
+        const home = process.env.HOME || process.env.USERPROFILE || '~'
+        const pairDir = process.env.HONE_DATA_DIR
+          ? `${process.env.HONE_DATA_DIR}/pairings`
+          : `${home}/.hone/pairings`
+        await fs.mkdir(pairDir, { recursive: true })
+        const approved = subcmd === 'approve'
+        await fs.writeFile(
+          `${pairDir}/${clientId}.decision.json`,
+          JSON.stringify({ clientId, approved, ts: new Date().toISOString() }),
+        )
+        console.log(`${approved ? '已批准' : '已拒绝'} 设备配对: ${clientId}`)
+        console.log('Gateway 将在下次轮询时处理（约 3 秒内）')
+      } catch (err) {
+        console.error(`写入失败: ${err}`)
+        process.exit(1)
+      }
       process.exit(0)
     }
 
-    if (subcmd === 'deny') {
-      const clientId = args[2]
-      if (!clientId) {
-        console.log('用法: hone gateway deny <clientId>')
+    if (subcmd === 'pairings') {
+      try {
+        const fs = await import('fs/promises')
+        const home = process.env.HOME || process.env.USERPROFILE || '~'
+        const pairDir = process.env.HONE_DATA_DIR
+          ? `${process.env.HONE_DATA_DIR}/pairings`
+          : `${home}/.hone/pairings`
+        const files = await fs.readdir(pairDir).catch(() => [] as string[])
+        const pending = files.filter(f => f.endsWith('.pending.json'))
+        if (pending.length === 0) {
+          console.log('当前没有等待批准的设备配对')
+        } else {
+          console.log('待批准设备配对:')
+          for (const f of pending) {
+            try {
+              const data = JSON.parse(
+                await fs.readFile(`${pairDir}/${f}`, 'utf-8'),
+              )
+              console.log(`  ${data.clientId}  码: ${data.pairingCode || '—'}  时间: ${data.ts || '—'}`)
+            } catch {
+              console.log(`  ${f.replace('.pending.json', '')} (解析失败)`)
+            }
+          }
+          console.log('')
+          console.log('使用 hone gateway approve <clientId> 批准')
+        }
+      } catch (err) {
+        console.error(`读取失败: ${err}`)
         process.exit(1)
       }
-      console.log(`已拒绝设备配对: ${clientId}`)
       process.exit(0)
     }
 
@@ -409,12 +446,13 @@ async function main(): Promise<void> {
       return
     }
 
-    console.log(`用法: hone gateway [start|stop|status|approve|deny]`)
-    console.log(`  start    启动 Gateway daemon`)
-    console.log(`  stop     停止 Gateway daemon`)
-    console.log(`  status   查看 Gateway 运行状态`)
-    console.log(`  approve  批准设备配对`)
-    console.log(`  deny     拒绝设备配对`)
+    console.log(`用法: hone gateway [start|stop|status|pairings|approve|deny]`)
+    console.log(`  start     启动 Gateway daemon`)
+    console.log(`  stop      停止 Gateway daemon`)
+    console.log(`  status    查看 Gateway 运行状态`)
+    console.log(`  pairings  列出等待批准的设备`)
+    console.log(`  approve   批准设备配对`)
+    console.log(`  deny      拒绝设备配对`)
     process.exit(1)
   }
 

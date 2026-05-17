@@ -187,10 +187,13 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
   }
   const llmCall: import('./browser/agent.js').LLMCallback = async (prompt) => {
     const provider = getProvider()
+    // Browser agent uses low temperature for deterministic JSON output regardless
+    // of user-configured HONE_TEMPERATURE — but respects HONE_MAX_TOKENS upper bound.
+    const envMax = Number(process.env.HONE_MAX_TOKENS)
     const resp = await provider.createMessage({
       model: process.env.HONE_MODEL || 'deepseek-v4-pro',
       messages: [{ role: 'user', content: prompt }],
-      maxTokens: 512,
+      maxTokens: Number.isFinite(envMax) && envMax > 0 ? Math.min(envMax, 512) : 512,
       temperature: 0.1,
     })
     const content = resp.content
@@ -297,6 +300,56 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
   console.error(`[Gateway] 中继: ${config.relayUrl}`)
   console.error(`[Gateway] 已加载 ${state.schedules.size} 条日程`)
 
+  // Poll for pairing decision files written by /gateway approve|deny.
+  // Cross-process file-based signaling so the CLI command can affect the
+  // long-running daemon. Decisions live at ~/.hone/pairings/<id>.decision.json.
+  const PAIRING_POLL_MS = 3000
+  const startPairingPoll = async () => {
+    try {
+      const { readdir, readFile, unlink, mkdir } = await import('fs/promises')
+      const { join } = await import('path')
+      const home = process.env.HOME || process.env.USERPROFILE || '~'
+      const dataDir = process.env.HONE_DATA_DIR || join(home, '.hone')
+      const pairDir = join(dataDir, 'pairings')
+      await mkdir(pairDir, { recursive: true })
+
+      const tick = async () => {
+        if (!state.running || !state.connected || !state.ws) return
+        try {
+          const files = await readdir(pairDir)
+          for (const f of files) {
+            if (!f.endsWith('.decision.json')) continue
+            const fp = join(pairDir, f)
+            try {
+              const data = JSON.parse(await readFile(fp, 'utf-8'))
+              if (data && data.clientId) {
+                sendJSON(state.ws!, {
+                  type: 'pairing_response',
+                  clientId: data.clientId,
+                  approved: !!data.approved,
+                })
+                log(
+                  config,
+                  `Pairing decision processed: ${data.clientId} approved=${!!data.approved}`,
+                )
+                await unlink(fp).catch(() => {})
+                await unlink(join(pairDir, `${data.clientId}.pending.json`)).catch(() => {})
+              }
+            } catch (err) {
+              log(config, `Pairing decision parse error: ${err}`)
+            }
+          }
+        } catch {}
+      }
+
+      // Reuse patternTimer? No — use its own; piggyback on state for cleanup.
+      ;(state as any).pairingPollTimer = setInterval(tick, PAIRING_POLL_MS)
+    } catch (err) {
+      log(config, `Pairing poll init error: ${err}`)
+    }
+  }
+  void startPairingPoll()
+
   await connectToRelay(state, tools)
 
   return state
@@ -394,7 +447,7 @@ async function handleMessage(
     }
 
     case 'pairing_request': {
-      // Auto-approve in God Mode, otherwise pending
+      // Auto-approve in God Mode, otherwise wait for /gateway approve via file decision
       const autoApprove = !!process.env.HONE_GOD_MODE
       if (autoApprove) {
         sendJSON(state.ws!, {
@@ -404,10 +457,28 @@ async function handleMessage(
         })
         log(config, `Auto-approved pairing: ${msg.clientId}`)
       } else {
-        // Store for manual approval
         log(config, `Pairing request from ${msg.clientId}, code: ${msg.pairingCode}`)
         console.error(`[Gateway] ⚠️ 新设备配对请求: ${msg.clientId} | 码: ${msg.pairingCode}`)
         console.error(`[Gateway] 输入 hone gateway approve ${msg.clientId} 批准`)
+        // Persist a pending marker so /gateway pairings can list it
+        try {
+          const { writeFile, mkdir } = await import('fs/promises')
+          const { join } = await import('path')
+          const home = process.env.HOME || process.env.USERPROFILE || '~'
+          const dataDir = process.env.HONE_DATA_DIR || join(home, '.hone')
+          const pairDir = join(dataDir, 'pairings')
+          await mkdir(pairDir, { recursive: true })
+          await writeFile(
+            join(pairDir, `${msg.clientId}.pending.json`),
+            JSON.stringify({
+              clientId: msg.clientId,
+              pairingCode: msg.pairingCode,
+              ts: new Date().toISOString(),
+            }),
+          )
+        } catch (err) {
+          log(config, `Failed to write pending pairing: ${err}`)
+        }
       }
       break
     }
@@ -620,6 +691,10 @@ export async function stopGateway(state: GatewayState): Promise<void> {
   }
   if (state.patternTimer) {
     clearInterval(state.patternTimer)
+  }
+  const pairingTimer = (state as any).pairingPollTimer
+  if (pairingTimer) {
+    clearInterval(pairingTimer)
   }
   if (state.schedulerState) {
     stopScheduler(state.schedulerState)

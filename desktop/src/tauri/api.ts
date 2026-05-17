@@ -67,6 +67,36 @@ export function sshExecute(command: string): Promise<string> {
   return invoke('ssh_execute', { command });
 }
 
+// ── Hone path ──
+
+export function getHonePath(): Promise<string | null> {
+  return invoke('get_hone_path');
+}
+
+export function setHonePath(newPath: string): Promise<void> {
+  return invoke('set_hone_path', { newPath });
+}
+
+// ── Provider connectivity test ──
+
+export interface TestProviderInput {
+  provider: string;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+}
+
+export function testProvider(input: TestProviderInput): Promise<string> {
+  return invoke('test_provider', {
+    input: {
+      provider: input.provider,
+      api_key: input.apiKey,
+      base_url: input.baseUrl,
+      model: input.model,
+    },
+  });
+}
+
 // ── Settings ──
 
 export function getConfig(): Promise<GatewayConfig> {
@@ -99,4 +129,16 @@ export function schedulesList(): Promise<ScheduleInfo[]> {
 
 export function schedulesSave(schedules: ScheduleInfo[]): Promise<void> {
   return invoke('schedules_save', { schedules });
+}
+
+// ── Canvas ──
+
+export interface CanvasSessionInfo {
+  id: string;
+  name: string;
+  modified_at: string;
+}
+
+export function canvasSessionsList(): Promise<CanvasSessionInfo[]> {
+  return invoke('canvas_sessions_list');
 }

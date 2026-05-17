@@ -33,6 +33,9 @@ pub fn run() {
             commands::ssh_connect,
             commands::ssh_disconnect,
             commands::ssh_execute,
+            commands::get_hone_path,
+            commands::set_hone_path,
+            commands::test_provider,
             commands::get_config,
             commands::save_config,
             commands::schedules_list,
@@ -40,6 +43,7 @@ pub fn run() {
             commands::autostart_is_enabled,
             commands::autostart_toggle,
             commands::execution_log_list,
+            commands::canvas_sessions_list,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -50,5 +54,5 @@ pub fn run() {
             }
         })
         .run(tauri::generate_context!())
-        .expect("error while running Hone Desktop");
+        .expect("error while running Hone");
 }

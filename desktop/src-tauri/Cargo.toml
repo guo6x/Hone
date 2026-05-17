@@ -1,7 +1,7 @@
 [package]
 name = "hone-desktop"
-version = "0.2.1-alpha"
-description = "Hone Desktop — 全功能 AI 编程控制台"
+version = "0.3.0-alpha"
+description = "Hone — 全功能 AI 编程控制台"
 authors = ["Hone Team"]
 edition = "2021"
 
@@ -9,7 +9,7 @@ edition = "2021"
 assets = []
 
 [package.metadata.tauri-winres]
-FileDescription = "Hone Desktop - AI Coding Console"
+FileDescription = "Hone — AI Coding Console"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -36,6 +36,7 @@ log = "0.4"
 env_logger = "0.11"
 thiserror = "2"
 dirs = "6"
+reqwest = { version = "0.12", features = ["json"] }
 
 [features]
 default = ["custom-protocol"]

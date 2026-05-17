@@ -30,12 +30,23 @@ export async function gatewayLLM(userMessage: string): Promise<GatewayLLMRespons
   const provider = getProvider()
 
   try {
+    // Honor user-configured temperature, but cap intent classification at 0.5
+    // so JSON-style classifier prompts stay deterministic enough.
+    const envTemp = Number(process.env.HONE_TEMPERATURE)
+    const temperature = Number.isFinite(envTemp) && envTemp >= 0
+      ? Math.min(envTemp, 0.5)
+      : 0.3
+    const envMax = Number(process.env.HONE_MAX_TOKENS)
+    const maxTokens = Number.isFinite(envMax) && envMax > 0
+      ? Math.min(envMax, 1024)
+      : 512
+
     const response = await provider.createMessage({
       model: process.env.HONE_MODEL || process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro',
       messages: [{ role: 'user', content: userMessage }],
       system: GATEWAY_SYSTEM_PROMPT,
-      maxTokens: 512,
-      temperature: 0.3,
+      maxTokens,
+      temperature,
     })
 
     const text = extractText(response)

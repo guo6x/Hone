@@ -1,4 +1,4 @@
-// Type definitions for Hone Desktop
+// Type definitions for Hone
 // No mock data — all data comes from Tauri IPC or starts empty.
 
 export interface MachineInfo {
@@ -56,6 +56,14 @@ export interface SettingsData {
   provider: string;
   apiKey: string;
   model: string;
+  /** OpenAI-compatible endpoint. Empty = use provider default. */
+  baseUrl?: string;
+  /** Display name when provider === 'custom'. */
+  customProviderName?: string;
+  /** Sampling temperature 0.0–2.0. */
+  temperature?: string;
+  /** Max output tokens. Empty = provider default. */
+  maxTokens?: string;
   gatewayAutoStart: boolean;
   relayUrl: string;
   localPort: string;

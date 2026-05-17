@@ -1,20 +1,51 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { type Lang, LANG } from '../i18n/translations';
 import { type CanvasSession } from '../data/mock';
+import { isTauri } from '../tauri/useTauri';
 
 interface Props {
   lang: Lang;
-  sessions: CanvasSession[];
+  sessions?: CanvasSession[];
   canvasPort?: string;
 }
 
 const CANVAS_PORT = '9120';
 
-const CanvasViewer: React.FC<Props> = ({ lang, sessions, canvasPort = CANVAS_PORT }) => {
+const CanvasViewer: React.FC<Props> = ({ lang, sessions: externalSessions, canvasPort = CANVAS_PORT }) => {
   const t = LANG[lang];
+  const [discovered, setDiscovered] = useState<CanvasSession[]>([]);
+
+  // Pull canvas sessions from Tauri (lists ~/.hone/canvas/*).
+  // Refresh every 5s so newly generated canvases appear.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const { canvasSessionsList } = await import('../tauri/api');
+        const list = await canvasSessionsList();
+        if (cancelled) return;
+        setDiscovered(list.map(s => ({ id: s.id, name: s.name, host: 'local' })));
+      } catch {}
+    };
+    refresh();
+    const t = setInterval(refresh, 5000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  const sessions = (externalSessions && externalSessions.length > 0) ? externalSessions : discovered;
+
   const [selectedSession, setSelectedSession] = useState<CanvasSession>(
     sessions[0] ?? { id: '', name: '', host: '' }
   );
+
+  // When sessions arrive (or change), auto-select the first if none chosen
+  useEffect(() => {
+    if (!selectedSession.id && sessions.length > 0) {
+      setSelectedSession(sessions[0]!);
+    }
+  }, [sessions, selectedSession.id]);
+
   const [lastUpdated, setLastUpdated] = useState(new Date());
 
   const canvasUrl = selectedSession.id

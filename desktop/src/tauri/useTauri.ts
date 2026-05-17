@@ -166,6 +166,34 @@ export function useDiscovery() {
   return { gateways, scanning, scan };
 }
 
+// ── Hone path hook ──
+
+export function useHonePath() {
+  const [honePath, setHonePath] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!isTauri()) {
+      setLoading(false);
+      return;
+    }
+    api.getHonePath()
+      .then(p => { if (!cancelled) setHonePath(p); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const updatePath = useCallback(async (newPath: string) => {
+    if (!isTauri()) return;
+    await api.setHonePath(newPath);
+    setHonePath(newPath);
+  }, []);
+
+  return { honePath, loading, updatePath };
+}
+
 // ── Settings/config hook ──
 
 export function useTauriConfig() {

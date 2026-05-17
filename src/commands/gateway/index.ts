@@ -6,7 +6,7 @@ const gateway = {
   description: '管理 Hone Gateway 守护进程 (start/stop/status/approve/deny)',
   aliases: ['gw'],
   supportsNonInteractive: true,
-  load: () => import('./gateway.js'),
+  load: () => import('./gateway.js'), // The build system transpiles .tsx to .js in dist
 } satisfies Command
 
 export default gateway

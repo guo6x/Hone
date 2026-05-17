@@ -89,6 +89,22 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub model: String,
 
+    /// Custom OpenAI-compatible base URL (empty = provider default).
+    #[serde(default)]
+    pub base_url: String,
+
+    /// Display name when provider == "custom".
+    #[serde(default)]
+    pub custom_name: String,
+
+    /// Sampling temperature (0.0–2.0). Empty/0 = provider default.
+    #[serde(default)]
+    pub temperature: f32,
+
+    /// Max output tokens (0 = provider default).
+    #[serde(default)]
+    pub max_tokens: u32,
+
     /// Enable browser automation agent
     #[serde(default)]
     pub browser_enabled: bool,
@@ -128,6 +144,10 @@ impl Default for GatewayConfig {
             provider: String::new(),
             api_key: String::new(),
             model: String::new(),
+            base_url: String::new(),
+            custom_name: String::new(),
+            temperature: 0.0,
+            max_tokens: 0,
             browser_enabled: false,
             gui_model_url: String::new(),
             browser_headless: true,
@@ -217,19 +237,46 @@ impl GatewayManager {
             match self.config.provider.as_str() {
                 "openai" => {
                     cmd.env("OPENAI_API_KEY", &self.config.api_key);
+                    if !self.config.base_url.is_empty() {
+                        cmd.env("HONE_OPENAI_BASE_URL", &self.config.base_url);
+                    }
+                    if !self.config.model.is_empty() {
+                        cmd.env("HONE_OPENAI_MODEL", &self.config.model);
+                    }
                 }
                 "custom" => {
                     cmd.env("HONE_CUSTOM_API_KEY", &self.config.api_key);
+                    if !self.config.base_url.is_empty() {
+                        cmd.env("HONE_CUSTOM_BASE_URL", &self.config.base_url);
+                    }
+                    if !self.config.model.is_empty() {
+                        cmd.env("HONE_CUSTOM_MODEL", &self.config.model);
+                    }
+                    if !self.config.custom_name.is_empty() {
+                        cmd.env("HONE_CUSTOM_NAME", &self.config.custom_name);
+                    }
                 }
                 _ => {
                     // deepseek (default) or unknown
                     cmd.env("DEEPSEEK_API_KEY", &self.config.api_key);
                     cmd.env("HONE_DEEPSEEK_API_KEY", &self.config.api_key);
+                    if !self.config.base_url.is_empty() {
+                        cmd.env("HONE_DEEPSEEK_BASE_URL", &self.config.base_url);
+                    }
+                    if !self.config.model.is_empty() {
+                        cmd.env("HONE_DEEPSEEK_MODEL", &self.config.model);
+                    }
                 }
             }
         }
         if !self.config.model.is_empty() {
             cmd.env("HONE_MODEL", &self.config.model);
+        }
+        if self.config.temperature > 0.0 {
+            cmd.env("HONE_TEMPERATURE", self.config.temperature.to_string());
+        }
+        if self.config.max_tokens > 0 {
+            cmd.env("HONE_MAX_TOKENS", self.config.max_tokens.to_string());
         }
         // Browser automation env vars
         if self.config.browser_enabled {
