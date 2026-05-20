@@ -1,106 +1,70 @@
 /**
- * GUI agent model client.
- * Sends screenshots + task description to a vision-capable model,
- * parses structured action JSON from the response.
+ * GUI agent vision model client.
  *
- * Reuses the existing provider chain for API calls.
- * Falls back to DOM-based extraction when no vision model is configured.
+ * Sends a screenshot + task to an OpenAI-compatible vision endpoint and parses
+ * a structured next-action JSON. Configured via env vars:
+ *   HONE_GUI_MODEL_URL   — e.g. https://api.moonshot.cn/v1/chat/completions
+ *   HONE_GUI_MODEL_NAME  — e.g. moonshot-v1-32k-vision-preview
+ *   HONE_GUI_MODEL_KEY   — API key for the endpoint
+ *
+ * Works with Kimi (Moonshot), GPT-4V, Claude (via OpenAI-compatible proxy),
+ * or any locally-served UI-TARS/Qwen-VL deployment that speaks OpenAI chat.
+ *
+ * Note for general vision LLMs (Kimi/GPT-4V): they do NOT natively output
+ * click coordinates. We ask for CSS selectors and let Playwright resolve.
+ * This is less accurate than purpose-trained models (UI-TARS) but works.
  */
-import { getProvider } from '../../services/providers/index.js'
-import type { GUIAction, GUITask } from './types.js'
+import type { GUIAction } from './types.js'
 
-const GUI_SYSTEM_PROMPT = `You are a vision-based web agent. Your task is to control a browser to complete user requests.
+const GUI_SYSTEM_PROMPT = `你是一个能看屏幕的浏览器操作 agent。
 
-Given a screenshot and the current page state, respond with ONE action in JSON format:
+每一步根据 screenshot + 当前页面文本，输出**一个**下一步动作的 JSON。
+JSON 形式（用其中一种）：
 
-{
-  "action": "click",
-  "selector": "css selector of element",
-  "reason": "why you chose this action"
-}
+{ "action": "click", "selector": "<css 选择器>", "reason": "为什么点这个" }
+{ "action": "type", "selector": "<input 的 css 选择器>", "text": "要输入的内容", "reason": "..." }
+{ "action": "navigate", "url": "https://...", "reason": "..." }
+{ "action": "scroll", "coordinates": {"x": 0, "y": 300}, "reason": "..." }
+{ "action": "press", "key": "Enter", "reason": "..." }
+{ "action": "wait", "waitMs": 2000, "reason": "..." }
+{ "action": "done", "reason": "任务完成" }
+{ "action": "fail", "reason": "无法完成的原因" }
 
-OR
+选择器要求：
+- 优先用稳定的属性（id / data-testid / aria-label / name），避免位置类
+- 看清楚截图里元素的真实文字，用 :has-text() 或 input[name=...] 这类语义选择器
+- 不能编造选择器；只用你能从截图或页面文本里推断出存在的
 
-{
-  "action": "type",
-  "selector": "css selector of input field",
-  "text": "what to type",
-  "reason": "why"
-}
-
-OR
-
-{
-  "action": "navigate",
-  "url": "https://...",
-  "reason": "why"
-}
-
-OR
-
-{
-  "action": "scroll",
-  "coordinates": {"x": 0, "y": 300},
-  "reason": "why"
-}
-
-OR
-
-{
-  "action": "press",
-  "key": "Enter",
-  "reason": "why"
-}
-
-OR
-
-{
-  "action": "wait",
-  "waitMs": 2000,
-  "reason": "why"
-}
-
-OR
-
-{
-  "action": "done",
-  "reason": "task completed successfully"
-}
-
-OR
-
-{
-  "action": "fail",
-  "reason": "why the task cannot be completed"
-}
-
-Rules:
-- Use the most specific CSS selector possible (id > class > tag)
-- Prefer [data-testid] or aria-label attributes when visible
-- Never guess selectors that aren't visible in the page
-- If the task is complete, return action: "done"
-- Respond with JSON only, no markdown, no explanation outside the JSON`
+仅输出 JSON，不要 markdown 围栏，不要 JSON 外的文字。`
 
 export interface VisionModelConfig {
-  url: string        // API endpoint
-  model: string      // model name, e.g. "ui-tars-7b"
+  url: string
+  model: string
+  apiKey?: string
 }
 
-/**
- * Send a screenshot + task to the GUI agent model and get back an action.
- * Uses the vision-capable model endpoint configured via env vars.
- */
+/** Build config from env vars; returns null if URL is not set. */
+export function visionConfigFromEnv(): VisionModelConfig | null {
+  const url = process.env.HONE_GUI_MODEL_URL
+  if (!url || !url.trim()) return null
+  return {
+    url: url.trim(),
+    model: process.env.HONE_GUI_MODEL_NAME || '',
+    apiKey: process.env.HONE_GUI_MODEL_KEY
+      || process.env.ARK_API_KEY
+      || process.env.MOONSHOT_API_KEY
+      || process.env.OPENAI_API_KEY,
+  }
+}
+
 export async function queryGUIModel(
   screenshotBase64: string,
   task: string,
   domText: string,
   config: VisionModelConfig | null,
 ): Promise<GUIAction> {
-  if (config && config.url) {
-    return queryVisionModel(screenshotBase64, task, domText, config)
-  }
-  // No vision model configured — caller should use DOM fallback
-  throw new NoVisionModelError()
+  if (!config || !config.url) throw new NoVisionModelError()
+  return queryVisionModel(screenshotBase64, task, domText, config)
 }
 
 async function queryVisionModel(
@@ -109,49 +73,53 @@ async function queryVisionModel(
   domText: string,
   config: VisionModelConfig,
 ): Promise<GUIAction> {
-  const provider = getProvider()
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  }
+  if (config.apiKey) headers['Authorization'] = `Bearer ${config.apiKey}`
 
-  const response = await provider.createMessage({
+  const body = {
     model: config.model,
+    temperature: 0.1,
+    max_tokens: 512,
     messages: [
+      { role: 'system', content: GUI_SYSTEM_PROMPT },
       {
         role: 'user',
         content: [
           {
             type: 'image_url',
-            image_url: { url: `data:image/jpeg;base64,${screenshotBase64}`, detail: 'auto' },
+            image_url: { url: `data:image/jpeg;base64,${screenshotBase64}` },
           },
           {
             type: 'text',
-            text: `Task: ${task}\n\nCurrent page text:\n${domText.slice(0, 4000)}\n\nRespond with the next action JSON.`,
+            text: `任务: ${task}\n\n页面文本节选:\n${domText.slice(0, 3000)}\n\n下一步动作 JSON:`,
           },
         ],
       },
     ],
-    system: GUI_SYSTEM_PROMPT,
-    maxTokens: 512,
-    temperature: 0.1,
-  })
+  }
 
-  const text = extractText(response)
+  const res = await fetch(config.url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '')
+    throw new Error(`Vision model HTTP ${res.status}: ${errText.slice(0, 300)}`)
+  }
+  const data = await res.json() as any
+  const content = data?.choices?.[0]?.message?.content ?? ''
+  const text = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+      : JSON.stringify(content)
   return parseAction(text)
 }
 
-function extractText(response: any): string {
-  if (response.content) {
-    if (typeof response.content === 'string') return response.content
-    if (Array.isArray(response.content)) {
-      return response.content
-        .filter((c: any) => c.type === 'text')
-        .map((c: any) => c.text)
-        .join('\n')
-    }
-  }
-  return JSON.stringify(response)
-}
-
 function parseAction(text: string): GUIAction {
-  // Strip markdown code fences if present
   const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim()
 
   try {
@@ -159,7 +127,6 @@ function parseAction(text: string): GUIAction {
     validateAction(parsed)
     return parsed
   } catch {
-    // Try to find JSON object in the text
     const jsonMatch = cleaned.match(/\{[\s\S]*"action"[\s\S]*\}/)
     if (jsonMatch) {
       try {
@@ -167,23 +134,23 @@ function parseAction(text: string): GUIAction {
         validateAction(parsed)
         return parsed
       } catch {
-        return { action: 'fail', reason: `Failed to parse model response: ${text.slice(0, 200)}` }
+        return { action: 'fail', reason: `无法解析模型响应: ${text.slice(0, 200)}` }
       }
     }
-    return { action: 'fail', reason: `Failed to parse model response: ${text.slice(0, 200)}` }
+    return { action: 'fail', reason: `无法解析模型响应: ${text.slice(0, 200)}` }
   }
 }
 
 function validateAction(action: any): asserts action is GUIAction {
-  const validActions = ['click', 'type', 'scroll', 'press', 'navigate', 'wait', 'done', 'fail']
-  if (!validActions.includes(action.action)) {
+  const valid = ['click', 'type', 'scroll', 'press', 'navigate', 'wait', 'done', 'fail']
+  if (!valid.includes(action.action)) {
     throw new Error(`Invalid action: ${action.action}`)
   }
 }
 
 export class NoVisionModelError extends Error {
   constructor() {
-    super('No vision model configured')
+    super('No vision model configured (set HONE_GUI_MODEL_URL)')
     this.name = 'NoVisionModelError'
   }
 }

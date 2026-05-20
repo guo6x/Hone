@@ -13,6 +13,7 @@ pub struct AppState {
     pub discovery: Mutex<MdnsDiscovery>,
     pub ssh: Mutex<Option<SshTunnel>>,
     pub hone_path: Mutex<Option<String>>,
+    pub pty: crate::pty_manager::PtyManager,
 }
 
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -21,17 +22,26 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .path()
         .app_data_dir()
         .unwrap_or_else(|_| PathBuf::from("."));
-    let _ = std::fs::create_dir_all(&data_dir);
+    let _ = std::fs::create_dir_all(&data_dir).map_err(|e| {
+        log::warn!("Could not create app data directory: {}", e);
+        e
+    });
 
     // Try to guess the hone project root from the executable location
     let hone_path = guess_hone_path(app);
 
+    // Bind the gateway config to disk so user settings (API key, model, etc.)
+    // survive app restarts. Without this every relaunch loses everything.
+    let mut gateway = GatewayManager::new();
+    gateway.bind_config_file(data_dir.join("gateway-config.json"));
+
     app.manage(AppState {
-        gateway: Mutex::new(GatewayManager::new()),
+        gateway: Mutex::new(gateway),
         registry: Mutex::new(MachineRegistry::new(data_dir.join("machines.json"))),
         discovery: Mutex::new(MdnsDiscovery::new()),
         ssh: Mutex::new(None),
         hone_path: Mutex::new(hone_path.clone()),
+        pty: crate::pty_manager::PtyManager::new(),
     });
 
     // Spawn the background scheduler
@@ -45,27 +55,76 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Attempt to locate the hone project root directory.
 fn guess_hone_path(app: &tauri::App) -> Option<String> {
-    // Check current working directory first
-    if let Ok(cwd) = std::env::current_dir() {
-        if cwd.join("dist").join("cli.js").exists() {
-            return Some(cwd.to_string_lossy().to_string());
-        }
-        // Check if we are in the 'desktop' folder, and look for CLI in parent
-        if let Some(parent) = cwd.parent() {
-            if parent.join("dist").join("cli.js").exists() {
-                return Some(parent.to_string_lossy().to_string());
+    // 1. Try relative to current executable, going up to 5 levels
+    if let Ok(exe_path) = std::env::current_exe() {
+        let mut curr = exe_path.as_path();
+        for _ in 0..5 {
+            if let Some(parent) = curr.parent() {
+                if parent.join("dist").join("cli.js").exists() {
+                    log::info!("Detected Hone path from exe ancestor: {}", parent.display());
+                    return Some(parent.to_string_lossy().to_string());
+                }
+                curr = parent;
+            } else {
+                break;
             }
         }
     }
 
-    // Try relative to resource_dir
+    // 2. Check current working directory, going up to 5 levels
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut curr = cwd.as_path();
+        for _ in 0..5 {
+            if curr.join("dist").join("cli.js").exists() {
+                log::info!("Detected Hone path from cwd ancestor: {}", curr.display());
+                return Some(curr.to_string_lossy().to_string());
+            }
+            if let Some(parent) = curr.parent() {
+                curr = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // 3. Try relative to resource_dir
     if let Ok(res_dir) = app.path().resource_dir() {
         if res_dir.join("dist").join("cli.js").exists() {
+            log::info!("Detected Hone path from resource_dir: {}", res_dir.display());
             return Some(res_dir.to_string_lossy().to_string());
+        }
+        let res_sub = res_dir.join("resources");
+        if res_sub.join("dist").join("cli.js").exists() {
+            log::info!("Detected Hone path from resource_dir/resources: {}", res_sub.display());
+            return Some(res_sub.to_string_lossy().to_string());
         }
     }
 
     None
+}
+
+/// Resolve the correct Node.js binary path.
+/// If a bundled Node.js is present under resource_dir, we prefer it;
+/// otherwise we fallback to the system 'node'.
+fn get_node_path(app: &tauri::AppHandle) -> String {
+    if let Ok(res_dir) = app.path().resource_dir() {
+        let paths = [
+            res_dir.join("resources").join("node").join("node.exe"),
+            res_dir.join("node").join("node.exe"),
+            res_dir.join("resources").join("node").join("node"),
+            res_dir.join("node").join("node"),
+        ];
+
+        for p in &paths {
+            if p.exists() {
+                log::info!("Using bundled Node runtime: {}", p.display());
+                return p.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    log::info!("Bundled Node runtime not found, falling back to system 'node'");
+    "node".to_string()
 }
 
 // ── Gateway Commands ──
@@ -112,7 +171,7 @@ pub async fn gateway_start(
         gw.set_config(cfg);
     }
 
-    let url = relay_url.unwrap_or_else(|| "wss://hone-relay.marsailleippi79.workers.dev".into());
+    let url = relay_url.unwrap_or_else(|| "wss://hone-relay.marsailleippi79.workers.dev/connect/default".into());
 
     // Validation: ensure the path exists and contains dist/cli.js
     let p = std::path::Path::new(&hone_path);
@@ -126,7 +185,8 @@ pub async fn gateway_start(
         ));
     }
 
-    gw.start(&hone_path, &url)
+    let node_path = get_node_path(&app);
+    gw.start(&node_path, &hone_path, &url)
         .map(|()| format!("Gateway started: {}", url))
         .map_err(|e| format!("Failed to start gateway: {}", e))
 }
@@ -413,6 +473,183 @@ pub async fn set_hone_path(
     Ok(())
 }
 
+// ── Local CLI instance discovery (auto-pairing on same machine) ──
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LocalCliInstance {
+    pub pid: u32,
+    pub cwd: String,
+    pub machine_name: String,
+    pub os: String,
+    pub version: String,
+    pub mode: String,
+    pub started_at: String,
+}
+
+/// Scan ~/.hone/instances/*.json for marker files dropped by running `hone`
+/// CLI processes on this machine. Filter out dead PIDs and clean their markers.
+#[tauri::command]
+pub async fn local_cli_instances_list() -> Result<Vec<LocalCliInstance>, String> {
+    let home = dirs::home_dir().ok_or_else(|| "未找到 home 目录".to_string())?;
+    let dir = home.join(".hone").join("instances");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut alive: Vec<LocalCliInstance> = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(Vec::new()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let pid = match parsed.get("pid").and_then(|v| v.as_u64()) {
+            Some(p) => p as u32,
+            None => continue,
+        };
+        if !is_process_alive(pid) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        alive.push(LocalCliInstance {
+            pid,
+            cwd: parsed.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            machine_name: parsed.get("machineName").and_then(|v| v.as_str()).unwrap_or("Local").to_string(),
+            os: parsed.get("os").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            version: parsed.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            mode: parsed.get("mode").and_then(|v| v.as_str()).unwrap_or("interactive").to_string(),
+            started_at: parsed.get("startedAt").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        });
+    }
+    // Newest first
+    alive.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    Ok(alive)
+}
+
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    use std::process::Command;
+    // tasklist returns INFO if found, else "No tasks are running which match..."
+    let out = match Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+        .output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let txt = String::from_utf8_lossy(&out.stdout);
+    // Output is empty or "INFO:" line when no match. A real row contains the pid.
+    txt.contains(&format!("\"{}\"", pid))
+}
+
+#[cfg(not(windows))]
+fn is_process_alive(pid: u32) -> bool {
+    // `kill -0 <pid>` returns 0 if the process exists and we can signal it.
+    use std::process::Command;
+    match Command::new("kill").args(["-0", &pid.to_string()]).status() {
+        Ok(s) => s.success(),
+        Err(_) => false,
+    }
+}
+
+// ── Local CLI pairing ──
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LocalPairInput {
+    pub host: String,
+    pub port: u16,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LocalPairResult {
+    pub ok: bool,
+    pub token: Option<String>,
+    pub machine_name: Option<String>,
+    pub machine_id: Option<String>,
+    pub os: Option<String>,
+    pub cwd: Option<String>,
+    pub pid: Option<u32>,
+    pub version: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Pair with a `hone pair`-running CLI on the local network.
+/// POSTs {code, clientName} to http://host:port/pair and returns the CLI's
+/// identity info on success.
+#[tauri::command]
+pub async fn pair_with_local_cli(input: LocalPairInput) -> Result<LocalPairResult, String> {
+    if input.code.is_empty() {
+        return Err("请输入配对码".to_string());
+    }
+    if input.host.is_empty() {
+        return Err("请输入 CLI 主机地址".to_string());
+    }
+
+    let url = format!("http://{}:{}/pair", input.host.trim(), input.port);
+    let client_name = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "Hone Desktop".to_string());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP 客户端错误: {}", e))?;
+
+    let body = serde_json::json!({
+        "code": input.code.trim(),
+        "clientName": client_name,
+    });
+
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("连接失败: {} — 确认 CLI 已运行 `hone pair`，端口可达", e))?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("响应解析失败: {} — 收到: {}", e, text.chars().take(120).collect::<String>()))?;
+
+    if !status.is_success() {
+        let err = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&text)
+            .to_string();
+        return Ok(LocalPairResult {
+            ok: false,
+            token: None, machine_name: None, machine_id: None,
+            os: None, cwd: None, pid: None, version: None,
+            error: Some(err),
+        });
+    }
+
+    Ok(LocalPairResult {
+        ok: parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        token: parsed.get("token").and_then(|v| v.as_str()).map(String::from),
+        machine_name: parsed.get("machineName").and_then(|v| v.as_str()).map(String::from),
+        machine_id: parsed.get("machineId").and_then(|v| v.as_str()).map(String::from),
+        os: parsed.get("os").and_then(|v| v.as_str()).map(String::from),
+        cwd: parsed.get("cwd").and_then(|v| v.as_str()).map(String::from),
+        pid: parsed.get("pid").and_then(|v| v.as_u64()).map(|n| n as u32),
+        version: parsed.get("version").and_then(|v| v.as_str()).map(String::from),
+        error: None,
+    })
+}
+
 // ── Provider connectivity test ──
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -499,6 +736,7 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<GatewayConfig, Str
 #[tauri::command]
 pub async fn save_config(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     config: GatewayConfig,
     hone_path: String,
 ) -> Result<(), String> {
@@ -509,7 +747,8 @@ pub async fn save_config(
         .lock()
         .map_err(|e| format!("Failed to acquire gateway lock: {}", e))?;
 
-    gw.apply_config(config, &hone_path)
+    let node_path = get_node_path(&app);
+    gw.apply_config(&node_path, config, &hone_path)
         .map_err(|e| format!("Failed to save config: {}", e))
 }
 
@@ -645,6 +884,198 @@ pub async fn canvas_sessions_list() -> Result<Vec<CanvasSessionInfo>, String> {
     // Newest first
     sessions.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
     Ok(sessions)
+}
+
+// ── CLI Task Workspace Commands ──
+//
+// Lets the desktop spawn one-shot CLI tasks in arbitrary working directories
+// and stream their stdout/stderr back via Tauri events. Powers the multi-project
+// "workspace" view where the user can dispatch tasks to several projects in
+// parallel from a single window.
+
+#[tauri::command]
+pub async fn cli_task_run(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    cwd: String,
+    task: String,
+) -> Result<String, String> {
+    use tauri::Emitter;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    log::info!("cli_task_run cwd={} task_len={}", cwd, task.len());
+
+    // Resolve hone CLI path
+    let hone_path = {
+        let p = state.hone_path.lock().map_err(|e| format!("lock: {}", e))?;
+        p.clone()
+    }
+    .ok_or_else(|| "Hone path not configured".to_string())?;
+
+    let cli_js = std::path::Path::new(&hone_path).join("dist").join("cli.js");
+    if !cli_js.exists() {
+        return Err(format!("CLI not found at {}", cli_js.display()));
+    }
+
+    // Validate cwd
+    let cwd_path = std::path::Path::new(&cwd);
+    if !cwd_path.exists() || !cwd_path.is_dir() {
+        return Err(format!("Working directory does not exist: {}", cwd));
+    }
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let event_chunk = format!("cli_task_chunk_{}", task_id);
+    let event_done = format!("cli_task_done_{}", task_id);
+
+    let app_handle = app.clone();
+    let task_id_for_spawn = task_id.clone();
+    let task_for_spawn = task.clone();
+    let cwd_for_spawn = cwd.clone();
+
+    let node_path = get_node_path(&app);
+    let node_path_for_spawn = node_path.clone();
+
+    // Spawn in a tokio task so cli_task_run returns immediately
+    tokio::spawn(async move {
+        let mut cmd = tokio::process::Command::new(&node_path_for_spawn);
+        cmd.arg(&cli_js)
+            .arg("-p")
+            .arg(&task_for_spawn)
+            .current_dir(&cwd_for_spawn)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null());
+
+        // On Windows hide console window for the child node process
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = app_handle.emit(&event_done, serde_json::json!({
+                    "task_id": task_id_for_spawn,
+                    "status": "error",
+                    "error": format!("spawn failed: {}", e),
+                }));
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+
+        let emit_stdout = {
+            let app_handle = app_handle.clone();
+            let event = event_chunk.clone();
+            let task_id = task_id_for_spawn.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let _ = app_handle.emit(&event, serde_json::json!({
+                        "task_id": task_id, "stream": "stdout", "line": line,
+                    }));
+                }
+            })
+        };
+        let emit_stderr = {
+            let app_handle = app_handle.clone();
+            let event = event_chunk.clone();
+            let task_id = task_id_for_spawn.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let _ = app_handle.emit(&event, serde_json::json!({
+                        "task_id": task_id, "stream": "stderr", "line": line,
+                    }));
+                }
+            })
+        };
+
+        let status = child.wait().await;
+        let _ = emit_stdout.await;
+        let _ = emit_stderr.await;
+
+        let (ok, code) = match status {
+            Ok(s) => (s.success(), s.code().unwrap_or(-1)),
+            Err(_) => (false, -1),
+        };
+        let _ = app_handle.emit(&event_done, serde_json::json!({
+            "task_id": task_id_for_spawn,
+            "status": if ok { "ok" } else { "fail" },
+            "exit_code": code,
+        }));
+    });
+
+    Ok(task_id)
+}
+
+// ── PTY Commands ──
+//
+// Real interactive terminal for the multi-CLI workspace. Each session runs
+// `node <hone>/dist/cli.js` in a pty so Ink TUIs render correctly. Output
+// streams over Tauri event `pty_data_<session_id>`; input via `pty_write`.
+
+#[tauri::command]
+pub async fn pty_open(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    cwd: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    log::info!("pty_open id={} cwd={}", session_id, cwd);
+
+    let hone_path = {
+        let p = state.hone_path.lock().map_err(|e| format!("lock: {}", e))?;
+        p.clone()
+    }
+    .ok_or_else(|| "Hone path not configured".to_string())?;
+
+    let cli_js = std::path::Path::new(&hone_path).join("dist").join("cli.js");
+    if !cli_js.exists() {
+        return Err(format!("CLI not found at {}", cli_js.display()));
+    }
+
+    let node_path = get_node_path(&app);
+    let args = vec![cli_js.to_string_lossy().to_string()];
+    let env = vec![
+        ("FORCE_COLOR".to_string(), "1".to_string()),
+        ("TERM".to_string(), "xterm-256color".to_string()),
+    ];
+
+    state.pty.open(app, session_id, &node_path, args, Some(&cwd), cols, rows, env)
+}
+
+#[tauri::command]
+pub async fn pty_write(
+    state: State<'_, AppState>,
+    session_id: String,
+    data: String,
+) -> Result<(), String> {
+    state.pty.write(&session_id, &data)
+}
+
+#[tauri::command]
+pub async fn pty_resize(
+    state: State<'_, AppState>,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    state.pty.resize(&session_id, cols, rows)
+}
+
+#[tauri::command]
+pub async fn pty_close(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    state.pty.close(&session_id)
 }
 
 // ── Execution Log Commands ──

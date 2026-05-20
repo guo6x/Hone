@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { LANG, type Lang } from '../i18n/translations';
 import { isTauri } from '../tauri/useTauri';
-import { sshConnect } from '../tauri/api';
+import { sshConnect, pairWithLocalCli } from '../tauri/api';
 import type { SshAuth } from '../tauri/types';
 
 type Method = 'local' | 'ssh' | 'tunnel';
@@ -119,16 +119,25 @@ export function DevicePairingModal({ lang, onClose, onPaired, useTauri, discover
           onClose();
         }, 600);
       } else if (method === 'local' && isTauri()) {
-        // Local network: add directly (discovered via mDNS or entered manually)
-        const machineName = host.trim() || `CLI-${code}`;
+        // Local network: POST /pair to the CLI's `hone pair` server.
+        const targetHost = (host.trim() || '127.0.0.1');
+        const targetPort = parseInt(port, 10) || 18789;
+        if (!code.trim() || code.trim().length !== 6) {
+          throw new Error(lang === 'zh' ? '请输入 6 位配对码' : 'Enter the 6-digit code');
+        }
+        const r = await pairWithLocalCli(targetHost, targetPort, code.trim());
+        if (!r.ok) {
+          throw new Error(r.error || (lang === 'zh' ? '配对失败' : 'Pairing failed'));
+        }
+        const machineName = r.machine_name || `CLI-${code}`;
         setConnecting(false);
         setConnected(true);
         setTimeout(() => {
           onPaired({
             name: machineName,
             method: 'local',
-            host: host.trim() || '',
-            port: parseInt(port, 10) || 18789,
+            host: targetHost,
+            port: targetPort,
             code: code.trim(),
             pairedAt: Date.now(),
           });
@@ -214,13 +223,57 @@ export function DevicePairingModal({ lang, onClose, onPaired, useTauri, discover
 
         {method === 'local' && (
           <div>
-            <label style={{ fontSize: 13, fontWeight: 500, display: 'block', marginBottom: 4 }}>{t('pairCode')}</label>
-            <p style={{ fontSize: 12, color: 'var(--hone-muted)', margin: '0 0 10px' }}>
+            <p style={{ fontSize: 12, color: 'var(--hone-muted)', margin: '0 0 12px', lineHeight: 1.5 }}>
               {lang === 'zh'
-                ? <>在 CLI 实例中运行 <code style={{ background: 'var(--hone-codeBg)', padding: '1px 5px', borderRadius: 3 }}>hone pair</code> 获取配对码</>
-                : <>Run <code style={{ background: 'var(--hone-codeBg)', padding: '1px 5px', borderRadius: 3 }}>hone pair</code> in your CLI instance to get a pairing code.</>
+                ? <>在 CLI 实例终端运行 <code style={{ background: 'var(--hone-codeBg)', padding: '1px 5px', borderRadius: 3 }}>hone pair</code>。CLI 会显示主机地址、端口和 6 位配对码——把它们填到下面。</>
+                : <>Run <code style={{ background: 'var(--hone-codeBg)', padding: '1px 5px', borderRadius: 3 }}>hone pair</code> in your CLI's terminal. It will print host, port, and a 6-digit code—enter them below.</>
               }
             </p>
+
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+              <div style={{ flex: 2 }}>
+                <label style={{ fontSize: 12, fontWeight: 500, display: 'block', marginBottom: 4, color: 'var(--hone-muted)' }}>
+                  {lang === 'zh' ? '主机' : 'Host'}
+                </label>
+                <input
+                  type="text"
+                  value={host}
+                  onChange={(e) => setHost(e.target.value)}
+                  placeholder="127.0.0.1"
+                  style={{
+                    width: '100%', boxSizing: 'border-box' as const,
+                    padding: '8px 12px', fontSize: 13, borderRadius: 6,
+                    border: '1px solid var(--hone-border)',
+                    background: 'var(--hone-surface)', color: 'var(--hone-text)',
+                    outline: 'none', fontFamily: 'monospace',
+                  }}
+                />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label style={{ fontSize: 12, fontWeight: 500, display: 'block', marginBottom: 4, color: 'var(--hone-muted)' }}>
+                  {lang === 'zh' ? '端口' : 'Port'}
+                </label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={port === '22' ? '18789' : port}
+                  onChange={(e) => {
+                    const v = e.target.value.replace(/\D/g, '');
+                    setPort(v);
+                  }}
+                  placeholder="18789"
+                  style={{
+                    width: '100%', boxSizing: 'border-box' as const,
+                    padding: '8px 12px', fontSize: 13, borderRadius: 6,
+                    border: '1px solid var(--hone-border)',
+                    background: 'var(--hone-surface)', color: 'var(--hone-text)',
+                    outline: 'none', fontFamily: 'monospace',
+                  }}
+                />
+              </div>
+            </div>
+
+            <label style={{ fontSize: 13, fontWeight: 500, display: 'block', marginBottom: 6 }}>{t('pairCode')}</label>
             <input
               type="text"
               inputMode="numeric"

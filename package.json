@@ -3,6 +3,9 @@
   "version": "2.1.88",
   "type": "module",
   "private": true,
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "postinstall": "node scripts/postinstall.js",
     "build": "bun run build.ts",

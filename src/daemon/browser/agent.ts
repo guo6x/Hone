@@ -223,8 +223,17 @@ export function createBrowserAgent(
     defaultTimeout: parseInt(process.env.HONE_BROWSER_TIMEOUT || '30000', 10),
   }
 
+  // Vision model is configured via the same env vars as gui-model.ts (visionConfigFromEnv).
+  // Pull the API key explicitly so the model can authenticate with Kimi/GPT-4V/etc.
   const visionConfig: VisionModelConfig | null = guiModelUrl
-    ? { url: guiModelUrl, model: config.guiModelName }
+    ? {
+        url: guiModelUrl,
+        model: config.guiModelName,
+        apiKey: process.env.HONE_GUI_MODEL_KEY
+          || process.env.MOONSHOT_API_KEY
+          || process.env.OPENAI_API_KEY
+          || undefined,
+      }
     : null
 
   return new BrowserAgent(config, visionConfig, onConfirm, onStep, llmCall)

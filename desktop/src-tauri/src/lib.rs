@@ -4,6 +4,7 @@ mod commands;
 mod gateway_manager;
 mod machine_registry;
 mod mdns_discovery;
+mod pty_manager;
 mod scheduler;
 mod ssh_tunnel;
 mod windows_git_bash;
@@ -35,6 +36,8 @@ pub fn run() {
             commands::ssh_execute,
             commands::get_hone_path,
             commands::set_hone_path,
+            commands::pair_with_local_cli,
+            commands::local_cli_instances_list,
             commands::test_provider,
             commands::get_config,
             commands::save_config,
@@ -44,6 +47,11 @@ pub fn run() {
             commands::autostart_toggle,
             commands::execution_log_list,
             commands::canvas_sessions_list,
+            commands::cli_task_run,
+            commands::pty_open,
+            commands::pty_write,
+            commands::pty_resize,
+            commands::pty_close,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

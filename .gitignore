@@ -11,6 +11,14 @@ desktop/src-tauri/target/
 # Temp / scratch
 ~/
 scratch/
+*.log
+*.patch
+FIX_BRIEF*.md
+FIX_REPORT*.md
+gw-out.* gw-err.*
+
+# Internal roadmap — kept locally, not published
+HONE_EVOLUTION.md
 
 # Backup / build output
 *.backup

@@ -14,7 +14,7 @@
  * command and the long-running gateway process.
  */
 import { spawn } from 'child_process'
-import type { LocalJSXCommandOnDone } from '../../types/command.js'
+import type { LocalCommandCall } from '../../types/command.js'
 
 function honeHome(): string {
   return process.env.HOME || process.env.USERPROFILE || '~'
@@ -32,11 +32,7 @@ function pairingsDir(): string {
   return `${honeDataDir()}/pairings`
 }
 
-export async function call(
-  onDone: LocalJSXCommandOnDone,
-  _context: any,
-  args?: string,
-): Promise<string | null> {
+export const call: LocalCommandCall = async (args, _context) => {
   const parts = (args || '').trim().split(/\s+/)
   const subcommand = parts[0] || 'status'
 
@@ -181,6 +177,5 @@ export async function call(
       result = '用法: /gateway [start|stop|status|pairings|approve|deny]'
   }
 
-  onDone(result)
-  return null
+  return { type: 'text', value: result }
 }

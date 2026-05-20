@@ -1,63 +1,95 @@
 /**
  * Playwright lifecycle manager for Hone Browser Agent.
- * Handles browser launch, context creation with persistent sessions,
- * page operations, and cleanup.
+ *
+ * Uses `launchPersistentContext(userDataDir)` per profile so EVERYTHING
+ * persists across runs — cookies, localStorage, indexedDB, service workers.
+ * The user logs into a site (e.g. xiaohongshu.com) once via the desktop
+ * "open for login" flow, and the agent reuses that session indefinitely.
+ *
+ * Trade-off: we can't share one Browser across persistent contexts; each
+ * profile is its own process. For a single-user app this is fine.
  */
-import type { Browser, BrowserContext, Page } from 'playwright'
-import type { BrowserConfig, BrowserState, BrowserProfile, GUIAction } from './types.js'
+import type { BrowserContext, Page } from 'playwright'
+import type { BrowserConfig, BrowserState, GUIAction } from './types.js'
 import { getPageExtractionScript, type PageExtraction } from './dom-fallback.js'
 import fs from 'fs/promises'
 import path from 'path'
 
-let browser: Browser | null = null
 const contexts = new Map<string, BrowserContext>()
 const pages = new Map<string, Page>()
 
-/**
- * Launch or reuse the Playwright browser instance.
- */
-export async function launchBrowser(config: BrowserConfig): Promise<Browser> {
-  if (browser?.isConnected()) return browser
-
-  // Dynamic import to avoid loading playwright when browser is disabled
-  const { chromium } = await import('playwright')
-  browser = await chromium.launch({
-    headless: config.headless,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  })
-  return browser
+function profileUserDataDir(config: BrowserConfig, profileName: string): string {
+  return path.join(config.dataDir, 'profiles', profileName, 'userData')
 }
 
 /**
- * Get or create a browser context for a profile.
- * Restores storage state (cookies, localStorage) from disk.
+ * Get or open a persistent browser context for a profile.
+ *
+ * The userDataDir is a real Chrome profile directory — anything the user
+ * does there (cookies, logins, extensions) survives restarts.
  */
-export async function getContext(config: BrowserConfig, profileName: string): Promise<BrowserContext> {
+export async function getContext(
+  config: BrowserConfig,
+  profileName: string,
+  opts: { headless?: boolean } = {},
+): Promise<BrowserContext> {
   const existing = contexts.get(profileName)
   if (existing) return existing
 
-  const profileDir = path.join(config.dataDir, 'profiles', profileName)
-  await fs.mkdir(profileDir, { recursive: true })
+  const userDataDir = profileUserDataDir(config, profileName)
+  await fs.mkdir(userDataDir, { recursive: true })
 
-  const stateFile = path.join(profileDir, 'state.json')
-  let storageState: any = undefined
-  try {
-    const raw = await fs.readFile(stateFile, 'utf-8')
-    storageState = JSON.parse(raw)
-  } catch {
-    // No saved state yet — fresh session
-  }
-
-  const b = await launchBrowser(config)
-  const context = await b.newContext({
-    storageState,
+  const { chromium } = await import('playwright')
+  const headless = opts.headless ?? config.headless
+  const context = await chromium.launchPersistentContext(userDataDir, {
+    headless,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
     viewport: { width: 1280, height: 800 },
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   })
 
   contexts.set(profileName, context)
+  // If the user closes the window manually (e.g. after login), clean up our refs.
+  context.on('close', () => {
+    contexts.delete(profileName)
+    pages.delete(profileName)
+  })
   return context
+}
+
+/**
+ * Open a profile in a non-headless browser so the user can manually log in
+ * to a site. Resolves when the user closes the window.
+ *
+ * This is the "log in once like a normal person" entry point — sessions
+ * persist via the userDataDir on disk.
+ */
+export async function openProfileForLogin(
+  config: BrowserConfig,
+  profileName: string,
+  startUrl?: string,
+): Promise<void> {
+  // Close any existing headless context for this profile so we can reopen
+  // it visibly (only one persistent context can use a userDataDir at a time).
+  await closeProfile(profileName)
+  const context = await getContext(config, profileName, { headless: false })
+  const page = context.pages()[0] || (await context.newPage())
+  pages.set(profileName, page)
+  if (startUrl) {
+    try {
+      await page.goto(startUrl, { waitUntil: 'domcontentloaded' })
+    } catch {
+      // ignore — user may navigate elsewhere
+    }
+  }
+  // Wait for the user to close either the window or the whole context.
+  await new Promise<void>((resolve) => {
+    let done = false
+    const finish = () => { if (!done) { done = true; resolve() } }
+    page.once('close', finish)
+    context.once('close', finish)
+  })
 }
 
 /**
@@ -170,17 +202,12 @@ export async function executeAction(
 }
 
 /**
- * Save the current browser context storage state to disk.
+ * Save the current browser context storage state.
+ * With persistent contexts (userDataDir), Chrome persists everything to disk
+ * automatically — this is a no-op kept for API compatibility.
  */
-export async function saveContextState(config: BrowserConfig, profileName: string): Promise<void> {
-  const context = contexts.get(profileName)
-  if (!context) return
-
-  const profileDir = path.join(config.dataDir, 'profiles', profileName)
-  await fs.mkdir(profileDir, { recursive: true })
-
-  const state = await context.storageState()
-  await fs.writeFile(path.join(profileDir, 'state.json'), JSON.stringify(state, null, 2))
+export async function saveContextState(_config: BrowserConfig, _profileName: string): Promise<void> {
+  // No-op: persistent context handles all storage on disk via Chrome itself.
 }
 
 /**
@@ -188,11 +215,15 @@ export async function saveContextState(config: BrowserConfig, profileName: strin
  */
 export async function closeProfile(profileName: string): Promise<void> {
   const page = pages.get(profileName)
-  if (page && !page.isClosed()) await page.close()
+  if (page && !page.isClosed()) {
+    try { await page.close() } catch {}
+  }
   pages.delete(profileName)
 
   const context = contexts.get(profileName)
-  if (context) await context.close()
+  if (context) {
+    try { await context.close() } catch {}
+  }
   contexts.delete(profileName)
 }
 
@@ -200,13 +231,11 @@ export async function closeProfile(profileName: string): Promise<void> {
  * Shut down browser and clean up all profiles.
  */
 export async function shutdown(): Promise<void> {
-  for (const [name] of pages) {
+  const names = [...pages.keys(), ...contexts.keys()]
+  const unique = Array.from(new Set(names))
+  for (const name of unique) {
     try { await closeProfile(name) } catch {}
   }
-  if (browser?.isConnected()) {
-    await browser.close()
-  }
-  browser = null
 }
 
 /**

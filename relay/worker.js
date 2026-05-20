@@ -102,7 +102,7 @@ export class RelayRoom {
 
     switch (type) {
 
-      // ----- Registration ------------------------------------------------
+      // ── Control messages (special handling) ──────────────────────────
 
       case "register": {
         if (msg.role === "gateway") {
@@ -115,8 +115,6 @@ export class RelayRoom {
         break;
       }
 
-      // ----- Gateway heartbeat -------------------------------------------
-
       case "heartbeat": {
         for (const [, gw] of this.gateways) {
           if (gw.ws === ws) {
@@ -127,101 +125,30 @@ export class RelayRoom {
         break;
       }
 
-      // ----- Client sends a message for the gateway ----------------------
-
-      case "message": {
-        this._handleMessage(ws, msg);
-        break;
-      }
-
-      // ----- Pairing response from gateway -------------------------------
-
       case "pairing_response": {
         this._handlePairingResponse(ws, msg);
         break;
       }
-
-      // ----- Task lifecycle (gateway → broadcast to all clients) ---------
-
-      case "task_started":
-      case "task_progress":
-      case "task_complete": {
-        this._broadcastToClients(ws, msg);
-        break;
-      }
-
-      // ----- Schedule messages -------------------------------------------
-
-      case "schedule_create": {
-        this._forwardToGateway(msg);
-        break;
-      }
-
-      case "schedule_list": {
-        // If the message includes schedules[] data, it's a response from
-        // the gateway — broadcast to approved clients.
-        if (Array.isArray(msg.schedules)) {
-          this._broadcastToClients(ws, msg);
-        } else {
-          // Request from a client — forward to gateway.
-          this._forwardToGateway(msg);
-        }
-        break;
-      }
-
-      case "schedule_enable":
-      case "schedule_disable":
-      case "schedule_delete": {
-        this._forwardToGateway(msg);
-        break;
-      }
-
-      case "schedule_created": {
-        // Gateway created a schedule — broadcast to all approved clients
-        this._broadcastToClients(ws, msg);
-        break;
-      }
-
-      case "schedule_triggered": {
-        this._forwardToClient(msg, msg.clientId);
-        this._broadcastToClients(ws, msg);
-        break;
-      }
-
-      // ----- Canvas streaming --------------------------------------------
-
-      case "canvas_update": {
-        this._broadcastToClients(ws, msg);
-        break;
-      }
-
-      // ----- Dispatch to CLI (desktop → gateway → CLI) ------------------
-
-      case "dispatch": {
-        this._forwardToGateway(msg);
-        break;
-      }
-
-      // ----- Internal ping / pong ----------------------------------------
 
       case "pong": {
         // silently consumed
         break;
       }
 
-      // ----- Client-initiated latency probe ------------------------------
-
       case "ping": {
         // Echo back so the client can measure round-trip latency.
-        // Preserves ts so the client can compute (now - ts).
         this._send(ws, { type: "pong", ts: msg.ts });
         break;
       }
 
-      // ----- Unknown type ------------------------------------------------
+      // ── Everything else — generic passthrough router ─────────────────
+      // Client messages → forwarded to gateway (with sender identity).
+      // Gateway messages → broadcast to all approved clients, or
+      //   point-to-point if target === "client" and clientId is set.
+      // Unregistered connections are silently dropped.
 
       default: {
-        // Silently ignore unknown message types.
+        this._routeMessage(ws, msg);
         break;
       }
     }
@@ -395,38 +322,54 @@ export class RelayRoom {
   // Private: Message forwarding
   // -----------------------------------------------------------------------
 
-  _handleMessage(ws, msg) {
-    const target = msg.target;
-    const payload = msg.payload || {};
+  /** Generic passthrough router for all non-control message types.
+   *  - Client → gateway: forward with sender identity (only if approved).
+   *  - Gateway → client(s): broadcast to all approved clients, or
+   *    point-to-point if msg.target === "client" and msg.clientId is set.
+   *  - Unregistered connections are silently dropped. */
+  _routeMessage(ws, msg) {
+    // Identify sender
+    let isGateway = false;
+    let clientId = null;
+    let approved = false;
 
-    if (target === "gateway") {
-      let senderId = null;
-      let approved = false;
+    for (const [, gw] of this.gateways) {
+      if (gw.ws === ws) { isGateway = true; break; }
+    }
+
+    if (!isGateway) {
       for (const [cid, cl] of this.clients) {
-        if (cl.ws === ws) { senderId = cid; approved = cl.approved; break; }
+        if (cl.ws === ws) { clientId = cid; approved = cl.approved; break; }
       }
-      if (!senderId) return;
+    }
+
+    if (isGateway) {
+      // Gateway → client(s) — always stamp from:'gateway' so
+      // clients can trust the sender and PWA's case 'message'
+      // check (m.from === 'gateway') works correctly.
+      // Overwriting msg.from also prevents client spoofing.
+      if (msg.target === 'client' && msg.clientId) {
+        this._forwardToClient({ ...msg, from: 'gateway' }, msg.clientId);
+      } else {
+        this._broadcastToClients({ ...msg, from: 'gateway' });
+      }
+    } else if (clientId) {
+      // Client → gateway
       if (!approved) {
-        this._send(ws, { type: "error", message: "Not approved — wait for gateway pairing approval" });
+        this._send(ws, {
+          type: 'error',
+          message: 'Not approved — wait for gateway pairing approval',
+        });
         return;
       }
-
+      // Forward with sender identity so the gateway knows which client sent it
       this._forwardToGateway({
-        type: "message",
-        from: "client",
-        clientId: senderId,
-        payload,
+        ...msg,
+        from: 'client',
+        clientId,
       });
-    } else if (target === "client") {
-      const clientId = msg.clientId;
-      if (!clientId) return;
-
-      this._forwardToClient({
-        type: "message",
-        from: "gateway",
-        payload,
-      }, clientId);
     }
+    // else: unknown sender — silently drop
   }
 
   _forwardToGateway(msg) {

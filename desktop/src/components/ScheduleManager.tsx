@@ -20,6 +20,11 @@ interface ScheduleManagerProps {
   onAcceptSuggestion: (ai: AiSuggestion) => void;
   onDismissSuggestion: (id: string) => void;
   lang: Lang;
+  /** Optional shared gateway connection for fetching execution history. */
+  connection?: {
+    send: (msg: Record<string, unknown>) => boolean;
+    subscribe: (cb: (msg: any) => void) => () => void;
+  };
 }
 
 interface ModalProps {
@@ -335,14 +340,178 @@ const emptyStyles: Record<string, any> = {
 /*  Main component                                                    */
 /* ------------------------------------------------------------------ */
 
+// ── History modal ───────────────────────────────────────────────────────
+
+interface ScheduleRun {
+  id: number;
+  schedule_id: string;
+  started_at: number;
+  finished_at?: number;
+  status?: 'ok' | 'fail';
+  result?: string;
+  error?: string;
+  duration_ms?: number;
+}
+
+interface AgentInfo {
+  schedule_id: string;
+  created_at: number;
+  confidence: number;
+  source_pattern?: string;
+  user_corrected: boolean;
+}
+
+function HistoryModal({
+  scheduleId, title, connection, onClose, lang,
+}: {
+  scheduleId: string;
+  title: string;
+  connection: ScheduleManagerProps['connection'];
+  onClose: () => void;
+  lang: Lang;
+}) {
+  const [runs, setRuns] = useState<ScheduleRun[] | null>(null);
+  const [agentInfo, setAgentInfo] = useState<AgentInfo | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!connection) {
+      setErr(lang === 'zh' ? 'Gateway 未连接，无法读取历史' : 'Gateway not connected');
+      return;
+    }
+    const unsub = connection.subscribe((msg: any) => {
+      if (msg.type === 'schedule_runs_response' && msg.scheduleId === scheduleId) {
+        setRuns(msg.runs || []);
+        setAgentInfo(msg.agentInfo || null);
+      }
+    });
+    const sent = connection.send({ type: 'schedule_runs_request', scheduleId, limit: 50 });
+    if (!sent) setErr(lang === 'zh' ? 'Gateway 离线' : 'Gateway offline');
+    const timer = setTimeout(() => {
+      if (!runs) setErr(prev => prev || (lang === 'zh' ? '请求超时' : 'Request timed out'));
+    }, 5000);
+    return () => { unsub(); clearTimeout(timer); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scheduleId, connection]);
+
+  const fmtTime = (ts: number) => {
+    const d = new Date(ts);
+    return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  };
+
+  return (
+    <div
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 10000,
+        background: 'var(--hone-scrim)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}
+    >
+      <div style={{
+        width: 640, maxWidth: 'calc(100vw - 40px)', maxHeight: '80vh',
+        borderRadius: 12, padding: 24, overflow: 'auto',
+        background: 'var(--hone-surfaceRaised)', color: 'var(--hone-text)',
+        border: '1px solid var(--hone-border)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+          <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>
+            {lang === 'zh' ? '执行历史' : 'Run History'}
+          </h2>
+          <button onClick={onClose} style={{
+            background: 'transparent', border: 'none', cursor: 'pointer',
+            color: 'var(--hone-muted)', fontSize: 16,
+          }}>✕</button>
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--hone-muted)', marginBottom: 12 }}>{title}</div>
+
+        {agentInfo && (
+          <div style={{
+            padding: '8px 12px', marginBottom: 12, borderRadius: 6, fontSize: 12,
+            background: 'var(--hone-accentMuted)', color: 'var(--hone-accent)',
+            border: '1px solid var(--hone-accent)',
+          }}>
+            🤖 {lang === 'zh' ? 'Agent 自创' : 'Agent-created'} · {lang === 'zh' ? '置信度' : 'Confidence'} {(agentInfo.confidence * 100).toFixed(0)}%
+            {agentInfo.source_pattern && <> · <code>{agentInfo.source_pattern}</code></>}
+            {agentInfo.user_corrected && <> · {lang === 'zh' ? '已被你纠正' : 'user-corrected'}</>}
+          </div>
+        )}
+
+        {err && (
+          <div style={{
+            padding: '10px 12px', borderRadius: 6, fontSize: 12,
+            background: 'var(--hone-dangerMuted)', color: 'var(--hone-danger)',
+          }}>{err}</div>
+        )}
+
+        {!err && runs === null && (
+          <div style={{ padding: 40, textAlign: 'center', color: 'var(--hone-muted)', fontSize: 13 }}>
+            {lang === 'zh' ? '加载中…' : 'Loading…'}
+          </div>
+        )}
+
+        {!err && runs && runs.length === 0 && (
+          <div style={{ padding: 40, textAlign: 'center', color: 'var(--hone-muted)', fontSize: 13 }}>
+            {lang === 'zh' ? '这个日程还没执行过' : 'No runs yet'}
+          </div>
+        )}
+
+        {!err && runs && runs.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {runs.map(r => (
+              <div key={r.id} style={{
+                padding: '10px 12px', borderRadius: 6,
+                background: 'var(--hone-surface)',
+                border: `1px solid ${r.status === 'fail' ? 'var(--hone-danger)' : 'var(--hone-border)'}`,
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, marginBottom: r.result || r.error ? 6 : 0 }}>
+                  <span style={{ fontFamily: 'monospace', color: 'var(--hone-muted)' }}>
+                    {fmtTime(r.started_at)}
+                  </span>
+                  <span style={{
+                    fontSize: 11, padding: '2px 8px', borderRadius: 10,
+                    background: r.status === 'ok' ? 'var(--hone-successMuted)'
+                      : r.status === 'fail' ? 'var(--hone-dangerMuted)'
+                      : 'var(--hone-surfaceOverlay)',
+                    color: r.status === 'ok' ? 'var(--hone-success)'
+                      : r.status === 'fail' ? 'var(--hone-danger)'
+                      : 'var(--hone-muted)',
+                  }}>
+                    {r.status === 'ok' ? (lang === 'zh' ? '✓ 成功' : '✓ ok')
+                     : r.status === 'fail' ? (lang === 'zh' ? '✗ 失败' : '✗ fail')
+                     : (lang === 'zh' ? '进行中' : 'running')}
+                    {r.duration_ms != null && ` · ${(r.duration_ms / 1000).toFixed(1)}s`}
+                  </span>
+                </div>
+                {r.result && (
+                  <div style={{ fontSize: 12, color: 'var(--hone-text)', lineHeight: 1.5, whiteSpace: 'pre-wrap' as const, maxHeight: 120, overflow: 'auto' }}>
+                    {r.result.length > 500 ? r.result.slice(0, 500) + '…' : r.result}
+                  </div>
+                )}
+                {r.error && (
+                  <div style={{ fontSize: 12, color: 'var(--hone-danger)', lineHeight: 1.5, whiteSpace: 'pre-wrap' as const }}>
+                    {r.error}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function ScheduleManager(props: ScheduleManagerProps) {
   const {
     schedules, onToggle, onEdit, onDelete,
     filter, setFilter, search, setSearch, onNew,
     suggestions, onAcceptSuggestion, onDismissSuggestion, lang,
+    connection,
   } = props;
   const t = LANG[lang];
   const [hovered, setHovered] = useState<string | null>(null);
+  const [historyFor, setHistoryFor] = useState<ScheduleInfo | null>(null);
 
   const filtered = applyFilter(schedules, filter, search);
 
@@ -399,6 +568,16 @@ export default function ScheduleManager(props: ScheduleManagerProps) {
         </div>
       )}
 
+      {historyFor && (
+        <HistoryModal
+          scheduleId={historyFor.id}
+          title={historyFor.title}
+          connection={connection}
+          onClose={() => setHistoryFor(null)}
+          lang={lang}
+        />
+      )}
+
       {/* Schedule list / empty */}
       {filtered.length === 0 ? (
         <ScheduleManager.Empty onCreate={onNew} lang={lang} />
@@ -431,6 +610,9 @@ export default function ScheduleManager(props: ScheduleManagerProps) {
                 </div>
                 <div style={styles.cardActions}>
                   <ToggleSwitch checked={s.enabled} onChange={() => onToggle(s.id)} />
+                  <button style={styles.iconBtn('var(--hone-muted)')} onClick={() => setHistoryFor(s)} title={lang === 'zh' ? '执行历史' : 'History'}>
+                    &#9202;
+                  </button>
                   <button style={styles.iconBtn('var(--hone-muted)')} onClick={() => onEdit(s)} title="Edit">
                     &#9998;
                   </button>

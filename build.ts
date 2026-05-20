@@ -108,7 +108,7 @@ const result = await Bun.build({
   minify: false,
   define: {
     // MACRO constants inlined at build time
-    'MACRO.VERSION': JSON.stringify('hone-v0.2.0'),
+    'MACRO.VERSION': JSON.stringify('0.3.0-alpha'),
     'MACRO.BUILD_TIME': JSON.stringify(new Date().toISOString()),
     'MACRO.ISSUES_EXPLAINER': JSON.stringify(''),
     'MACRO.FEEDBACK_CHANNEL': JSON.stringify(''),

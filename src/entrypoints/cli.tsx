@@ -1,5 +1,19 @@
 import { feature } from 'E:/ai-work/claude-code-main/src/bundle-shim.js';
 
+// Suppress Node's experimental warning for node:sqlite
+// eslint-disable-next-line custom-rules/no-top-level-side-effects
+const originalEmit = process.emit;
+// eslint-disable-next-line custom-rules/no-top-level-side-effects
+process.emit = function (name, data, ...args) {
+  if (name === 'warning' && typeof data === 'object' && data !== null) {
+    const warning = data as any;
+    if (warning.name === 'ExperimentalWarning' && warning.message && warning.message.includes('SQLite')) {
+      return false;
+    }
+  }
+  return originalEmit.apply(this, [name, data, ...args]);
+} as any;
+
 // Bugfix for corepack auto-pinning, which adds yarnpkg to peoples' package.jsons
 // eslint-disable-next-line custom-rules/no-top-level-side-effects
 process.env.COREPACK_ENABLE_AUTO_PIN = '0';
@@ -30,6 +44,40 @@ if (false && process.env.CLAUDE_CODE_ABLATION_BASELINE) {
  * All imports are dynamic to minimize module evaluation for fast paths.
  * Fast-path for --version has zero imports beyond this file.
  */
+/**
+ * Hard-gate on Node 22.5+ because the daemon uses `node:sqlite`, which only exists
+ * on that version. Without this check, a user on Node 20/22.0 would see the gateway
+ * silently crash with "Cannot find module 'node:sqlite'" buried in logs. Friendly
+ * error + exit is far better than a zombie daemon.
+ */
+function assertNodeVersion(): void {
+  // Bun has its own SQLite and reports a fake `process.versions.node` for compat.
+  // Skip the gate when running under Bun — the daemon's `node:sqlite` import is
+  // handled by Bun's compat layer (or by Bun's own bun:sqlite shim).
+  // eslint-disable-next-line custom-rules/no-process-env-top-level
+  if (typeof (globalThis as any).Bun !== 'undefined') return;
+  const v = process.versions?.node || '';
+  const m = v.match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return; // unknown runtime — don't block
+  const major = parseInt(m[1], 10);
+  const minor = parseInt(m[2], 10);
+  if (major < 22 || (major === 22 && minor < 5)) {
+    // eslint-disable-next-line no-console
+    console.error(`\n[Hone] ✗ Node 版本过低: 当前 v${v}，需要 v22.5.0 或更新。\n`);
+    // eslint-disable-next-line no-console
+    console.error(`原因: 后台守护进程依赖 Node 22.5 内置的 \`node:sqlite\` 模块来持久化对话/调度/盯盘记忆。`);
+    // eslint-disable-next-line no-console
+    console.error(`升级方式:`);
+    // eslint-disable-next-line no-console
+    console.error(`  Windows: 去 https://nodejs.org 下载 LTS 安装包 (v22.x)，或者 winget install OpenJS.NodeJS.LTS`);
+    // eslint-disable-next-line no-console
+    console.error(`  macOS:   brew install node@22  或  nvm install 22 && nvm use 22`);
+    // eslint-disable-next-line no-console
+    console.error(`  Linux:   nvm install 22 && nvm use 22\n`);
+    process.exit(1);
+  }
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
@@ -41,6 +89,48 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Version check happens after --version fast-path so `hone --version` still works
+  // on any Node — useful for "why is it broken" diagnosis.
+  assertNodeVersion();
+
+  // Drop a presence marker so Hone Desktop can auto-discover this CLI on the
+  // same machine — no `hone pair` step needed. Cleaned up on normal exit;
+  // the desktop side prunes stale entries whose PID is no longer alive.
+  // Skip the internal gateway daemon (it has its own pid file already).
+  if (!args.includes('--gateway-mode')) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fsSync = require('fs') as typeof import('fs');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require('path') as typeof import('path');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const os = require('os') as typeof import('os');
+    try {
+      const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+      const instancesDir = path.join(home, '.hone', 'instances');
+      const markerFile = path.join(instancesDir, `${process.pid}.json`);
+      try { fsSync.mkdirSync(instancesDir, { recursive: true }); } catch {}
+      const isOneShot = args.includes('-p');
+      const mode = isOneShot ? 'oneshot'
+        : args[0] === 'gateway' ? 'gateway'
+        : args[0] === 'pair' ? 'pair'
+        : 'interactive';
+      fsSync.writeFileSync(markerFile, JSON.stringify({
+        pid: process.pid,
+        cwd: process.cwd(),
+        machineName: process.env.COMPUTERNAME || os.hostname() || 'unknown',
+        os: process.platform,
+        version: MACRO.VERSION,
+        mode,
+        startedAt: new Date().toISOString(),
+      }));
+      const cleanup = () => { try { fsSync.unlinkSync(markerFile); } catch {} };
+      process.on('exit', cleanup);
+      process.on('SIGINT', () => { cleanup(); process.exit(130); });
+      process.on('SIGTERM', () => { cleanup(); process.exit(143); });
+    } catch {
+      // Marker is best-effort; if filesystem fails, the CLI still works fine.
+    }
+  }
 
   // For all other paths, load the startup profiler
   const {
@@ -277,6 +367,159 @@ async function main(): Promise<void> {
   // Redirect common update flag mistakes to the update subcommand
   if (args.length === 1 && (args[0] === '--update' || args[0] === '--upgrade')) {
     process.argv = [process.argv[0]!, process.argv[1]!, 'update'];
+  }
+
+  // Hone CLI pairing: `hone pair` — print a 6-digit code and serve a local
+  // HTTP endpoint so a desktop Hone client on the same network can connect.
+  // The Desktop's "Add Machine → Local Network" panel hits this server.
+  if (args[0] === 'pair') {
+    const http = await import('http')
+    const os = await import('os')
+    const crypto = await import('crypto')
+    const fs = await import('fs/promises')
+
+    const portArg = args.find(a => a.startsWith('--port='))
+    const port = portArg
+      ? parseInt(portArg.slice('--port='.length), 10)
+      : parseInt(process.env.HONE_PAIR_PORT || '18789', 10)
+
+    const code = String(Math.floor(100000 + Math.random() * 900000))
+    const machineName = process.env.COMPUTERNAME || os.hostname() || 'unknown'
+    const machineId = crypto.randomUUID()
+    const pairedTokens = new Map<string, { token: string; ts: number }>()
+
+    // Determine the best LAN address to show the user
+    const nets = os.networkInterfaces()
+    let lanAddr: string | null = null
+    for (const ifaces of Object.values(nets)) {
+      if (!ifaces) continue
+      for (const ni of ifaces) {
+        if (ni.family === 'IPv4' && !ni.internal) {
+          lanAddr = ni.address
+          break
+        }
+      }
+      if (lanAddr) break
+    }
+
+    const handle = async (req: any, res: any) => {
+      const setJson = () => {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Hone-Token')
+      }
+      if (req.method === 'OPTIONS') { setJson(); res.statusCode = 204; res.end(); return }
+
+      try {
+        if (req.url === '/info' && req.method === 'GET') {
+          setJson()
+          res.end(JSON.stringify({
+            machineName,
+            machineId,
+            os: process.platform,
+            cwd: process.cwd(),
+            pid: process.pid,
+            version: '2.1.88',
+          }))
+          return
+        }
+
+        if (req.url === '/pair' && req.method === 'POST') {
+          let body = ''
+          for await (const chunk of req) body += chunk
+          let parsed: any = {}
+          try { parsed = JSON.parse(body) } catch {}
+          setJson()
+          if (parsed.code === code) {
+            const token = crypto.randomBytes(16).toString('hex')
+            pairedTokens.set(token, { token, ts: Date.now() })
+            // Persist the pairing fact so the user can see what's connected
+            try {
+              const dir = `${process.env.HOME || process.env.USERPROFILE || '~'}/.hone`
+              await fs.mkdir(dir, { recursive: true })
+              const log = `${new Date().toISOString()} paired ${parsed.clientName || 'unknown'} token=${token.slice(0,8)}...\n`
+              await fs.appendFile(`${dir}/pair-log.txt`, log)
+            } catch {}
+            console.log(`✓ 配对成功 — ${parsed.clientName || '客户端'}`)
+            res.end(JSON.stringify({
+              ok: true,
+              token,
+              machineName,
+              machineId,
+              os: process.platform,
+              cwd: process.cwd(),
+              pid: process.pid,
+              version: '2.1.88',
+            }))
+          } else {
+            res.statusCode = 403
+            res.end(JSON.stringify({ ok: false, error: '配对码错误' }))
+          }
+          return
+        }
+
+        if (req.url === '/ping' && req.method === 'GET') {
+          const token = req.headers['x-hone-token']
+          if (!token || !pairedTokens.has(String(token))) {
+            res.statusCode = 401
+            setJson()
+            res.end(JSON.stringify({ ok: false }))
+            return
+          }
+          setJson()
+          res.end(JSON.stringify({ ok: true, ts: Date.now() }))
+          return
+        }
+
+        res.statusCode = 404
+        setJson()
+        res.end(JSON.stringify({ error: 'not found' }))
+      } catch (err: any) {
+        res.statusCode = 500
+        res.end(JSON.stringify({ error: err?.message || String(err) }))
+      }
+    }
+
+    const server = http.createServer(handle)
+    server.on('error', (err: any) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`✗ 端口 ${port} 已被占用。用 --port=18790 换一个端口。`)
+        process.exit(1)
+      }
+      console.error('Server error:', err)
+      process.exit(1)
+    })
+
+    server.listen(port, () => {
+      console.log('')
+      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+      console.log(`  Hone CLI 配对模式`)
+      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+      console.log('')
+      console.log(`  配对码:    \x1b[33;1m${code}\x1b[0m`)
+      console.log(`  机器名:    ${machineName}`)
+      console.log(`  本地端口:  ${port}`)
+      if (lanAddr) {
+        console.log(`  局域网:    ${lanAddr}:${port}`)
+      }
+      console.log(`  仅本机:    127.0.0.1:${port}`)
+      console.log('')
+      console.log(`  在桌面端点击「+ 添加机器」→ 本地网络:`)
+      console.log(`    主机:  ${lanAddr || '127.0.0.1'}`)
+      console.log(`    端口:  ${port}`)
+      console.log(`    配对码: ${code}`)
+      console.log('')
+      console.log(`  Ctrl+C 退出`)
+      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+    })
+
+    process.on('SIGINT', () => {
+      console.log('\n配对模式已退出')
+      server.close()
+      process.exit(0)
+    })
+    return
   }
 
   // Hone Gateway CLI subcommand: hone gateway [start|stop|status|approve|deny]

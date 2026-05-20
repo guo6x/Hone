@@ -2,6 +2,7 @@ use crate::windows_git_bash;
 use chrono::{DateTime, Utc};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;
 #[cfg(unix)]
@@ -66,7 +67,7 @@ pub struct GatewayConfig {
     pub local_port: u16,
 
     /// Whether to auto-start the Gateway when the app launches.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub auto_start: bool,
 
     /// Directory for shared data between desktop and daemon (schedules, logs).
@@ -113,6 +114,14 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub gui_model_url: String,
 
+    /// GUI vision model name (e.g. moonshot-v1-32k-vision-preview)
+    #[serde(default)]
+    pub gui_model_name: String,
+
+    /// GUI vision model API key
+    #[serde(default)]
+    pub gui_model_key: String,
+
     /// Run browser in headless mode
     #[serde(default = "default_true")]
     pub browser_headless: bool,
@@ -138,7 +147,7 @@ impl Default for GatewayConfig {
         Self {
             relay_url: default_relay_url(),
             local_port: default_local_port(),
-            auto_start: false,
+            auto_start: true,
             data_dir: None,
             machine_name: hostname(),
             provider: String::new(),
@@ -150,6 +159,8 @@ impl Default for GatewayConfig {
             max_tokens: 0,
             browser_enabled: false,
             gui_model_url: String::new(),
+            gui_model_name: String::new(),
+            gui_model_key: String::new(),
             browser_headless: true,
             browser_max_steps: 15,
         }
@@ -181,6 +192,7 @@ pub struct GatewayManager {
     pub uptime: Option<DateTime<Utc>>,
     pub version: String,
     config: GatewayConfig,
+    config_path: Option<PathBuf>,
 }
 
 impl GatewayManager {
@@ -191,6 +203,53 @@ impl GatewayManager {
             uptime: None,
             version: env!("CARGO_PKG_VERSION").to_string(),
             config: GatewayConfig::default(),
+            config_path: None,
+        }
+    }
+
+    /// Bind a config file path and load existing config from disk if present.
+    /// Call once during app setup before auto-start.
+    pub fn bind_config_file(&mut self, path: PathBuf) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(cfg) = serde_json::from_slice::<GatewayConfig>(&bytes) {
+                info!("Loaded gateway config from {}", path.display());
+                self.config = cfg;
+            } else {
+                warn!("Failed to parse {}, keeping defaults", path.display());
+            }
+        }
+        self.config_path = Some(path);
+    }
+
+    fn persist(&self) {
+        if let Some(p) = &self.config_path {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match serde_json::to_vec_pretty(&self.config) {
+                Ok(bytes) => {
+                    let mut tmp_path = p.clone();
+                    let mut filename = tmp_path.file_name().unwrap_or_default().to_os_string();
+                    filename.push(".tmp");
+                    tmp_path.set_file_name(filename);
+
+                    let res = (|| -> Result<(), std::io::Error> {
+                        use std::io::Write;
+                        let mut file = std::fs::File::create(&tmp_path)?;
+                        file.write_all(&bytes)?;
+                        file.sync_all()?;
+                        drop(file);
+                        std::fs::rename(&tmp_path, p)?;
+                        Ok(())
+                    })();
+
+                    if let Err(e) = res {
+                        warn!("Failed to atomically persist gateway config to {}: {}", p.display(), e);
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                }
+                Err(e) => warn!("Failed to serialize gateway config: {}", e),
+            }
         }
     }
 
@@ -199,7 +258,7 @@ impl GatewayManager {
     /// Executes `node <hone_path>/dist/cli.js daemon start` and sets the
     /// environment variables `HONE_RELAY_URL`, `HONE_GATEWAY_PORT`, and
     /// the platform-appropriate machine-name variable.
-    pub fn start(&mut self, hone_path: &str, relay_url: &str) -> Result<(), GatewayError> {
+    pub fn start(&mut self, node_path: &str, hone_path: &str, relay_url: &str) -> Result<(), GatewayError> {
         if matches!(
             self.status,
             GatewayStatus::Running | GatewayStatus::Starting
@@ -210,7 +269,7 @@ impl GatewayManager {
         self.status = GatewayStatus::Starting;
         info!("Starting Hone Gateway (relay: {})", relay_url);
 
-        let mut cmd = Command::new("node");
+        let mut cmd = Command::new(node_path);
         cmd.arg(format!("{}/dist/cli.js", hone_path))
             .arg("gateway")
             .arg("start")
@@ -284,6 +343,12 @@ impl GatewayManager {
         }
         if !self.config.gui_model_url.is_empty() {
             cmd.env("HONE_GUI_MODEL_URL", &self.config.gui_model_url);
+        }
+        if !self.config.gui_model_name.is_empty() {
+            cmd.env("HONE_GUI_MODEL_NAME", &self.config.gui_model_name);
+        }
+        if !self.config.gui_model_key.is_empty() {
+            cmd.env("HONE_GUI_MODEL_KEY", &self.config.gui_model_key);
         }
         if !self.config.browser_headless {
             cmd.env("HONE_BROWSER_HEADLESS", "false");
@@ -375,12 +440,12 @@ impl GatewayManager {
     }
 
     /// Stop (if running) and restart the Gateway daemon.
-    pub fn restart(&mut self, hone_path: &str, relay_url: &str) -> Result<(), GatewayError> {
+    pub fn restart(&mut self, node_path: &str, hone_path: &str, relay_url: &str) -> Result<(), GatewayError> {
         info!("Restarting Hone Gateway");
         if self.is_running() {
             self.stop()?;
         }
-        self.start(hone_path, relay_url)
+        self.start(node_path, hone_path, relay_url)
     }
 
     /// Whether the Gateway is currently in the `Running` state.
@@ -394,8 +459,10 @@ impl GatewayManager {
     }
 
     /// Apply a new config. If the Gateway is running, restart it with the new settings.
+    /// Also persists to disk so config survives app restarts.
     pub fn apply_config(
         &mut self,
+        node_path: &str,
         config: GatewayConfig,
         hone_path: &str,
     ) -> Result<(), GatewayError> {
@@ -404,16 +471,19 @@ impl GatewayManager {
             self.stop()?;
         }
         self.config = config;
+        self.persist();
         if was_running {
             let relay = self.config.relay_url.clone();
-            self.start(hone_path, &relay)?;
+            self.start(node_path, hone_path, &relay)?;
         }
         Ok(())
     }
 
     /// Update config in-place without restarting. Use before first start.
+    /// Also persists to disk.
     pub fn set_config(&mut self, config: GatewayConfig) {
         self.config = config;
+        self.persist();
     }
 
     /// Uptime in seconds (for IPC serialization).

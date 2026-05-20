@@ -46,12 +46,13 @@ const themes: { key: ThemeName; zh: string; en: string; colors: [string, string,
   { key: 'midnight', zh: '深蓝夜', en: 'Midnight', colors: ['#0d1117', '#161b22', '#1f6feb'] },
 ];
 
-export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
+export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hydrated = false }: {
   settings: SettingsData;
   setSettings: (s: SettingsData) => void;
   lang: Lang;
   theme: ThemeName;
   setTheme: (t: ThemeName) => void;
+  hydrated?: boolean;
 }) {
   const [section, setSection] = useState<Section>('provider');
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
@@ -77,6 +78,8 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
   const [logRetention, setLogRetention] = useState(settings.logRetention ?? '30');
   const [browserEnabled, setBrowserEnabled] = useState(settings.browserEnabled ?? false);
   const [guiModelUrl, setGuiModelUrl] = useState(settings.guiModelUrl ?? '');
+  const [guiModelName, setGuiModelName] = useState((settings as any).guiModelName ?? '');
+  const [guiModelKey, setGuiModelKey] = useState((settings as any).guiModelKey ?? '');
   const [browserHeadless, setBrowserHeadless] = useState(settings.browserHeadless ?? true);
   const [browserMaxSteps, setBrowserMaxSteps] = useState(settings.browserMaxSteps ?? '15');
   const [buddySpecies, setBuddySpecies] = useState(settings.buddySpecies ?? 'robot');
@@ -94,6 +97,52 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
       return saved ? JSON.parse(saved) : [];
     } catch { return []; }
   });
+
+  const [isLocalHydrated, setIsLocalHydrated] = useState(false);
+
+  // Sync settings once when the app is hydrated
+  useEffect(() => {
+    if (hydrated && !isLocalHydrated && settings) {
+      setApiKeyDraft(settings.apiKey ?? '');
+      setModel(settings.model ?? 'deepseek-chat');
+      setProvider(normProvider(settings.provider));
+      setBaseUrl(settings.baseUrl ?? '');
+      setCustomProviderName(settings.customProviderName ?? '');
+      setTemperature(settings.temperature ?? '');
+      setMaxTokens(settings.maxTokens ?? '');
+      setRelayUrl(settings.relayUrl ?? '');
+      setLocalPort(settings.localPort ?? '18789');
+      setAutoStart(settings.gatewayAutoStart ?? false);
+      setWorkspace(settings.workspaceDir ?? '');
+      setLogRetention(settings.logRetention ?? '30');
+      setBrowserEnabled(settings.browserEnabled ?? false);
+      setGuiModelUrl(settings.guiModelUrl ?? '');
+      setGuiModelName((settings as any).guiModelName ?? '');
+      setGuiModelKey((settings as any).guiModelKey ?? '');
+      setBrowserHeadless(settings.browserHeadless ?? true);
+      setBrowserMaxSteps(settings.browserMaxSteps ?? '15');
+      setBuddySpecies(settings.buddySpecies ?? 'robot');
+      setIsLocalHydrated(true);
+    }
+  }, [hydrated, isLocalHydrated, settings]);
+
+  // Reverse flow: sync config values that may update from the backend (like workspace detection)
+  useEffect(() => {
+    if (isLocalHydrated && settings) {
+      if (settings.workspaceDir !== undefined && settings.workspaceDir !== workspace) {
+        setWorkspace(settings.workspaceDir);
+      }
+      if (settings.relayUrl !== undefined && settings.relayUrl !== relayUrl) {
+        setRelayUrl(settings.relayUrl);
+      }
+      if (settings.localPort !== undefined && settings.localPort !== localPort) {
+        setLocalPort(settings.localPort);
+      }
+      if (settings.gatewayAutoStart !== undefined && settings.gatewayAutoStart !== autoStart) {
+        setAutoStart(settings.gatewayAutoStart);
+      }
+    }
+  }, [settings?.workspaceDir, settings?.relayUrl, settings?.localPort, settings?.gatewayAutoStart, isLocalHydrated]);
 
   // Persist skills to localStorage
   const updateSkills = useCallback((next: SkillInfo[]) => {
@@ -121,6 +170,7 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
 
   // 自动保存：任一字段变更后延迟 600ms 同步到父状态
   const autoSave = useCallback(() => {
+    if (!isLocalHydrated) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     setSaved(false);
     saveTimer.current = setTimeout(() => {
@@ -139,14 +189,16 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
         logRetention,
         browserEnabled,
         guiModelUrl,
+        guiModelName,
+        guiModelKey,
         browserHeadless,
         browserMaxSteps,
         buddySpecies,
-      });
+      } as any);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     }, 600);
-  }, [provider, apiKeyDraft, model, baseUrl, customProviderName, temperature, maxTokens, autoStart, relayUrl, localPort, workspace, logRetention, browserEnabled, guiModelUrl, browserHeadless, browserMaxSteps, buddySpecies, setSettings]);
+  }, [provider, apiKeyDraft, model, baseUrl, customProviderName, temperature, maxTokens, autoStart, relayUrl, localPort, workspace, logRetention, browserEnabled, guiModelUrl, guiModelName, guiModelKey, browserHeadless, browserMaxSteps, buddySpecies, setSettings, isLocalHydrated]);
 
   useEffect(() => { autoSave(); }, [autoSave]);
 
@@ -514,12 +566,37 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
       <h2 style={s.title}>{t('数据管理', 'Data Management')}</h2>
       <p style={s.desc}>{t('管理工作区目录和日志保留策略', 'Manage workspace directory and log retention policy.')}</p>
       <label style={s.label}>{t('工作区目录', 'Workspace Directory')}</label>
-      <input
-        style={{ ...s.mono, ...s.input, marginBottom: 16 }}
-        value={workspace}
-        onChange={(e) => setWorkspace(e.target.value)}
-        placeholder="/home/user/hone-workspace"
-      />
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+        <input
+          style={{ ...s.mono, ...s.input, flex: 1, marginBottom: 0 }}
+          value={workspace}
+          onChange={(e) => setWorkspace(e.target.value)}
+          placeholder="/home/user/hone-workspace"
+        />
+        {isTauri() && (
+          <button
+            style={{ ...s.btn, whiteSpace: 'nowrap' as const, flexShrink: 0 }}
+            onClick={async () => {
+              try {
+                const { open } = await import('@tauri-apps/plugin-dialog');
+                const picked = await open({ directory: true, multiple: false });
+                if (picked && typeof picked === 'string') {
+                  setWorkspace(picked);
+                  // Validate via set_hone_path
+                  try {
+                    const { invoke } = await import('@tauri-apps/api/core');
+                    await invoke('set_hone_path', { newPath: picked });
+                  } catch (err) {
+                    console.warn('set_hone_path validation:', err);
+                  }
+                }
+              } catch (e) {
+                console.error('Directory picker failed:', e);
+              }
+            }}
+          >{t('浏览…', 'Browse…')}</button>
+        )}
+      </div>
       <label style={s.label}>{t('日志保留', 'Log Retention')}</label>
       <select
         style={{ ...s.select, marginBottom: 24 }}
@@ -750,15 +827,60 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
         </div>
       </div>
 
-      <label style={s.label}>{t('GUI 模型 URL', 'GUI Model URL')}</label>
+      <label style={s.label}>{t('视觉模型 URL', 'Vision Model URL')}</label>
       <input
-        style={{ ...s.input, marginBottom: 16 }}
+        style={{ ...s.input, marginBottom: 8 }}
         value={guiModelUrl}
         onChange={(e) => setGuiModelUrl(e.target.value)}
-        placeholder="http://localhost:8000/v1/chat/completions"
+        placeholder="https://ark.cn-beijing.volces.com/api/v3/chat/completions"
       />
-      <p style={{ fontSize: 12, color: 'var(--hone-muted)', marginTop: -12, marginBottom: 16 }}>
-        {t('OpenAI 兼容的视觉模型 API。留空使用 DOM 降级模式（仅文本）。', 'OpenAI-compatible vision model API. Leave empty for DOM fallback (text-only).')}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 12, flexWrap: 'wrap' as const }}>
+        {[
+          { label: '字节方舟', url: 'https://ark.cn-beijing.volces.com/api/v3/chat/completions', model: '' },
+          { label: 'Kimi', url: 'https://api.moonshot.cn/v1/chat/completions', model: 'moonshot-v1-32k-vision-preview' },
+          { label: 'OpenAI', url: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o' },
+          { label: '本地 UI-TARS', url: 'http://localhost:8000/v1/chat/completions', model: 'ui-tars-7b' },
+        ].map(p => (
+          <button
+            key={p.label}
+            type="button"
+            onClick={() => { setGuiModelUrl(p.url); if (p.model) setGuiModelName(p.model); }}
+            style={{
+              fontSize: 11, padding: '3px 10px', borderRadius: 12,
+              background: 'var(--hone-surface)', color: 'var(--hone-muted)',
+              border: '1px solid var(--hone-border)', cursor: 'pointer',
+            }}
+          >{p.label}</button>
+        ))}
+      </div>
+
+      <label style={s.label}>{t('视觉模型名称 / 接入点 ID', 'Vision Model / Endpoint ID')}</label>
+      <input
+        style={{ ...s.input, marginBottom: 4, fontFamily: 'monospace' }}
+        value={guiModelName}
+        onChange={(e) => setGuiModelName(e.target.value)}
+        placeholder="ep-20250101000000-xxxxx (火山方舟) 或 doubao-1.5-vision-pro-32k"
+      />
+      <p style={{ fontSize: 11, color: 'var(--hone-muted)', margin: '0 0 12px' }}>
+        {t(
+          '火山方舟要填接入点 ID（在控制台「在线推理」创建后获得，形如 ep-...），不是模型名。',
+          'For Volcengine Ark, paste the endpoint ID (e.g. ep-...), not the model name.',
+        )}
+      </p>
+
+      <label style={s.label}>{t('视觉模型 API Key', 'Vision Model API Key')}</label>
+      <input
+        type="password"
+        style={{ ...s.input, marginBottom: 8, fontFamily: 'monospace' }}
+        value={guiModelKey}
+        onChange={(e) => setGuiModelKey(e.target.value)}
+        placeholder="sk-..."
+      />
+      <p style={{ fontSize: 12, color: 'var(--hone-muted)', marginTop: -4, marginBottom: 16 }}>
+        {t(
+          '留空 URL = DOM 降级（仅文本）。Kimi/GPT-4V 等通用 vision 模型能用但准确率不如专门训练的 GUI 模型 (UI-TARS)。',
+          'Leave URL empty for DOM fallback. General vision LLMs (Kimi/GPT-4V) work but are less accurate than GUI-specialized models.',
+        )}
       </p>
 
       <div style={{ ...s.row, marginBottom: 8 }}>
@@ -787,7 +909,7 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme }: {
   const renderBuddy = () => (
     <div style={s.section}>
       <h2 style={s.title}>{t('🤖 智能伙伴', '🤖 AI Buddy')}</h2>
-      <p style={s.desc}>{t('选择一个你喜欢的 ASCII 宠物作为 AI 助手的化身。', 'Pick an ASCII pet as your AI avatar.')}</p>
+      <p style={s.desc}>{t('选择一个你喜欢的 SVG 宠物作为 AI 助手的化身。', 'Pick an SVG pet as your AI avatar.')}</p>
       <label style={s.label}>{t('伙伴品种', 'Buddy Species')}</label>
       <select
         style={{ ...s.select, marginBottom: 16 }}

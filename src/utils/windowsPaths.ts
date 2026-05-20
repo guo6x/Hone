@@ -43,39 +43,37 @@ function findExecutable(executable: string): string | null {
     }
   }
 
-  // Fall back to where.exe
-  try {
-    const result = execSync_DEPRECATED(`where.exe ${executable}`, {
-      stdio: 'pipe',
-      encoding: 'utf8',
-    }).trim()
+  // Pure JS replacement for where.exe to avoid encoding issues with Chinese/Unicode paths
+  const pathEnv = process.env.PATH || ''
+  const pathExtEnv = process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM'
+  const pathDirs = pathEnv.split(path.delimiter)
+  const extensions = pathExtEnv.split(';').map(ext => ext.toLowerCase())
 
-    // SECURITY: Filter out any results from the current directory
-    // to prevent executing malicious git.bat/cmd/exe files
-    const paths = result.split('\r\n').filter(Boolean)
-    const cwd = getCwd().toLowerCase()
+  const hasExt = /\.[a-zA-Z0-9]+$/.test(executable)
+  const candidates = hasExt ? [executable] : [executable, ...extensions.map(ext => executable + ext)]
 
-    for (const candidatePath of paths) {
-      // Normalize and compare paths to ensure we're not in current directory
-      const normalizedPath = path.resolve(candidatePath).toLowerCase()
-      const pathDir = path.dirname(normalizedPath).toLowerCase()
+  const cwd = getCwd().toLowerCase()
 
-      // Skip if the executable is in the current working directory
-      if (pathDir === cwd || normalizedPath.startsWith(cwd + path.sep)) {
-        logForDebugging(
-          `Skipping potentially malicious executable in current directory: ${candidatePath}`,
-        )
-        continue
+  for (const dir of pathDirs) {
+    if (!dir) continue
+    for (const candidate of candidates) {
+      const fullPath = path.resolve(dir, candidate)
+      if (checkPathExists(fullPath)) {
+        // SECURITY: Filter out any results from the current directory
+        const normalizedPath = fullPath.toLowerCase()
+        const pathDir = path.dirname(normalizedPath).toLowerCase()
+        if (pathDir === cwd || normalizedPath.startsWith(cwd + path.sep)) {
+          logForDebugging(
+            `Skipping potentially malicious executable in current directory: ${fullPath}`,
+          )
+          continue
+        }
+        return fullPath
       }
-
-      // Return the first valid path that's not in the current directory
-      return candidatePath
     }
-
-    return null
-  } catch {
-    return null
   }
+
+  return null
 }
 
 /**

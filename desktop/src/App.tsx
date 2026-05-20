@@ -6,7 +6,8 @@ import Dashboard from './components/Dashboard';
 import GatewayChat from './components/GatewayChat';
 import ScheduleManager from './components/ScheduleManager';
 import CanvasViewer from './components/CanvasViewer';
-import WebTaskRunner from './components/WebTaskRunner';
+import CliWorkspace from './components/CliWorkspace';
+import WatchPanel from './components/WatchPanel';
 import { SettingsPage } from './components/SettingsPage';
 import StatusBar from './components/StatusBar';
 import HoneBuddy, { BuddyState } from './components/HoneBuddy';
@@ -23,7 +24,7 @@ import {
   type StatusBarData,
 } from './data/mock';
 
-type ViewName = 'dashboard' | 'gateway' | 'schedule' | 'canvas' | 'webtask' | 'settings';
+type ViewName = 'dashboard' | 'gateway' | 'workspace' | 'watch' | 'schedule' | 'canvas' | 'settings';
 type PageState = 'loaded' | 'loading' | 'error';
 
 export default function App() {
@@ -37,13 +38,57 @@ export default function App() {
   const { start: ipcGatewayStart } = useGateway();
   const { honePath: detectedHonePath } = useHonePath();
 
+  // ── Auto-discovered local CLI instances (same-machine, no pairing needed) ─
+  // Each `hone` CLI process drops ~/.hone/instances/<pid>.json on startup;
+  // Tauri scans the dir, prunes dead PIDs, returns alive ones. Refreshed every 5s
+  // so opening/closing a CLI shows up live.
+  const [localCliMachines, setLocalCliMachines] = useState<MachineInfo[]>([]);
+  // Keep the raw CLI instance data alongside the mapped MachineInfo so the
+  // dashboard can render rich per-CLI cards (pid, mode, cwd, uptime).
+  const [cliInstances, setCliInstances] = useState<any[]>([]);
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const { localCliInstancesList } = await import('./tauri/api');
+        const list = await localCliInstancesList();
+        if (cancelled) return;
+        setCliInstances(list);
+        const mapped: MachineInfo[] = list.map(inst => {
+          // Take the last path segment as a short label
+          const cwdParts = inst.cwd.replace(/\\/g, '/').split('/').filter(Boolean);
+          const folder = cwdParts[cwdParts.length - 1] || inst.cwd;
+          return {
+            id: `local-cli-${inst.pid}`,
+            name: inst.mode === 'gateway' ? `${inst.machine_name} · Gateway`
+                : inst.mode === 'pair' ? `${inst.machine_name} · Pair`
+                : `${inst.machine_name} · ${folder}`,
+            host: '127.0.0.1',
+            status: 'online' as const,
+            sessions: 0,
+            os: inst.os,
+            cpu: `pid ${inst.pid}`,
+          };
+        });
+        setLocalCliMachines(mapped);
+      } catch {}
+    };
+    refresh();
+    const tt = setInterval(refresh, 5000);
+    return () => { cancelled = true; clearInterval(tt); };
+  }, []);
+
+  // Combined: persistently added machines + auto-discovered local CLI processes
+  const allMachines = [...machines, ...localCliMachines];
+
   // Dashboard state
   const [activeMachine, setActiveMachine] = useState<string | null>(null);
   useEffect(() => {
-    if (machines.length > 0 && !activeMachine) {
-      setActiveMachine(machines[0].id);
+    if (allMachines.length > 0 && !activeMachine) {
+      setActiveMachine(allMachines[0].id);
     }
-  }, [machines, activeMachine]);
+  }, [allMachines, activeMachine]);
   const [filter, setFilter] = useState('all');
   const [sortBy, setSortBy] = useState('elapsed');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
@@ -52,6 +97,35 @@ export default function App() {
 
   // View
   const [activeView, setActiveView] = useState<ViewName>('dashboard');
+
+  // Lifted workspaces state for CliWorkspace and click-to-open PTY terminal
+  const [workspaces, setWorkspaces] = useState<any[]>(() => {
+    try {
+      const raw = localStorage.getItem('hone-workspaces-v2');
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  });
+  const [activeWsId, setActiveWsId] = useState<string | null>(() => workspaces[0]?.id || null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('hone-workspaces-v2', JSON.stringify(workspaces));
+    } catch {}
+  }, [workspaces]);
+
+  const openWorkspace = useCallback((cwd: string) => {
+    let ws = workspaces.find(w => w.cwd === cwd);
+    if (!ws) {
+      ws = {
+        id: `ws_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        cwd: cwd,
+        label: cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() || cwd,
+      };
+      setWorkspaces(prev => [...prev, ws!]);
+    }
+    setActiveWsId(ws.id);
+    setActiveView('workspace');
+  }, [workspaces]);
 
   // Schedule state (persisted via Tauri IPC)
   const { schedules, save: saveSchedules } = useSchedules();
@@ -134,7 +208,9 @@ export default function App() {
     if (!honePath) return;
 
     const relayUrl = tauriConfig.relay_url || 'wss://hone-relay.marsailleippi79.workers.dev/connect/default';
-    ipcGatewayStart(honePath, relayUrl);
+    ipcGatewayStart(honePath, relayUrl).catch(e => {
+      console.error("Auto-start gateway failed:", e);
+    });
   }, [tauriConfig, detectedHonePath, settings.workspaceDir]);
 
   // Persist: all settings → Tauri (authoritative), localStorage as fallback
@@ -153,6 +229,8 @@ export default function App() {
         logRetention: next.logRetention,
         browserEnabled: next.browserEnabled,
         guiModelUrl: next.guiModelUrl,
+        guiModelName: (next as any).guiModelName || '',
+        guiModelKey: (next as any).guiModelKey || '',
         browserHeadless: next.browserHeadless,
         browserMaxSteps: next.browserMaxSteps,
         buddySpecies: next.buddySpecies,
@@ -174,6 +252,8 @@ export default function App() {
         max_tokens: parseInt(next.maxTokens || '', 10) || 0,
         browser_enabled: next.browserEnabled,
         gui_model_url: next.guiModelUrl,
+        gui_model_name: (next as any).guiModelName || '',
+        gui_model_key: (next as any).guiModelKey || '',
         browser_headless: next.browserHeadless,
         browser_max_steps: parseInt(next.browserMaxSteps, 10) || 15,
       } as any, next.workspaceDir || '');
@@ -258,14 +338,21 @@ export default function App() {
         case 'task_dispatched': {
           const id = String((msg as any).taskId || `t_${Date.now()}`);
           const task = String((msg as any).task || '');
+          // Routing priority: msg-provided machineId/clientId > active machine > "gateway" sentinel.
+          // Never silently attribute to allMachines[0] — that was a real bug when more than
+          // one machine was connected.
+          const msgMachineId = String((msg as any).machineId || (msg as any).clientId || '');
           setSessions(prev => {
             if (prev.find(s => s.id === id)) return prev;
-            const machine = machines[0]?.name || 'Local';
-            const machineId = machines[0]?.id || 'local';
+            const target = msgMachineId
+              ? allMachines.find(m => m.id === msgMachineId)
+              : (activeMachine ? allMachines.find(m => m.id === activeMachine) : undefined);
+            const machineId = target?.id || msgMachineId || activeMachine || 'gateway';
+            const machineName = target?.name || (msgMachineId ? `Machine ${msgMachineId.slice(0, 8)}` : 'Gateway');
             const next: SessionInfo = {
               id,
               machineId,
-              machineName: machine,
+              machineName,
               status: 'live',
               task,
               tokensUsed: '0',
@@ -296,12 +383,18 @@ export default function App() {
         case 'browser_task_started': {
           const id = `web_${Date.now()}`;
           const task = String((msg as any).task || '');
-          const machine = machines[0]?.name || 'Local';
-          const machineId = machines[0]?.id || 'local';
+          // Browser tasks always run on the gateway machine itself, but still respect
+          // any explicit machineId in the message for future remote-gateway scenarios.
+          const msgMachineId = String((msg as any).machineId || '');
+          const target = msgMachineId
+            ? allMachines.find(m => m.id === msgMachineId)
+            : (activeMachine ? allMachines.find(m => m.id === activeMachine) : undefined);
+          const machineId = target?.id || msgMachineId || activeMachine || 'gateway';
+          const machineName = target?.name || (msgMachineId ? `Machine ${msgMachineId.slice(0, 8)}` : 'Gateway');
           const next: SessionInfo = {
             id,
             machineId,
-            machineName: machine,
+            machineName,
             status: 'live',
             task: `web: ${task}`,
             tokensUsed: '0',
@@ -325,12 +418,18 @@ export default function App() {
           const id = String((msg as any).scheduleId || `sch_${Date.now()}`);
           const text = String((msg as any).text || (msg as any).task || '');
           const result = (msg as any).result;
-          const machine = machines[0]?.name || 'Local';
-          const machineId = machines[0]?.id || 'local';
+          // Schedules run on the gateway. Honor any explicit machineId; fall back to
+          // active machine; sentinel last. No silent attribution to allMachines[0].
+          const msgMachineId = String((msg as any).machineId || '');
+          const target = msgMachineId
+            ? allMachines.find(m => m.id === msgMachineId)
+            : (activeMachine ? allMachines.find(m => m.id === activeMachine) : undefined);
+          const machineId = target?.id || msgMachineId || activeMachine || 'gateway';
+          const machineName = target?.name || (msgMachineId ? `Machine ${msgMachineId.slice(0, 8)}` : 'Gateway');
           const next: SessionInfo = {
             id: `${id}_${Date.now()}`,
             machineId,
-            machineName: machine,
+            machineName,
             status: 'done',
             task: `⏰ ${text}`,
             tokensUsed: '0',
@@ -342,12 +441,82 @@ export default function App() {
             const len = typeof result === 'string' ? result.length : JSON.stringify(result).length;
             setTokensToday(prev => prev + Math.ceil(len / 4));
           }
+          // Buddy pops up to actively announce the schedule fire.
+          handleBuddyEvent('suggestion', {
+            text: lang === 'zh' ? `⏰ 日程触发: ${text}` : `⏰ Triggered: ${text}`,
+          });
+          break;
+        }
+        case 'schedule_auto_created': {
+          // Agent created and enabled a schedule on its own. Surface as a suggestion
+          // so the user knows what happened and can correct if wrong.
+          const m = msg as any;
+          const sugId = `auto_${String(m.scheduleId)}`;
+          setSuggestions(prev => {
+            if (prev.find(s => s.id === sugId)) return prev;
+            return [...prev, {
+              id: sugId,
+              pattern: `🤖 Agent 已自动创建并启用日程: "${m.text}" (${m.cron})`,
+              patternEn: `🤖 Agent auto-created schedule: "${m.text}" (${m.cron})`,
+              acceptLabel: '好',
+              acceptLabelEn: 'OK',
+              dismissLabel: '不需要，删掉',
+              dismissLabelEn: 'Remove it',
+            }];
+          });
+          handleBuddyEvent('suggestion', {
+            text: lang === 'zh' ? `🤖 我建了个日程: ${m.text}` : `🤖 I set up a schedule: ${m.text}`,
+          });
+          break;
+        }
+        case 'tracked_item_signal': {
+          const m = msg as any;
+          const sigText = m.signal === 'sell' ? '止损/止盈'
+            : m.signal === 'buy' ? '买入信号'
+            : m.signal === 'alert' ? '异动' : m.signal;
+          const title = m.displayName || m.identifier;
+          const body = m.autoExecuted
+            ? `已自动 ${m.signal === 'sell' ? '卖出' : '执行'}: ${title} @ ${m.quote?.current}`
+            : `${title}: ${sigText} (${m.quote?.change_pct?.toFixed(2)}%)`;
+          // Fire OS notification (tauri-plugin-notification)
+          if (isTauri()) {
+            import('@tauri-apps/plugin-notification').then(async ({ sendNotification, isPermissionGranted, requestPermission }) => {
+              let granted = await isPermissionGranted();
+              if (!granted) {
+                const perm = await requestPermission();
+                granted = perm === 'granted';
+              }
+              if (granted) sendNotification({ title: '⚠ Hone 盯盘', body });
+            }).catch(() => {});
+          }
+          handleBuddyEvent(m.signal === 'sell' ? 'error' : 'suggestion', { text: body });
+          break;
+        }
+        case 'schedule_proposed': {
+          // Agent proposes a schedule (created but disabled, waiting for user to enable).
+          const m = msg as any;
+          const sugId = `prop_${String(m.scheduleId)}`;
+          setSuggestions(prev => {
+            if (prev.find(s => s.id === sugId)) return prev;
+            return [...prev, {
+              id: sugId,
+              pattern: `💡 Agent 建议日程（已创建但未启用）: "${m.text}" (${m.cron})`,
+              patternEn: `💡 Agent proposed a schedule (created but disabled): "${m.text}" (${m.cron})`,
+              acceptLabel: '启用',
+              acceptLabelEn: 'Enable',
+              dismissLabel: '删掉',
+              dismissLabelEn: 'Delete',
+            }];
+          });
+          handleBuddyEvent('suggestion', {
+            text: lang === 'zh' ? `💡 我提议一个日程: ${m.text}` : `💡 I propose: ${m.text}`,
+          });
           break;
         }
       }
     });
     return unsub;
-  }, [connection, machines]);
+  }, [connection, allMachines]);
 
   // ── StatusBar live data ─────────────────────────────────────────────────
   const [gatewayUptimeSec, setGatewayUptimeSec] = useState<number | null>(null);
@@ -432,9 +601,46 @@ export default function App() {
         <span style={styles.topBarVersion}>v0.3.0-alpha</span>
       </div>
 
+      {isTauri() && !settings.workspaceDir && !detectedHonePath && (
+        <div style={{
+          background: 'rgba(244, 88, 88, 0.1)',
+          borderBottom: '1px solid var(--hone-danger, #F45858)',
+          padding: '8px 16px',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          gap: '12px',
+          color: '#F45858',
+          fontSize: '13px',
+          fontWeight: 500,
+          flexShrink: 0,
+        }}>
+          <span>
+            {lang === 'zh'
+              ? '⚠️ 未找到 Hone CLI，请在设置中指定工作目录'
+              : '⚠️ Hone CLI not found. Please specify the workspace directory in Settings.'}
+          </span>
+          <button
+            onClick={() => setActiveView('settings')}
+            style={{
+              background: 'var(--hone-danger, #F45858)',
+              color: '#FFF',
+              border: 'none',
+              borderRadius: '4px',
+              padding: '2px 10px',
+              cursor: 'pointer',
+              fontSize: '12px',
+              fontWeight: 600,
+            }}
+          >
+            {lang === 'zh' ? '前去设置' : 'Go to Settings'}
+          </button>
+        </div>
+      )}
+
       <div style={styles.body}>
         <Sidebar
-          machines={machines}
+          machines={allMachines}
           activeMachine={activeMachine}
           setActiveMachine={setActiveMachine}
           lang={lang}
@@ -446,7 +652,7 @@ export default function App() {
 
         <div style={styles.main}>
           <div style={styles.viewTabs}>
-            {(['dashboard', 'gateway', 'schedule', 'canvas', 'webtask', 'settings'] as ViewName[]).map(v => (
+            {(['dashboard', 'gateway', 'workspace', 'watch', 'schedule', 'canvas', 'settings'] as ViewName[]).map(v => (
               <button
                 key={v}
                 style={styles.viewTab(activeView === v)}
@@ -462,11 +668,12 @@ export default function App() {
               <Dashboard.Loading lang={lang} />
             ) : pageState === 'error' ? (
               <Dashboard.Error lang={lang} onRetry={() => setPageState('loaded')} />
-            ) : (machines.length > 0 || sessions.length > 0) ? (
+            ) : (allMachines.length > 0 || sessions.length > 0) ? (
               <Dashboard
                 lang={lang}
-                machines={machines}
+                machines={allMachines}
                 sessions={sessions}
+                cliInstances={cliInstances}
                 filter={filter}
                 setFilter={setFilter}
                 sortBy={sortBy}
@@ -475,6 +682,7 @@ export default function App() {
                 setSortDir={setSortDir}
                 search={search}
                 setSearch={setSearch}
+                onOpenWorkspace={openWorkspace}
               />
             ) : (
               <Dashboard.Empty lang={lang} onAddMachine={() => setPairingModal(true)} />
@@ -489,6 +697,8 @@ export default function App() {
               relayUrl={settings.relayUrl}
               connection={connection}
               onBuddyEvent={handleBuddyEvent}
+              apiKeyConfigured={!!settings.apiKey?.trim()}
+              onGoToSettings={() => setActiveView('settings')}
             />
           )}
 
@@ -507,6 +717,7 @@ export default function App() {
               onAcceptSuggestion={handleAcceptSuggestion}
               onDismissSuggestion={handleDismissSuggestion}
               lang={lang}
+              connection={connection}
             />
           )}
 
@@ -517,18 +728,26 @@ export default function App() {
               lang={lang}
               theme={theme}
               setTheme={setTheme}
+              hydrated={!!tauriConfig}
             />
           )}
 
           {activeView === 'canvas' && (
-            <CanvasViewer lang={lang} />
+            <CanvasViewer lang={lang} connection={connection} />
           )}
 
-          {activeView === 'webtask' && (
-            <WebTaskRunner
+          {activeView === 'workspace' && (
+            <CliWorkspace
               lang={lang}
-              connection={connection}
+              workspaces={workspaces}
+              setWorkspaces={setWorkspaces}
+              activeId={activeWsId}
+              setActiveId={setActiveWsId}
             />
+          )}
+
+          {activeView === 'watch' && (
+            <WatchPanel lang={lang} connection={connection} />
           )}
 
           <StatusBar lang={lang} statusBar={statusBarData} />
@@ -585,11 +804,24 @@ export default function App() {
             state={buddyState}
             text={buddyText}
             species={settings.buddySpecies as any || 'robot'}
-            onAction={(action) => {
+            onAction={(action, data) => {
               if (action === 'pet') {
                 setBuddyState('success');
                 setBuddyText('摸摸头~');
                 setTimeout(() => setBuddyState('idle'), 2000);
+              } else if (action === 'open_bubble') {
+                // Route based on what kind of event triggered the bubble.
+                const text = String(data?.text || '');
+                if (data?.state === 'error') {
+                  setActiveView('gateway');
+                } else if (data?.state === 'suggestion') {
+                  // Schedule-related → schedule tab; otherwise stay on chat
+                  if (/日程|schedule|⏰|🤖|💡/.test(text)) {
+                    setActiveView('schedule');
+                  } else {
+                    setActiveView('gateway');
+                  }
+                }
               }
             }}
           />

@@ -77,6 +77,48 @@ export function setHonePath(newPath: string): Promise<void> {
   return invoke('set_hone_path', { newPath });
 }
 
+// ── Local CLI instances (auto-discovered) ──
+
+export interface LocalCliInstance {
+  pid: number;
+  cwd: string;
+  machine_name: string;
+  os: string;
+  version: string;
+  mode: string;
+  started_at: string;
+}
+
+export function localCliInstancesList(): Promise<LocalCliInstance[]> {
+  return invoke('local_cli_instances_list');
+}
+
+// ── CLI Task Workspace ──
+
+/** Spawn a one-shot CLI task in a working directory. Returns the task_id.
+ * Listen for `cli_task_chunk_<task_id>` and `cli_task_done_<task_id>` events. */
+export function cliTaskRun(cwd: string, task: string): Promise<string> {
+  return invoke('cli_task_run', { cwd, task });
+}
+
+// ── Local CLI pairing ──
+
+export interface LocalPairResult {
+  ok: boolean;
+  token?: string;
+  machine_name?: string;
+  machine_id?: string;
+  os?: string;
+  cwd?: string;
+  pid?: number;
+  version?: string;
+  error?: string;
+}
+
+export function pairWithLocalCli(host: string, port: number, code: string): Promise<LocalPairResult> {
+  return invoke('pair_with_local_cli', { input: { host, port, code } });
+}
+
 // ── Provider connectivity test ──
 
 export interface TestProviderInput {

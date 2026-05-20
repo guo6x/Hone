@@ -37,6 +37,7 @@ export function useGateway() {
     version: '—',
   }));
   const [loading, setLoading] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
   const fetchStatus = useCallback(async () => {
     if (!isTauri()) return;
@@ -64,13 +65,16 @@ export function useGateway() {
 
   const start = useCallback(async (honePath: string, relayUrl?: string) => {
     setLoading(true);
+    setStartError(null);
     try {
       if (isTauri()) {
         await api.gatewayStart(honePath, relayUrl);
       }
       setGw(prev => ({ ...prev, status: 'Running' as const }));
     } catch (e) {
-      console.error('gateway start failed:', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error('gateway start failed:', msg);
+      setStartError(msg);
     } finally {
       setLoading(false);
     }
@@ -78,19 +82,22 @@ export function useGateway() {
 
   const stop = useCallback(async () => {
     setLoading(true);
+    setStartError(null);
     try {
       if (isTauri()) {
         await api.gatewayStop();
       }
       setGw(prev => ({ ...prev, status: 'Stopped' as const }));
     } catch (e) {
-      console.error('gateway stop failed:', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error('gateway stop failed:', msg);
+      setStartError(msg);
     } finally {
       setLoading(false);
     }
   }, []);
 
-  return { gw, loading, start, stop, refreshStatus: fetchStatus };
+  return { gw, loading, start, stop, refreshStatus: fetchStatus, startError };
 }
 
 // ── Machines hook ──
@@ -124,12 +131,14 @@ export function useMachines() {
   const addMachine = useCallback(async (info: Omit<MachineInfo, 'id'>) => {
     if (!isTauri()) return '';
     try {
-      return await api.machineAdd(info);
+      const id = await api.machineAdd(info);
+      await fetchMachines();
+      return id;
     } catch (e) {
       setError(String(e));
       return '';
     }
-  }, []);
+  }, [fetchMachines]);
 
   const removeMachine = useCallback(async (id: string) => {
     if (!isTauri()) return;

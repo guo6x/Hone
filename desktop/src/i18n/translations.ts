@@ -4,6 +4,8 @@ export interface Translations {
   // Tabs
   tabDashboard: string;
   tabGateway: string;
+  tabWorkspace: string;
+  tabWatch: string;
   tabSchedule: string;
   tabCanvas: string;
   tabSettings: string;
@@ -235,6 +237,8 @@ const zh: Translations = {
   tabDashboard: '仪表盘',
   tabGateway: '对话',
   tabSchedule: '日程管理',
+  tabWorkspace: '工作台',
+  tabWatch: '盯盘',
   tabCanvas: '可视化',
   tabSettings: '设置',
   sidebarTitle: '机器列表',
@@ -444,6 +448,8 @@ const en: Translations = {
   tabDashboard: 'Dashboard',
   tabGateway: 'Chat',
   tabSchedule: 'Schedule',
+  tabWorkspace: 'Workspace',
+  tabWatch: 'Watch',
   tabCanvas: 'Canvas',
   tabSettings: 'Settings',
   sidebarTitle: 'Machines',

@@ -7,6 +7,16 @@ interface DashboardProps {
   lang: Lang;
   machines: MachineInfo[];
   sessions: SessionInfo[];
+  /** Raw CLI instance data for the per-CLI cards section. */
+  cliInstances?: Array<{
+    pid: number;
+    cwd: string;
+    machine_name: string;
+    os: string;
+    version: string;
+    mode: string;
+    started_at: string;
+  }>;
   filter: string;
   setFilter: (f: string) => void;
   sortBy: string;
@@ -15,6 +25,7 @@ interface DashboardProps {
   setSortDir: (d: 'asc' | 'desc') => void;
   search: string;
   setSearch: (s: string) => void;
+  onOpenWorkspace?: (cwd: string) => void;
 }
 
 interface EmptyProps { lang: Lang; onAddMachine: () => void }
@@ -95,8 +106,36 @@ function Error_({ lang, onRetry }: ErrorProps) {
 
 // ── Main Dashboard ─────────────────────────────────────────────────────────────
 
+function fmtUptime(startedAt: string, lang: Lang): string {
+  const start = Date.parse(startedAt);
+  if (!start) return '—';
+  const secs = Math.max(0, Math.floor((Date.now() - start) / 1000));
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (lang === 'zh') {
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function modeBadge(mode: string, lang: Lang): { label: string; color: string; bg: string } {
+  const map: Record<string, { zh: string; en: string; color: string; bg: string }> = {
+    gateway:     { zh: '后台',     en: 'gateway',     color: 'var(--hone-accent)',  bg: 'var(--hone-accentMuted)' },
+    interactive: { zh: '交互',     en: 'interactive', color: 'var(--hone-success)', bg: 'var(--hone-successMuted)' },
+    oneshot:     { zh: '一次性',   en: 'one-shot',    color: 'var(--hone-warning)', bg: 'var(--hone-warningMuted)' },
+    pair:        { zh: '配对中',   en: 'pairing',     color: 'var(--hone-muted)',   bg: 'var(--hone-surfaceOverlay)' },
+  };
+  const e = map[mode] || { zh: mode, en: mode, color: 'var(--hone-muted)', bg: 'var(--hone-surfaceOverlay)' };
+  return { label: lang === 'zh' ? e.zh : e.en, color: e.color, bg: e.bg };
+}
+
 export default function Dashboard({
-  lang, machines, sessions, filter, setFilter, sortBy, setSortBy, sortDir, setSortDir, search, setSearch,
+  lang, machines, sessions, cliInstances, filter, setFilter, sortBy, setSortBy, sortDir, setSortDir, search, setSearch, onOpenWorkspace,
 }: DashboardProps) {
   const t = LANG[lang];
 
@@ -171,6 +210,63 @@ export default function Dashboard({
           <div style={styles.cardDesc}>{lang === 'zh' ? '已注册机器' : 'Registered machines'}</div>
         </div>
       </div>
+
+      {/* ── CLI Instance Cards ─────────────────────────── */}
+      {cliInstances && cliInstances.length > 0 && (
+        <div style={styles.section}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={styles.tableTitle}>
+              {lang === 'zh' ? '运行中的 CLI 实例' : 'Running CLI Instances'}
+              <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--hone-muted)', fontWeight: 400 }}>
+                {cliInstances.length}
+              </span>
+            </div>
+            <span style={{ fontSize: 10, color: 'var(--hone-muted)' }}>
+              {lang === 'zh' ? '每 5s 自动刷新' : 'refreshing every 5s'}
+            </span>
+          </div>
+          <div style={cliCardsStyles.grid}>
+            {cliInstances.map(inst => {
+              const cwdParts = inst.cwd.replace(/\\/g, '/').split('/').filter(Boolean);
+              const folder = cwdParts[cwdParts.length - 1] || inst.cwd;
+              const badge = modeBadge(inst.mode, lang);
+              return (
+                <div
+                  key={inst.pid}
+                  onClick={() => onOpenWorkspace?.(inst.cwd)}
+                  style={{
+                    ...cliCardsStyles.card,
+                    cursor: 'pointer',
+                  }}
+                  className="transition-all duration-150 hover:border-[var(--hone-accent,#1f6feb)] hover:shadow-sm hover:translate-y-[-1px]"
+                >
+                  <div style={cliCardsStyles.cardHead}>
+                    <span style={cliCardsStyles.dot} />
+                    <span style={cliCardsStyles.folder} title={inst.cwd}>{folder}</span>
+                    <span style={{ ...cliCardsStyles.modeBadge, background: badge.bg, color: badge.color }}>
+                      {badge.label}
+                    </span>
+                  </div>
+                  <div style={cliCardsStyles.cwd} title={inst.cwd}>{inst.cwd}</div>
+                  <div style={cliCardsStyles.meta}>
+                    <span>pid {inst.pid}</span>
+                    <span style={cliCardsStyles.sep}>·</span>
+                    <span>{fmtUptime(inst.started_at, lang)}</span>
+                    <span style={cliCardsStyles.sep}>·</span>
+                    <span>{inst.os}</span>
+                    {inst.machine_name && (
+                      <>
+                        <span style={cliCardsStyles.sep}>·</span>
+                        <span>{inst.machine_name}</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* ── Sessions Table ─────────────────────────────── */}
       <div style={styles.section}>
@@ -567,5 +663,70 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: '50%',
     background: 'var(--hone-accent)',
     animation: 'bounce 0.7s infinite ease-in-out',
+  },
+};
+
+const cliCardsStyles: Record<string, React.CSSProperties> = {
+  grid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
+    gap: 10,
+    marginTop: 4,
+  },
+  card: {
+    background: 'var(--hone-surfaceRaised)',
+    border: '1px solid var(--hone-border)',
+    borderRadius: 8,
+    padding: '12px 14px',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 6,
+  },
+  cardHead: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+  },
+  dot: {
+    width: 7,
+    height: 7,
+    borderRadius: '50%',
+    background: 'var(--hone-success, #2ECC80)',
+    boxShadow: '0 0 4px rgba(46, 204, 128, 0.4)',
+    flexShrink: 0,
+  },
+  folder: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: 600,
+    color: 'var(--hone-text)',
+    whiteSpace: 'nowrap' as const,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+  },
+  modeBadge: {
+    fontSize: 10,
+    padding: '2px 8px',
+    borderRadius: 10,
+    fontWeight: 500,
+    flexShrink: 0,
+  },
+  cwd: {
+    fontSize: 10,
+    fontFamily: 'JetBrains Mono, monospace',
+    color: 'var(--hone-muted)',
+    whiteSpace: 'nowrap' as const,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+  },
+  meta: {
+    fontSize: 11,
+    color: 'var(--hone-muted)',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 4,
+  },
+  sep: {
+    color: 'var(--hone-border)',
   },
 };

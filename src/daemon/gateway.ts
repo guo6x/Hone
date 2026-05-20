@@ -18,6 +18,10 @@ import { gatewayLLM } from './llm.js'
 import { getPatternSuggestions, type ActivityLogEntry } from './pattern-learner.js'
 import { createBrowserAgent, type ConfirmCallback, type StepCallback } from './browser/agent.js'
 import type { BrowserAgent } from './browser/types.js'
+import { recordMessage, startRun, finishRun, markScheduleAgentCreated, listAgentSchedules, getScheduleRuns, getAgentScheduleInfo, getRecentMessages, listTrackedItems, recordObservation, upsertTrackedItem } from './storage.js'
+import { tryStockIntent } from './intent/stock-intent.js'
+import { fetchStockQuotes } from './datasources/stock-cn.js'
+import { tryAutoExecute, listBrokerAdapters } from './brokers/adapter.js'
 
 const HEARTBEAT_INTERVAL_MS = 30_000
 const RECONNECT_DELAY_MS = 2000
@@ -107,6 +111,8 @@ function createGatewayContext(state: GatewayState): GatewayContext {
         type: 'task_dispatched',
         taskId,
         task,
+        machineId: state.config.machineId,
+        machineName: state.config.machineName,
         ts: new Date().toISOString(),
       })
 
@@ -117,10 +123,18 @@ function createGatewayContext(state: GatewayState): GatewayContext {
 
         const nodePath = process.execPath
         const cliScript = process.argv[1]
+        // cwd is the hone project root (parent of dist/cli.js)
+        const cwd = cliScript.replace(/[/\\][^/\\]+[/\\][^/\\]+$/, '')
 
-        const { stdout, stderr } = await execFileAsync(nodePath, [cliScript, '-p', task])
+        const { stdout, stderr } = await execFileAsync(nodePath, [cliScript, '-p', task], {
+          timeout: 5 * 60 * 1000, // 5-minute timeout to prevent permanent hang
+          cwd,
+        })
         return stdout || stderr || '执行完毕'
       } catch (err: any) {
+        if (err.killed && err.signal === 'SIGTERM') {
+          return `CLI 任务超时 (5分钟)`
+        }
         return `CLI 任务执行失败: ${err.message || err}`
       }
     },
@@ -135,10 +149,13 @@ function createGatewayContext(state: GatewayState): GatewayContext {
 }
 
 function broadcast(state: GatewayState, msg: unknown): void {
-  sendJSON(state.ws!, msg)
+  if (state.ws && state.ws.readyState === 1) { // 1 = OPEN
+    sendJSON(state.ws, msg)
+  }
 }
 
 function broadcastBuddyEvent(state: GatewayState, event: string, text?: string, data?: any): void {
+  if (!state.ws) return;
   broadcast(state, {
     type: 'buddy_event',
     event,
@@ -214,8 +231,96 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
   // Start the scheduler
   state.schedulerState = createScheduler(state.schedules, gatewayCtx, async (entry: ScheduleEntry) => {
     log(config, `Schedule triggered: ${entry.text}`)
+    const runId = startRun(entry.id)
     try {
       let finalResult: string
+
+      // Stock monitor task: pull quote, analyze, record observation, raise signal if notable
+      if (entry.task.startsWith('stock_monitor:')) {
+        const itemId = entry.task.slice('stock_monitor:'.length)
+        const items = listTrackedItems({ kind: 'stock' })
+        const item = items.find(i => i.id === itemId)
+        if (!item) {
+          finalResult = `tracked item 已被移除: ${itemId}`
+        } else {
+          const quotes = await fetchStockQuotes([item.identifier]).catch(() => [])
+          const q = quotes[0]
+          if (!q) {
+            finalResult = `${item.identifier} 暂无行情数据`
+          } else {
+            const p = item.user_position as any
+            const hasPos = !!(p?.shares && p?.avg_cost)
+            const pnlPct = hasPos ? ((q.current - p.avg_cost) / p.avg_cost) * 100 : null
+            // Simple signal heuristic: ±3% intraday or ±5% from cost (if position)
+            let signal: 'none' | 'buy' | 'sell' | 'alert' = 'none'
+            if (Math.abs(q.change_pct) >= 5) signal = 'alert'
+            if (hasPos && pnlPct !== null) {
+              if (pnlPct <= -8) signal = 'sell'   // stop-loss territory
+              else if (pnlPct >= 15) signal = 'sell' // take-profit
+            }
+            const assessment = hasPos
+              ? `${q.name} ${q.current} (${q.change_pct >= 0 ? '+' : ''}${q.change_pct.toFixed(2)}%) · 持仓浮${pnlPct! >= 0 ? '盈' : '亏'} ${pnlPct!.toFixed(2)}%`
+              : `${q.name} ${q.current} (${q.change_pct >= 0 ? '+' : ''}${q.change_pct.toFixed(2)}%)`
+            recordObservation({
+              item_id: item.id,
+              data: { ...q, pnl_pct: pnlPct },
+              agent_assessment: assessment,
+              signal,
+            })
+            finalResult = assessment
+            if (signal !== 'none') {
+              broadcastBuddyEvent(state, 'suggestion', `⚠ ${item.display_name || item.identifier}: ${signal === 'sell' ? '止损/止盈信号' : signal === 'alert' ? '异动' : '关注'} (${q.change_pct.toFixed(2)}%)`)
+
+              // If broker_authorized + adapter available, try auto-execute.
+              // Otherwise broadcast for the user to act manually.
+              let autoExecResult: any = null
+              if (signal === 'sell' && hasPos && p?.broker_authorized && p?.broker) {
+                autoExecResult = await tryAutoExecute(String(p.broker), {
+                  symbol: item.identifier,
+                  side: 'sell',
+                  quantity: Number(p.shares),
+                  reason: `自动止损/止盈触发: ${assessment}`,
+                })
+                if (autoExecResult?.ok) {
+                  const { recordRecommendation, closeTrackedItem } = await import('./storage.js')
+                  recordRecommendation({
+                    item_id: item.id,
+                    recommendation: `自动卖出 ${p.shares} 股 @ ${autoExecResult.filled_price || q.current}`,
+                    reasoning: assessment,
+                  })
+                  closeTrackedItem(item.id, `Adapter ${p.broker} 自动执行: ${autoExecResult.order_id}`)
+                }
+              }
+
+              broadcast(state, {
+                type: 'tracked_item_signal',
+                itemId: item.id,
+                identifier: item.identifier,
+                displayName: item.display_name,
+                signal,
+                quote: q,
+                pnlPct,
+                autoExecuted: !!autoExecResult?.ok,
+                autoExecResult,
+                ts: new Date().toISOString(),
+              })
+            }
+          }
+        }
+        broadcast(state, {
+          type: 'schedule_triggered',
+          scheduleId: entry.id,
+          text: entry.text,
+          task: entry.task,
+          result: finalResult,
+          machineId: config.machineId,
+          machineName: config.machineName,
+          ts: new Date().toISOString(),
+        })
+        entry.lastStatus = 'ok'
+        finishRun(runId, 'ok', finalResult)
+        return
+      }
 
       // Route web: prefixed tasks to browser agent
       if (entry.task.startsWith('web:') && state.browserAgent) {
@@ -257,30 +362,104 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
         text: entry.text,
         task: entry.task,
         result: finalResult,
+        machineId: config.machineId,
+        machineName: config.machineName,
         ts: new Date().toISOString(),
       })
       entry.lastStatus = 'ok'
+      finishRun(runId, 'ok', finalResult)
     } catch (err) {
       entry.lastStatus = 'fail'
       log(config, `Schedule failed: ${err}`)
+      finishRun(runId, 'fail', undefined, String(err))
     }
   })
 
-  // Run pattern learner every 6 hours (first run after 5 min)
+  // Run pattern learner every 6 hours (first run after 5 min).
+  // Three confidence tiers control how proactive the agent is:
+  //   ≥ 0.85  → auto-create + enabled  (agent acts on its own; user can disable)
+  //   0.6–0.85 → auto-create + disabled (agent proposes; user must enable)
+  //   < 0.6   → suggestion only         (no schedule created; user must accept)
+  // Dedup by pattern type so we don't recreate the same one each tick.
   const PATTERN_CHECK_MS = 6 * 3600_000
+  const AUTO_CREATE_THRESHOLD = 0.85
+  const PROPOSE_THRESHOLD = 0.6
   const runPatternCheck = () => {
     try {
       const suggestions = getPatternSuggestions()
-      if (suggestions.length > 0) {
-        log(config, `Pattern learner found ${suggestions.length} suggestions`)
-        broadcastBuddyEvent(state, 'suggestion', suggestions[0].text, suggestions[0])
-        for (const s of suggestions) {
+      if (suggestions.length === 0) return
+      log(config, `Pattern learner found ${suggestions.length} suggestions`)
+
+      const existing = listAgentSchedules()
+      const seenPatterns = new Set(
+        existing.filter(a => !a.user_corrected).map(a => a.source_pattern),
+      )
+
+      for (const s of suggestions) {
+        const pat = s.pattern
+        if (seenPatterns.has(pat.type)) {
+          // Already created an agent schedule for this pattern; skip to avoid spam
+          continue
+        }
+
+        if (pat.confidence >= AUTO_CREATE_THRESHOLD && pat.suggestedSchedule) {
+          const id = `agent_${Date.now()}_${pat.type}`
+          const entry: ScheduleEntry = {
+            id,
+            text: pat.suggestedSchedule.text,
+            trigger: { type: 'cron', cron: pat.suggestedSchedule.cron },
+            task: pat.suggestedSchedule.task,
+            delivery: 'both',
+            enabled: true,
+            createdAt: Date.now(),
+          }
+          state.schedules.set(id, entry)
+          saveSchedules(state.schedules)
+          markScheduleAgentCreated(id, pat.confidence, pat.type)
+          broadcastBuddyEvent(state, 'success', `已自动创建日程: ${pat.suggestedSchedule.text}`)
+          broadcast(state, {
+            type: 'schedule_auto_created',
+            scheduleId: id,
+            text: pat.suggestedSchedule.text,
+            task: pat.suggestedSchedule.task,
+            cron: pat.suggestedSchedule.cron,
+            pattern: pat.type,
+            confidence: pat.confidence,
+            ts: new Date().toISOString(),
+          })
+        } else if (pat.confidence >= PROPOSE_THRESHOLD && pat.suggestedSchedule) {
+          const id = `agent_${Date.now()}_${pat.type}`
+          const entry: ScheduleEntry = {
+            id,
+            text: pat.suggestedSchedule.text,
+            trigger: { type: 'cron', cron: pat.suggestedSchedule.cron },
+            task: pat.suggestedSchedule.task,
+            delivery: 'both',
+            enabled: false, // disabled — waiting for user approval
+            createdAt: Date.now(),
+          }
+          state.schedules.set(id, entry)
+          saveSchedules(state.schedules)
+          markScheduleAgentCreated(id, pat.confidence, pat.type)
+          broadcast(state, {
+            type: 'schedule_proposed',
+            scheduleId: id,
+            text: pat.suggestedSchedule.text,
+            task: pat.suggestedSchedule.task,
+            cron: pat.suggestedSchedule.cron,
+            pattern: pat.type,
+            confidence: pat.confidence,
+            ts: new Date().toISOString(),
+          })
+        } else {
+          // Low confidence: just a suggestion (original behavior)
+          broadcastBuddyEvent(state, 'suggestion', s.text, s)
           broadcast(state, {
             type: 'schedule_suggestion',
             id: s.id,
             text: s.text,
-            pattern: s.pattern.type,
-            confidence: s.pattern.confidence,
+            pattern: pat.type,
+            confidence: pat.confidence,
             ts: new Date().toISOString(),
           })
         }
@@ -490,19 +669,84 @@ async function handleMessage(
       const replyClientId = msg.clientId || ''
       log(config, `Received message from ${msg.from || 'client'}: ${text.slice(0, 100)}`)
 
+      // Stock intent fast-path: handle "盯着 / 买了 / 卖了 / 行情 / 持仓"
+      // deterministically before LLM. No tokens wasted, no misinterpretation.
+      try {
+        const stockResult = await tryStockIntent(text)
+        if (stockResult) {
+          recordMessage({
+            ts: Date.now(), direction: 'in', text,
+            intent_action: 'stock', client_id: replyClientId || undefined,
+          })
+          sendJSON(state.ws!, {
+            type: 'message',
+            target: 'client',
+            clientId: replyClientId,
+            payload: { text: stockResult.reply },
+            ts: new Date().toISOString(),
+          })
+          recordMessage({
+            ts: Date.now(), direction: 'out', text: stockResult.reply,
+            client_id: replyClientId || undefined,
+          })
+          // Auto-create monitor schedule for newly-tracked items
+          for (const item of stockResult.needs_monitor || []) {
+            if (item.monitor_schedule_id) continue
+            const schedId = `mon_stock_${item.identifier}_${Date.now()}`
+            // Every 30 min, weekdays 9-15 — covers A-share trading + close
+            state.schedules.set(schedId, {
+              id: schedId,
+              text: `监控股票 ${item.display_name || item.identifier}`,
+              trigger: { type: 'cron', cron: '*/30 9-15 * * 1-5' },
+              task: `stock_monitor:${item.id}`,
+              delivery: 'both',
+              enabled: true,
+              createdAt: Date.now(),
+            })
+            saveSchedules(state.schedules)
+            upsertTrackedItem({
+              kind: item.kind, identifier: item.identifier,
+              monitor_schedule_id: schedId,
+            })
+          }
+          broadcast(state, {
+            type: 'tracked_items_changed',
+            items: stockResult.items_changed || [],
+            ts: new Date().toISOString(),
+          })
+          break
+        }
+      } catch (err) {
+        log(config, `Stock intent handler error: ${err}`)
+      }
+
       try {
         broadcastBuddyEvent(state, 'thinking', '正在思考意图...')
         const intent = await gatewayLLM(text)
 
+        // Persist the incoming message with its classified intent for memory & history.
+        recordMessage({
+          ts: Date.now(),
+          direction: 'in',
+          text,
+          intent_action: intent.action,
+          intent_task: intent.task,
+          client_id: replyClientId || undefined,
+        })
+
         switch (intent.action) {
           case 'reply': {
             broadcastBuddyEvent(state, 'idle')
+            const reply = intent.reply || '已收到'
             sendJSON(state.ws!, {
               type: 'message',
               target: 'client',
               clientId: replyClientId,
-              payload: { text: intent.reply || '已收到' },
+              payload: { text: reply },
               ts: new Date().toISOString(),
+            })
+            recordMessage({
+              ts: Date.now(), direction: 'out', text: reply, client_id: replyClientId || undefined,
             })
             break
           }
@@ -516,16 +760,27 @@ async function handleMessage(
               result,
               ts: new Date().toISOString(),
             })
+            recordMessage({
+              ts: Date.now(),
+              direction: 'out',
+              text: typeof result === 'string' ? result : JSON.stringify(result),
+              result_text: typeof result === 'string' ? result : JSON.stringify(result),
+              client_id: replyClientId || undefined,
+            })
             break
           }
           case 'schedule': {
             broadcastBuddyEvent(state, 'success', '日程已创建')
+            const reply = intent.reply || '日程已创建'
             sendJSON(state.ws!, {
               type: 'message',
               target: 'client',
               clientId: replyClientId,
-              payload: { text: intent.reply || '日程已创建' },
+              payload: { text: reply },
               ts: new Date().toISOString(),
+            })
+            recordMessage({
+              ts: Date.now(), direction: 'out', text: reply, client_id: replyClientId || undefined,
             })
             break
           }
@@ -572,6 +827,14 @@ async function handleMessage(
                 error: result.error,
                 ts: new Date().toISOString(),
               })
+              const summary = result.status === 'success'
+                ? `网页任务完成${result.finalUrl ? ' · ' + result.finalUrl : ''}`
+                : `网页任务${result.status}${result.error ? ': ' + result.error : ''}`
+              recordMessage({
+                ts: Date.now(), direction: 'out', text: summary,
+                result_text: result.finalUrl || result.error,
+                client_id: replyClientId || undefined,
+              })
             }).catch(err => {
               broadcastBuddyEvent(state, 'error', `执行错误: ${err.message}`)
               sendJSON(state.ws!, {
@@ -579,6 +842,11 @@ async function handleMessage(
                 status: 'failed',
                 error: err.message || String(err),
                 ts: new Date().toISOString(),
+              })
+              recordMessage({
+                ts: Date.now(), direction: 'out',
+                text: `网页任务执行错误: ${err.message || err}`,
+                client_id: replyClientId || undefined,
               })
             })
             break
@@ -592,6 +860,10 @@ async function handleMessage(
           clientId: replyClientId,
           payload: { text: `处理失败: ${err}` },
           ts: new Date().toISOString(),
+        })
+        recordMessage({
+          ts: Date.now(), direction: 'out', text: `处理失败: ${err}`,
+          client_id: replyClientId || undefined,
         })
       }
       break
@@ -655,6 +927,163 @@ async function handleMessage(
     case 'schedule_delete': {
       const deleted = state.schedules.delete(msg.scheduleId)
       if (deleted) saveSchedules(state.schedules)
+      break
+    }
+
+    case 'schedule_runs_request': {
+      const scheduleId = String(msg.scheduleId || '')
+      const limit = Number(msg.limit) || 50
+      if (!scheduleId) break
+      const runs = getScheduleRuns(scheduleId, limit)
+      const agentInfo = getAgentScheduleInfo(scheduleId)
+      sendJSON(state.ws!, {
+        type: 'schedule_runs_response',
+        scheduleId,
+        runs,
+        agentInfo,
+        ts: new Date().toISOString(),
+      })
+      break
+    }
+
+    case 'browser_open_login': {
+      // User wants to manually log into a site with the agent's browser profile.
+      // Open non-headless, wait for them to close, then session is persisted.
+      const profile = String(msg.profile || 'default')
+      const startUrl = msg.url ? String(msg.url) : undefined
+      if (!state.browserAgent) {
+        sendJSON(state.ws!, {
+          type: 'browser_login_done',
+          profile, status: 'error',
+          error: '浏览器代理未启用 (HONE_BROWSER_ENABLED=true)',
+          ts: new Date().toISOString(),
+        })
+        break
+      }
+      try {
+        const runner = await import('./browser/playwright-runner.js')
+        const cfg = (state.browserAgent as any).config
+        broadcastBuddyEvent(state, 'working', `打开浏览器登录 ${profile}…`)
+        sendJSON(state.ws!, {
+          type: 'browser_login_started',
+          profile, url: startUrl,
+          ts: new Date().toISOString(),
+        })
+        // Async — don't block other messages
+        runner.openProfileForLogin(cfg, profile, startUrl)
+          .then(() => {
+            broadcastBuddyEvent(state, 'success', `${profile} 登录会话已保存`)
+            sendJSON(state.ws!, {
+              type: 'browser_login_done',
+              profile, status: 'ok',
+              ts: new Date().toISOString(),
+            })
+          })
+          .catch(err => {
+            broadcastBuddyEvent(state, 'error', `登录失败: ${err.message || err}`)
+            sendJSON(state.ws!, {
+              type: 'browser_login_done',
+              profile, status: 'error',
+              error: String(err.message || err),
+              ts: new Date().toISOString(),
+            })
+          })
+      } catch (err) {
+        sendJSON(state.ws!, {
+          type: 'browser_login_done',
+          profile, status: 'error',
+          error: String(err),
+          ts: new Date().toISOString(),
+        })
+      }
+      break
+    }
+
+    case 'messages_list_request': {
+      const limit = Math.max(1, Math.min(500, Number(msg.limit) || 100))
+      const messages = getRecentMessages(limit)
+      sendJSON(state.ws!, {
+        type: 'messages_list_response',
+        messages,
+        ts: new Date().toISOString(),
+      })
+      break
+    }
+
+    case 'tracked_items_list_request': {
+      const { getObservations, getRecommendations, getRecommendationStats } = await import('./storage.js')
+      const items = listTrackedItems()
+      // Include latest observation and stats per item
+      const enriched = items.map(item => ({
+        ...item,
+        latest_observation: (getObservations(item.id, 1)[0]) || null,
+        stats: getRecommendationStats(item.id),
+      }))
+      sendJSON(state.ws!, {
+        type: 'tracked_items_list_response',
+        items: enriched,
+        ts: new Date().toISOString(),
+      })
+      break
+    }
+
+    case 'tracked_item_detail_request': {
+      const { getObservations, getRecommendations, getTrackedItem } = await import('./storage.js')
+      const itemId = String(msg.itemId || '')
+      const item = getTrackedItem(itemId)
+      const observations = item ? getObservations(itemId, 100) : []
+      const recommendations = item ? getRecommendations(itemId, 50) : []
+      sendJSON(state.ws!, {
+        type: 'tracked_item_detail_response',
+        itemId,
+        item,
+        observations,
+        recommendations,
+        ts: new Date().toISOString(),
+      })
+      break
+    }
+
+    case 'tracked_item_remove': {
+      const { removeTrackedItem, getTrackedItem } = await import('./storage.js')
+      const itemId = String(msg.itemId || '')
+      const item = getTrackedItem(itemId)
+      if (item?.monitor_schedule_id) {
+        state.schedules.delete(item.monitor_schedule_id)
+        saveSchedules(state.schedules)
+      }
+      removeTrackedItem(itemId)
+      sendJSON(state.ws!, {
+        type: 'tracked_items_changed',
+        items: [],
+        removedId: itemId,
+        ts: new Date().toISOString(),
+      })
+      break
+    }
+
+    case 'browser_profiles_list': {
+      if (!state.browserAgent) {
+        sendJSON(state.ws!, { type: 'browser_profiles_response', profiles: [], ts: new Date().toISOString() })
+        break
+      }
+      try {
+        const runner = await import('./browser/playwright-runner.js')
+        const cfg = (state.browserAgent as any).config
+        const profiles = await runner.listProfiles(cfg)
+        sendJSON(state.ws!, {
+          type: 'browser_profiles_response',
+          profiles,
+          ts: new Date().toISOString(),
+        })
+      } catch (err) {
+        sendJSON(state.ws!, {
+          type: 'browser_profiles_response',
+          profiles: [],
+          error: String(err),
+          ts: new Date().toISOString(),
+        })
+      }
       break
     }
 

@@ -18,21 +18,29 @@ interface Props {
     reconnect: () => void;
   };
   onBuddyEvent?: (event: string, payload?: any) => void;
+  /** True if user has saved an API key. When false, chat is blocked with a guidance banner. */
+  apiKeyConfigured?: boolean;
+  /** Jump to Settings tab from the warning banner. */
+  onGoToSettings?: () => void;
 }
 
 function formatTime(): string {
   return `${String(new Date().getHours()).padStart(2, '0')}:${String(new Date().getMinutes()).padStart(2, '0')}`;
 }
 
-const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl, connection, onBuddyEvent }) => {
+const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl, connection, onBuddyEvent, apiKeyConfigured = true, onGoToSettings }) => {
   const t = LANG[lang];
   const { start: ipcStart, stop: ipcStop } = useGateway();
   const { status, sendChat, subscribe, reconnect } = connection;
+  const send = (connection as any).send as ((msg: Record<string, unknown>) => boolean) | undefined;
 
   const [messages, setMessages] = useState<GatewayMessage[]>([]);
   const [input, setInput] = useState('');
   const [chatSearch, setChatSearch] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [loginModalOpen, setLoginModalOpen] = useState(false);
+  const [loginProfile, setLoginProfile] = useState('');
+  const [loginUrl, setLoginUrl] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = useCallback(() => {
@@ -58,6 +66,26 @@ const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl, conne
     const unsubscribe = subscribe((msg) => {
       const now = formatTime();
       switch (msg.type) {
+        case 'browser_login_started':
+          setMessages(prev => [...prev, {
+            id: 'sys' + Date.now(),
+            from: 'system',
+            text: lang === 'zh'
+              ? `🌐 已打开浏览器，请在窗口里登录 ${(msg as any).profile}。登录完关掉窗口就行。`
+              : `🌐 Browser opened for ${(msg as any).profile}. Log in, then close the window.`,
+            time: now,
+          }]);
+          break;
+        case 'browser_login_done':
+          setMessages(prev => [...prev, {
+            id: 'sys' + Date.now(),
+            from: 'system',
+            text: (msg as any).status === 'ok'
+              ? (lang === 'zh' ? `✅ ${(msg as any).profile} 登录会话已保存。之后 agent 自动复用。` : `✅ ${(msg as any).profile} session saved. Agent will reuse it.`)
+              : (lang === 'zh' ? `❌ 登录失败: ${(msg as any).error || ''}` : `❌ Login failed: ${(msg as any).error || ''}`),
+            time: now,
+          }]);
+          break;
         case 'message':
           if (msg.from === 'gateway' && (msg as any).payload?.text) {
             setMessages((prev) => [...prev, {
@@ -73,12 +101,40 @@ const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl, conne
           onBuddyEvent?.((msg as any).event, (msg as any).payload);
           break;
         case 'task_started':
-        case 'browser_task_started':
           onBuddyEvent?.('working', msg);
           break;
-        case 'browser_task_result':
-          onBuddyEvent?.((msg as any).status === 'success' ? 'success' : 'error', msg);
+        case 'browser_task_started': {
+          onBuddyEvent?.('working', msg);
+          const task = String((msg as any).task || '');
+          if (task) {
+            setMessages((prev) => [...prev, {
+              id: 'g' + Date.now(),
+              from: 'gateway',
+              text: lang === 'zh' ? `🌐 启动网页任务: ${task}` : `🌐 Starting web task: ${task}`,
+              time: now,
+            }]);
+          }
           break;
+        }
+        case 'browser_task_result': {
+          const m = msg as any;
+          onBuddyEvent?.(m.status === 'success' ? 'success' : 'error', msg);
+          const statusLabel = m.status === 'success'
+            ? (lang === 'zh' ? '✓ 任务完成' : '✓ Done')
+            : (lang === 'zh' ? '✗ 任务失败' : '✗ Failed');
+          const parts: string[] = [statusLabel];
+          if (m.finalUrl) parts.push(`→ ${m.finalUrl}`);
+          if (typeof m.steps === 'number' && m.steps > 0) parts.push(`${m.steps} ${lang === 'zh' ? '步' : 'steps'}`);
+          if (typeof m.durationMs === 'number') parts.push(`${(m.durationMs / 1000).toFixed(1)}s`);
+          if (m.error) parts.push(`(${m.error})`);
+          setMessages((prev) => [...prev, {
+            id: 'g' + Date.now(),
+            from: 'gateway',
+            text: parts.join(' · '),
+            time: now,
+          }]);
+          break;
+        }
         case 'task_complete':
           onBuddyEvent?.('success', msg);
           if ((msg as any).result) {
@@ -104,7 +160,7 @@ const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl, conne
       }
     });
     return unsubscribe;
-  }, [subscribe, onBuddyEvent]);
+  }, [subscribe, onBuddyEvent, lang]);
 
   const getStatusText = (s: ConnectionStatus): string => {
     switch (s) {
@@ -185,7 +241,7 @@ const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl, conne
     ? messages.filter((m) => getMessageText(m).toLowerCase().includes(chatSearch.toLowerCase()))
     : messages;
 
-  const inputDisabled = status === 'offline' || status === 'stopping' || status === 'reconnecting';
+  const inputDisabled = status === 'offline' || status === 'stopping' || status === 'reconnecting' || !apiKeyConfigured;
 
   const powerColors: Record<string, { bg: string; glow: string }> = {
     online: { bg: 'var(--hone-danger, #F45858)', glow: '0 0 6px rgba(244,88,88,0.4)' },
@@ -330,6 +386,56 @@ const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl, conne
         </div>
       )}
 
+      {!apiKeyConfigured && (
+        <div style={{
+          margin: '12px 12px 0', padding: '12px 14px',
+          background: 'rgba(245, 158, 11, 0.08)',
+          border: '1px solid var(--hone-warning, #f59e0b)',
+          borderRadius: 8, color: 'var(--hone-warning, #f59e0b)',
+          fontSize: 12, lineHeight: 1.5,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+        }}>
+          <span>
+            {lang === 'zh'
+              ? '⚠ 还没配置大模型 API key。对话和网页任务都需要先配好才能用。'
+              : '⚠ No LLM API key configured. Chat and web tasks both need this first.'}
+          </span>
+          {onGoToSettings && (
+            <button
+              onClick={onGoToSettings}
+              style={{
+                padding: '5px 12px', fontSize: 12, fontWeight: 500,
+                borderRadius: 6, border: 'none',
+                background: 'var(--hone-warning, #f59e0b)', color: '#fff',
+                cursor: 'pointer', flexShrink: 0,
+              }}
+            >
+              {lang === 'zh' ? '前往设置 →' : 'Open Settings →'}
+            </button>
+          )}
+        </div>
+      )}
+
+      {apiKeyConfigured && messages.length === 0 && status === 'online' && (
+        <div style={{
+          margin: '12px 12px 0', padding: '10px 14px',
+          background: 'var(--hone-surface)', border: '1px solid var(--hone-border)',
+          borderRadius: 8, fontSize: 12, color: 'var(--hone-muted)', lineHeight: 1.6,
+        }}>
+          {lang === 'zh'
+            ? <>这是一个全能 agent，直接用自然语言告诉它你要做什么：<br/>
+                • <code>查 Hacker News 今天最热的 3 条</code>（网页任务）<br/>
+                • <code>每天早上 9 点提醒我看邮件</code>（日程）<br/>
+                • <code>用 git status 看一下当前仓库状态</code>（CLI 任务）<br/>
+                • 或者就普通聊天</>
+            : <>This is an all-purpose agent. Just tell it what you want in natural language:<br/>
+                • <code>fetch top 3 stories on Hacker News today</code> (web task)<br/>
+                • <code>remind me to check email every morning at 9</code> (schedule)<br/>
+                • <code>run git status to see the repo state</code> (CLI task)<br/>
+                • or just chat</>}
+        </div>
+      )}
+
       <div style={styles.messagesArea}>
         {filteredMessages.length === 0 ? (
           <div style={styles.noResults}>{lang === 'zh' ? '没有匹配的对话' : 'No messages yet'}</div>
@@ -362,7 +468,114 @@ const GatewayChat: React.FC<Props> = ({ lang, honePath = 'hone', relayUrl, conne
         <button style={styles.pill} onClick={() => handleQuickAction(`🎨 ${t.gwQuickCanvas}`)}>
           {'🎨 '}{t.gwQuickCanvas}
         </button>
+        <button style={styles.pill} onClick={() => setLoginModalOpen(true)}>
+          {'🌐 '}{lang === 'zh' ? '浏览器登录' : 'Browser Login'}
+        </button>
       </div>
+
+      {loginModalOpen && (
+        <div
+          onClick={e => { if (e.target === e.currentTarget) setLoginModalOpen(false); }}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 10000,
+            background: 'var(--hone-scrim)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >
+          <div style={{
+            width: 460, maxWidth: 'calc(100vw - 40px)',
+            borderRadius: 12, padding: 24,
+            background: 'var(--hone-surfaceRaised)', color: 'var(--hone-text)',
+            border: '1px solid var(--hone-border)',
+          }}>
+            <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600, marginBottom: 6 }}>
+              {lang === 'zh' ? '浏览器账号登录' : 'Browser Account Login'}
+            </h2>
+            <p style={{ margin: '0 0 16px', fontSize: 12, color: 'var(--hone-muted)', lineHeight: 1.6 }}>
+              {lang === 'zh'
+                ? '打开一个非无头浏览器窗口让你手动登录。登录完关掉窗口，cookie/session 自动持久化，之后 agent 直接复用，不用重新登。'
+                : 'Opens a visible browser window for you to log in manually. Close it when done; the agent reuses the session.'}
+            </p>
+
+            <label style={{ fontSize: 12, color: 'var(--hone-muted)', display: 'block', marginBottom: 4 }}>
+              {lang === 'zh' ? 'Profile 名称（例如 xiaohongshu）' : 'Profile name (e.g. xiaohongshu)'}
+            </label>
+            <input
+              type="text"
+              value={loginProfile}
+              onChange={e => setLoginProfile(e.target.value.replace(/[^a-zA-Z0-9_-]/g, ''))}
+              placeholder="xiaohongshu"
+              style={{
+                width: '100%', boxSizing: 'border-box' as const,
+                padding: '8px 12px', fontSize: 13, borderRadius: 6,
+                border: '1px solid var(--hone-border)',
+                background: 'var(--hone-surface)', color: 'var(--hone-text)',
+                outline: 'none', marginBottom: 12, fontFamily: 'monospace',
+              }}
+            />
+
+            <label style={{ fontSize: 12, color: 'var(--hone-muted)', display: 'block', marginBottom: 4 }}>
+              {lang === 'zh' ? '起始网址' : 'Start URL'}
+            </label>
+            <input
+              type="text"
+              value={loginUrl}
+              onChange={e => setLoginUrl(e.target.value)}
+              placeholder="https://xiaohongshu.com"
+              style={{
+                width: '100%', boxSizing: 'border-box' as const,
+                padding: '8px 12px', fontSize: 13, borderRadius: 6,
+                border: '1px solid var(--hone-border)',
+                background: 'var(--hone-surface)', color: 'var(--hone-text)',
+                outline: 'none', marginBottom: 16,
+              }}
+            />
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button
+                onClick={() => setLoginModalOpen(false)}
+                style={{
+                  padding: '7px 16px', fontSize: 13, borderRadius: 6,
+                  background: 'transparent', color: 'var(--hone-text)',
+                  border: '1px solid var(--hone-border)', cursor: 'pointer',
+                }}
+              >
+                {lang === 'zh' ? '取消' : 'Cancel'}
+              </button>
+              <button
+                onClick={() => {
+                  if (!loginProfile.trim()) return;
+                  const ok = send && send({
+                    type: 'browser_open_login',
+                    profile: loginProfile.trim(),
+                    url: loginUrl.trim() || undefined,
+                  });
+                  if (!ok) {
+                    setMessages(prev => [...prev, {
+                      id: 'sys' + Date.now(),
+                      from: 'system',
+                      text: lang === 'zh' ? 'Gateway 离线 — 无法打开浏览器' : 'Gateway offline — cannot open browser',
+                      time: formatTime(),
+                    }]);
+                  }
+                  setLoginModalOpen(false);
+                  setLoginProfile('');
+                  setLoginUrl('');
+                }}
+                disabled={!loginProfile.trim() || !send}
+                style={{
+                  padding: '7px 16px', fontSize: 13, borderRadius: 6,
+                  background: 'var(--hone-accent)', color: '#0C0E12',
+                  border: 'none', cursor: 'pointer', fontWeight: 600,
+                  opacity: loginProfile.trim() && send ? 1 : 0.5,
+                }}
+              >
+                {lang === 'zh' ? '打开浏览器登录' : 'Open Browser'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div style={styles.inputRow}>
         <input

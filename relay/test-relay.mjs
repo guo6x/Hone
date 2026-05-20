@@ -76,11 +76,73 @@ function testRouting() {
   })
 }
 
+// ── Test 3: from field is correctly stamped by relay ──
+function testFromField() {
+  return new Promise((resolve) => {
+    const ROOM3 = 'test-from-' + Date.now()
+    console.log('\n[3] Relay stamps from field (prevents regression)')
+    const timeout = setTimeout(() => { fail('from-field', 'timeout'); gw.close(); resolve() }, 15000)
+
+    const gw = new WebSocket(`${RELAY}/connect/${ROOM3}`)
+    let clientId = null
+
+    gw.onopen = () => send(gw, { type: 'register', role: 'gateway', machineId: 'gw-from', machineName: 'from-test' })
+
+    gw.onmessage = (e) => {
+      const msg = JSON.parse(e.data); log('GW', msg)
+
+      if (msg.type === 'registered') ok('gateway registered for from-test')
+
+      if (msg.type === 'pairing_request') {
+        clientId = msg.clientId
+        send(gw, { type: 'pairing_response', clientId, approved: true })
+      }
+
+      if (msg.type === 'message') {
+        // 3a: Client→Gateway must have from:'client' (relay stamps, prevents spoofing)
+        if (msg.from === 'client') ok('client→gateway has from:"client"')
+        else fail('client→gateway from field', `expected "client", got "${msg.from}"`)
+
+        // Reply back so client can check gateway→client direction
+        send(gw, { type: 'message', target: 'client', clientId: msg.clientId, payload: { text: 'pong' } })
+      }
+    }
+    gw.onerror = () => { fail('from-field', 'gw error'); resolve() }
+
+    // Client
+    setTimeout(() => {
+      const cl = new WebSocket(`${RELAY}/connect/${ROOM3}`)
+      cl.onopen = () => send(cl, { type: 'register', role: 'client', pairingCode: '123456' })
+
+      cl.onmessage = (ce) => {
+        const msg = JSON.parse(ce.data); log('CL', msg)
+
+        if (msg.type === 'registered') {
+          ok('client approved for from-test')
+          // Send a message AND try to spoof from:'gateway' — relay must overwrite it
+          send(cl, { type: 'message', target: 'gateway', from: 'gateway', payload: { text: 'hello' } })
+        }
+
+        if (msg.type === 'message') {
+          // 3b: Gateway→Client must have from:'gateway'
+          if (msg.from === 'gateway') ok('gateway→client has from:"gateway"')
+          else fail('gateway→client from field', `expected "gateway", got "${msg.from}"`)
+
+          clearTimeout(timeout)
+          setTimeout(() => { cl.close(); gw.close(); resolve() }, 200)
+        }
+      }
+      cl.onerror = () => { fail('from-field', 'cl error'); resolve() }
+    }, 300)
+  })
+}
+
 // ── Main ──
 async function main() {
   console.log(`Hone Relay E2E — ${new Date().toISOString()}`)
   await testHealth()
   await testRouting()
+  await testFromField()
   console.log(`\n${'─'.repeat(40)}`)
   console.log(`Results: ${passed} passed, ${failed} failed`)
   process.exit(failed > 0 ? 1 : 0)

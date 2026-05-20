@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "npm run build && npm run build:cli"
   },
   "app": {
     "windows": [
@@ -31,7 +31,8 @@
   "bundle": {
     "active": true,
     "targets": "nsis",
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico"],
+    "resources": ["resources/**/*"]
   },
   "plugins": {}
 }
