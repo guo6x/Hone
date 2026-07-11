@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0C0E12">
+<meta name="description" content="Hone 磨石 — 全功能 AI 编程助手。终端 CLI + 桌面控制台 + 24/7 网关 + 手机端。">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Hone 磨石 — 全功能 AI 编程助手</title>
+<style>
+  :root {
+    --bg: #0C0E12;
+    --bg-2: #0F131A;
+    --surface: #13161C;
+    --surfaceRaised: #1A1E26;
+    --surfaceOverlay: #222733;
+    --border: #252A36;
+    --border-strong: #2F3545;
+    --text: #E4E8F0;
+    --text-2: #A8AEC0;
+    --muted: #6B7285;
+    --accent: #D4A853;
+    --accent-2: #E8C97A;
+    --accent-glow: rgba(212,168,83,0.35);
+    --success: #2ECC80;
+    --danger: #F45858;
+    --radius: 16px;
+    --radius-sm: 10px;
+    --radius-xs: 8px;
+    --maxw: 1140px;
+    --shadow: 0 10px 40px rgba(0,0,0,0.5);
+    --shadow-glow: 0 0 60px var(--accent-glow);
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent); color: var(--bg); }
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-2); }
+  img { max-width: 100%; display: block; }
+
+  .container { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+
+  /* ── Nav ── */
+  nav.top {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(12,14,18,0.82);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-inner {
+    display: flex; align-items: center; justify-content: space-between;
+    height: 60px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; color: var(--text); }
+  .brand-logo {
+    width: 32px; height: 32px; border-radius: 9px;
+    background: linear-gradient(135deg, #D4A853, #A07830);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 16px rgba(212,168,83,0.3);
+  }
+  .brand-logo svg { width: 18px; height: 18px; }
+  .brand-name { letter-spacing: 1px; }
+  .brand-name .en { color: var(--accent); }
+  .nav-links { display: flex; align-items: center; gap: 28px; }
+  .nav-links a { color: var(--text-2); font-size: 14px; font-weight: 500; transition: color .2s; }
+  .nav-links a:hover { color: var(--text); }
+  .nav-cta {
+    padding: 8px 18px; border-radius: var(--radius-xs);
+    background: var(--accent); color: var(--bg) !important; font-weight: 600;
+    transition: transform .2s, box-shadow .2s;
+  }
+  .nav-cta:hover { transform: translateY(-1px); box-shadow: 0 6px 20px var(--accent-glow); }
+  .nav-burger { display: none; background: none; border: none; color: var(--text); cursor: pointer; padding: 8px; }
+  .nav-burger svg { width: 24px; height: 24px; }
+
+  /* ── Hero ── */
+  .hero {
+    position: relative;
+    padding: 100px 0 80px;
+    overflow: hidden;
+  }
+  .hero::before {
+    content: ''; position: absolute; top: -200px; left: 50%; transform: translateX(-50%);
+    width: 900px; height: 600px;
+    background: radial-gradient(ellipse at center, var(--accent-glow), transparent 60%);
+    pointer-events: none; z-index: 0;
+  }
+  .hero-inner { position: relative; z-index: 1; text-align: center; }
+  .hero-badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 14px; border-radius: 100px;
+    background: var(--surface); border: 1px solid var(--border);
+    font-size: 12px; color: var(--text-2); margin-bottom: 28px;
+  }
+  .hero-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); box-shadow: 0 0 8px var(--success); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .hero h1 {
+    font-size: clamp(40px, 7vw, 76px); font-weight: 800; line-height: 1.05;
+    letter-spacing: -1.5px; margin-bottom: 24px;
+  }
+  .hero h1 .gold {
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  }
+  .hero p {
+    font-size: clamp(16px, 2.2vw, 20px); color: var(--text-2);
+    max-width: 620px; margin: 0 auto 40px;
+  }
+  .hero-actions { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 14px 28px; border-radius: var(--radius-sm);
+    font-size: 15px; font-weight: 600; cursor: pointer;
+    transition: transform .2s, box-shadow .2s, background .2s;
+    border: none; outline: none;
+  }
+  .btn-primary {
+    background: linear-gradient(135deg, var(--accent), #B8902F);
+    color: var(--bg);
+    box-shadow: 0 8px 28px var(--accent-glow);
+  }
+  .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 12px 36px var(--accent-glow); color: var(--bg); }
+  .btn-ghost {
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-ghost:hover { background: var(--surfaceRaised); border-color: var(--border-strong); color: var(--text); }
+  .btn svg { width: 18px; height: 18px; }
+
+  .hero-stats {
+    display: flex; gap: 40px; justify-content: center; margin-top: 64px;
+    flex-wrap: wrap;
+  }
+  .hero-stat { text-align: center; }
+  .hero-stat .num { font-size: 32px; font-weight: 800; color: var(--accent); }
+  .hero-stat .lbl { font-size: 13px; color: var(--muted); margin-top: 4px; }
+
+  /* ── Section common ── */
+  section.block { padding: 90px 0; }
+  .section-head { text-align: center; max-width: 700px; margin: 0 auto 56px; }
+  .section-tag {
+    display: inline-block; padding: 4px 12px; border-radius: 100px;
+    background: var(--accent-glow); color: var(--accent);
+    font-size: 12px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+  .section-head h2 {
+    font-size: clamp(28px, 4.5vw, 44px); font-weight: 700; letter-spacing: -.8px;
+    margin-bottom: 16px;
+  }
+  .section-head p { font-size: 16px; color: var(--text-2); }
+
+  /* ── Components grid ── */
+  .comp-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px;
+  }
+  .comp-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 28px 24px;
+    transition: transform .3s, border-color .3s, box-shadow .3s;
+    position: relative; overflow: hidden;
+  }
+  .comp-card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: linear-gradient(90deg, var(--accent), transparent);
+    opacity: 0; transition: opacity .3s;
+  }
+  .comp-card:hover { transform: translateY(-4px); border-color: var(--border-strong); box-shadow: var(--shadow); }
+  .comp-card:hover::before { opacity: 1; }
+  .comp-icon {
+    width: 44px; height: 44px; border-radius: 11px;
+    background: var(--surfaceRaised); display: flex; align-items: center; justify-content: center;
+    margin-bottom: 18px; font-size: 22px;
+  }
+  .comp-card h3 { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+  .comp-card .role { font-size: 12px; color: var(--accent); font-weight: 600; margin-bottom: 10px; font-family: monospace; }
+  .comp-card p { font-size: 13px; color: var(--text-2); line-height: 1.55; }
+
+  /* ── Feature tabs ── */
+  .feat-tabs {
+    display: flex; gap: 8px; justify-content: center; margin-bottom: 36px; flex-wrap: wrap;
+  }
+  .feat-tab {
+    padding: 10px 20px; border-radius: 100px;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text-2); font-size: 14px; font-weight: 500; cursor: pointer;
+    transition: all .2s;
+  }
+  .feat-tab:hover { color: var(--text); border-color: var(--border-strong); }
+  .feat-tab.active {
+    background: var(--accent); color: var(--bg); border-color: var(--accent);
+  }
+  .feat-panel {
+    display: none;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 40px;
+    grid-template-columns: 1fr 1fr; gap: 40px; align-items: center;
+  }
+  .feat-panel.active { display: grid; }
+  .feat-text h3 { font-size: 24px; font-weight: 700; margin-bottom: 14px; }
+  .feat-text p { color: var(--text-2); margin-bottom: 18px; }
+  .feat-text ul { list-style: none; }
+  .feat-text li {
+    padding: 8px 0; padding-left: 28px; position: relative;
+    color: var(--text-2); font-size: 14px;
+  }
+  .feat-text li::before {
+    content: ''; position: absolute; left: 0; top: 13px;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: var(--accent-glow);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23D4A853' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'><polyline points='20 6 9 17 4 12'/></svg>");
+    background-size: 12px; background-repeat: no-repeat; background-position: center;
+  }
+  .feat-visual {
+    background: var(--bg-2); border-radius: var(--radius-sm);
+    border: 1px solid var(--border); padding: 24px;
+    min-height: 280px; display: flex; flex-direction: column; gap: 14px;
+  }
+
+  /* ── Pairing demo ── */
+  .pair-demo {
+    display: grid; grid-template-columns: 1fr auto 1fr; gap: 40px;
+    align-items: center; margin-top: 40px;
+  }
+  .pair-desktop, .pair-phone {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 28px; text-align: center;
+    position: relative;
+  }
+  .pair-desktop h4, .pair-phone h4 { font-size: 14px; color: var(--muted); margin-bottom: 16px; font-weight: 600; }
+  .qr-mock {
+    width: 140px; height: 140px; margin: 0 auto 16px;
+    background: #fff; border-radius: 12px; padding: 10px;
+    display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px;
+  }
+  .qr-mock span { background: #0C0E12; border-radius: 1px; }
+  .qr-mock span.on { background: #0C0E12; }
+  .qr-mock span.off { background: #fff; }
+  .pair-code {
+    font-family: monospace; font-size: 28px; font-weight: 800;
+    color: var(--accent); letter-spacing: 8px; margin-bottom: 8px;
+  }
+  .pair-phone-mock {
+    width: 130px; height: 240px; margin: 0 auto;
+    background: var(--bg-2); border-radius: 18px; border: 3px solid var(--border-strong);
+    padding: 14px 10px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .pair-phone-mock .screen {
+    background: var(--surface); border-radius: 6px; padding: 8px;
+    font-size: 9px; color: var(--text-2); flex: 1;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .pair-phone-mock .msg-in {
+    background: var(--surfaceRaised); padding: 5px 8px; border-radius: 8px;
+    font-size: 9px; align-self: flex-start; max-width: 90%;
+  }
+  .pair-phone-mock .msg-out {
+    background: var(--accent); color: var(--bg); padding: 5px 8px; border-radius: 8px;
+    font-size: 9px; align-self: flex-end; max-width: 90%; font-weight: 600;
+  }
+  .pair-arrow {
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    color: var(--accent);
+  }
+  .pair-arrow svg { width: 40px; height: 40px; }
+  .pair-arrow .lbl { font-size: 11px; color: var(--muted); text-align: center; }
+
+  /* ── Security ── */
+  .sec-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 20px; }
+  .sec-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 28px;
+    transition: border-color .3s;
+  }
+  .sec-card:hover { border-color: var(--accent); }
+  .sec-card .ico {
+    width: 40px; height: 40px; border-radius: 10px;
+    background: var(--accent-glow); display: flex; align-items: center; justify-content: center;
+    margin-bottom: 16px; font-size: 20px;
+  }
+  .sec-card h3 { font-size: 17px; font-weight: 700; margin-bottom: 8px; }
+  .sec-card p { font-size: 13px; color: var(--text-2); }
+
+  /* ── Download ── */
+  .download-box {
+    background: linear-gradient(135deg, var(--surface), var(--bg-2));
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 56px 40px; text-align: center; position: relative; overflow: hidden;
+  }
+  .download-box::before {
+    content: ''; position: absolute; top: -100px; left: 50%; transform: translateX(-50%);
+    width: 500px; height: 300px;
+    background: radial-gradient(ellipse, var(--accent-glow), transparent 70%);
+    pointer-events: none;
+  }
+  .download-box h2 { font-size: clamp(28px, 4vw, 40px); font-weight: 700; margin-bottom: 14px; position: relative; }
+  .download-box p { color: var(--text-2); margin-bottom: 32px; position: relative; font-size: 16px; }
+  .download-actions { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; position: relative; }
+  .download-meta { margin-top: 24px; font-size: 12px; color: var(--muted); position: relative; }
+
+  /* ── Footer ── */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 40px 0; text-align: center;
+  }
+  footer .container { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+  footer .brand { font-size: 16px; }
+  footer .links { display: flex; gap: 24px; font-size: 13px; }
+  footer .links a { color: var(--text-2); }
+  footer .copy { font-size: 12px; color: var(--muted); }
+
+  /* ── Reveal animation ── */
+  .reveal { opacity: 0; transform: translateY(24px); transition: opacity .7s, transform .7s; }
+  .reveal.in { opacity: 1; transform: none; }
+
+  /* ── Mobile ── */
+  @media (max-width: 880px) {
+    .nav-links { display: none; }
+    .nav-links.open {
+      display: flex; flex-direction: column; position: absolute;
+      top: 60px; left: 0; right: 0; background: var(--surface);
+      border-bottom: 1px solid var(--border); padding: 20px 24px; gap: 16px;
+    }
+    .nav-burger { display: block; }
+    .comp-grid { grid-template-columns: 1fr 1fr; }
+    .feat-panel.active { grid-template-columns: 1fr; }
+    .pair-demo { grid-template-columns: 1fr; gap: 24px; }
+    .pair-arrow { transform: rotate(90deg); }
+    .sec-grid { grid-template-columns: 1fr; }
+    .hero { padding: 60px 0 50px; }
+    section.block { padding: 60px 0; }
+    .hero-stats { gap: 28px; }
+  }
+  @media (max-width: 520px) {
+    .comp-grid { grid-template-columns: 1fr; }
+    .feat-panel { padding: 24px; }
+    .download-box { padding: 40px 20px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ── Nav ── -->
+<nav class="top">
+  <div class="container nav-inner">
+    <a href="#" class="brand">
+      <span class="brand-logo">
+        <svg viewBox="0 0 32 32" fill="none"><path d="M6,26 L6,22 L26,22 L26,26 Z" fill="#0C0E12" opacity="0.85"/><path d="M10,10 L22,10 L24,22 L8,22 Z" fill="#0C0E12" opacity="0.4"/><circle cx="19" cy="11" r="1" fill="#0C0E12" opacity="0.7"/></svg>
+      </span>
+      <span class="brand-name">磨石 <span class="en">Hone</span></span>
+    </a>
+    <div class="nav-links" id="navLinks">
+      <a href="#components">架构</a>
+      <a href="#features">特性</a>
+      <a href="#mobile">移动端</a>
+      <a href="#security">安全</a>
+      <a href="https://github.com/guo6x/Hone" target="_blank">GitHub</a>
+      <a href="https://github.com/guo6x/Hone/releases" target="_blank" class="nav-cta">下载</a>
+    </div>
+    <button class="nav-burger" id="navBurger" aria-label="菜单">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+  </div>
+</nav>
+
+<!-- ── Hero ── -->
+<section class="hero">
+  <div class="container hero-inner">
+    <div class="hero-badge">
+      <span class="dot"></span>
+      <span>v0.3.0-alpha · 正在内测</span>
+    </div>
+    <h1>你的 <span class="gold">AI 编程管家</span><br>不止于终端</h1>
+    <p>终端 CLI + 桌面控制台 + 24/7 网关 + 手机端。一套全栈 AI 编程助手，让 AI 真正替你干活。</p>
+    <div class="hero-actions">
+      <a href="https://github.com/guo6x/Hone/releases" target="_blank" class="btn btn-primary">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        下载 Windows 安装包
+      </a>
+      <a href="https://github.com/guo6x/Hone" target="_blank" class="btn btn-ghost">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.9 1.2 1.9 1.2 1 .8 2.7.6 3.3.2.1-.7.4-1.2.7-1.5-2.7-.3-5.5-1.3-5.5-6 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.7-5.5 6 .4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3"/></svg>
+        查看源码
+      </a>
+    </div>
+    <div class="hero-stats">
+      <div class="hero-stat"><div class="num">4</div><div class="lbl">核心组件</div></div>
+      <div class="hero-stat"><div class="num">28MB</div><div class="lbl">安装包大小</div></div>
+      <div class="hero-stat"><div class="num">0</div><div class="lbl">明文密钥</div></div>
+      <div class="hero-stat"><div class="num">∞</div><div class="lbl">手机端设备数</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Components ── -->
+<section class="block" id="components">
+  <div class="container">
+    <div class="section-head reveal">
+      <span class="section-tag">架构</span>
+      <h2>四层一体，各司其职</h2>
+      <p>从终端到云端，从桌面到手机，一套完整的 AI 编程协作体系。</p>
+    </div>
+    <div class="comp-grid reveal">
+      <div class="comp-card">
+        <div class="comp-icon">⌨️</div>
+        <div class="role">src/ → dist/cli.js</div>
+        <h3>CLI 终端</h3>
+        <p>真正的执行层。读写文件、运行命令、编辑代码，所有重活在这里干。单文件打包，开箱即用。</p>
+      </div>
+      <div class="comp-card">
+        <div class="comp-icon">🖥️</div>
+        <div class="role">desktop/ · Tauri</div>
+        <h3>桌面控制台</h3>
+        <p>Tauri + React 桌面应用。对话、工作台、盯盘、日程、可视化、设置，一站式操控中心。</p>
+      </div>
+      <div class="comp-card">
+        <div class="comp-icon">⚙️</div>
+        <div class="role">src/daemon/</div>
+        <h3>Gateway 网关</h3>
+        <p>24/7 后台进程。意图分发、日程调度、设备配对、成本/Token 预算管理，永不下线的大管家。</p>
+      </div>
+      <div class="comp-card">
+        <div class="comp-icon">🌐</div>
+        <div class="role">relay/ · Cloudflare</div>
+        <h3>Relay 中继</h3>
+        <p>Cloudflare Worker 中继层。桥接桌面、网关、手机端，全球边缘节点，低延迟穿透。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Features ── -->
+<section class="block" id="features" style="background: var(--bg-2);">
+  <div class="container">
+    <div class="section-head reveal">
+      <span class="section-tag">特性</span>
+      <h2>2026 年的标准，不是 2025 年</h2>
+      <p>紧跟最新规范，从 Agent Skills 到 MCP 三种传输，从 OS keyring 到移动端 PWA。</p>
+    </div>
+    <div class="feat-tabs reveal">
+      <button class="feat-tab active" data-tab="settings">⚙️ 现代化设置</button>
+      <button class="feat-tab" data-tab="tray">🖥️ 桌面体验</button>
+      <button class="feat-tab" data-tab="proxy">🌐 系统代理</button>
+      <button class="feat-tab" data-tab="skills">📦 Skills 导入</button>
+    </div>
+
+    <div class="feat-panel active" data-panel="settings">
+      <div class="feat-text">
+        <h3>多 Provider + 模型自动拉取</h3>
+        <p>告别单一 API Key 配置。多卡片管理 deepseek / openai / openrouter / custom，一键拉取模型列表。</p>
+        <ul>
+          <li>OpenAI 兼容 <code>/models</code> 端点自动拉取</li>
+          <li>MCP 三种传输：stdio / sse / streamable-http</li>
+          <li>Agent Skills 2026 规范：SKILL.md + YAML</li>
+          <li>旧配置自动迁移，无需手动转换</li>
+        </ul>
+      </div>
+      <div class="feat-visual">
+        <div style="display:flex;gap:8px;align-items:center;padding:10px 14px;background:var(--surfaceRaised);border-radius:8px;">
+          <span style="width:10px;height:10px;border-radius:50%;background:#F45858;"></span>
+          <span style="width:10px;height:10px;border-radius:50%;background:#D4A853;"></span>
+          <span style="width:10px;height:10px;border-radius:50%;background:#2ECC80;"></span>
+          <span style="margin-left:8px;font-size:12px;color:var(--muted);font-family:monospace;">hone-desktop</span>
+        </div>
+        <div style="padding:14px;background:var(--bg);border-radius:8px;border:1px solid var(--border);">
+          <div style="font-size:11px;color:var(--muted);margin-bottom:8px;">提供方卡片</div>
+          <div style="padding:10px;background:var(--surfaceRaised);border-radius:6px;margin-bottom:8px;border-left:3px solid var(--accent);">
+            <div style="font-size:13px;font-weight:600;">DeepSeek <span style="font-size:10px;color:var(--success);">● 默认</span></div>
+            <div style="font-size:11px;color:var(--muted);margin-top:4px;">deepseek-chat · deepseek-v3</div>
+          </div>
+          <div style="padding:10px;background:var(--surface);border-radius:6px;border-left:3px solid var(--border);">
+            <div style="font-size:13px;font-weight:600;">OpenAI</div>
+            <div style="font-size:11px;color:var(--muted);margin-top:4px;">gpt-4o · gpt-4-turbo</div>
+          </div>
+        </div>
+        <div style="padding:10px 14px;background:var(--accent);color:var(--bg);border-radius:8px;font-size:12px;font-weight:600;text-align:center;cursor:pointer;">
+          🔍 拉取模型列表
+        </div>
+      </div>
+    </div>
+
+    <div class="feat-panel" data-panel="tray">
+      <div class="feat-text">
+        <h3>系统托盘 + 开机自启</h3>
+        <p>关闭窗口不退出，Gateway 后台常驻。开机可选自动启动，永远在线等你差遣。</p>
+        <ul>
+          <li>关闭主窗口 → 最小化到系统托盘</li>
+          <li>托盘菜单：Show / Quit 双选项</li>
+          <li>开机自启 + Gateway 自启双开关</li>
+          <li>内置 PTY 终端，工作台集成 xterm</li>
+          <li>执行日志可查，所有任务留痕</li>
+        </ul>
+      </div>
+      <div class="feat-visual">
+        <div style="display:flex;flex-direction:column;gap:10px;">
+          <div style="padding:12px;background:var(--surfaceRaised);border-radius:8px;display:flex;align-items:center;gap:10px;">
+            <span style="font-size:18px;">📌</span>
+            <div>
+              <div style="font-size:12px;font-weight:600;">Hone — 已最小化</div>
+              <div style="font-size:10px;color:var(--success);">● Gateway 运行中 · 2h 15m</div>
+            </div>
+          </div>
+          <div style="padding:10px;background:var(--bg);border-radius:8px;border:1px solid var(--border);font-family:monospace;font-size:11px;color:var(--text-2);">
+            <div style="color:var(--success);">$ git status</div>
+            <div>On branch main · nothing to commit</div>
+            <div style="color:var(--accent);margin-top:6px;">$ _</div>
+          </div>
+          <div style="padding:8px 12px;background:var(--surface);border-radius:6px;font-size:11px;color:var(--muted);display:flex;justify-content:space-between;">
+            <span>开机自启</span>
+            <span style="color:var(--success);font-weight:600;">已开启</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="feat-panel" data-panel="proxy">
+      <div class="feat-text">
+        <h3>Windows 系统代理透传</h3>
+        <p>自动读取注册表系统代理，注入到所有子进程。你配了一次系统代理，Gateway 和 CLI 都自动走。</p>
+        <ul>
+          <li>读取 <code>HKCU\...\Internet Settings</code> 代理设置</li>
+          <li>自动注入 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY</li>
+          <li>NO_PROXY 自动包含 localhost / 127.0.0.1</li>
+          <li>用户已设环境变量则不覆盖</li>
+        </ul>
+      </div>
+      <div class="feat-visual">
+        <div style="font-family:monospace;font-size:11px;line-height:1.8;">
+          <div style="color:var(--muted);"># 注册表读取</div>
+          <div style="color:var(--text-2);">ProxyEnable: <span style="color:var(--success);">0x1</span></div>
+          <div style="color:var(--text-2);">ProxyServer: <span style="color:var(--accent);">127.0.0.1:7890</span></div>
+          <div style="color:var(--muted);margin-top:10px;"># 注入子进程</div>
+          <div style="color:var(--text-2);">HTTP_PROXY=<span style="color:var(--accent);">http://127.0.0.1:7890</span></div>
+          <div style="color:var(--text-2);">HTTPS_PROXY=<span style="color:var(--accent);">http://127.0.0.1:7890</span></div>
+          <div style="color:var(--text-2);">NO_PROXY=<span style="color:var(--accent);">localhost,127.0.0.1</span></div>
+          <div style="color:var(--success);margin-top:10px;">✓ 所有子进程自动走代理</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="feat-panel" data-panel="skills">
+      <div class="feat-text">
+        <h3>扫描本地文件夹批量导入</h3>
+        <p>你的 Skills 散落在各处？选个文件夹，自动扫描所有 SKILL.md 并导入。支持 2026 Agent Skills 开放规范。</p>
+        <ul>
+          <li>SKILL.md + YAML frontmatter + Markdown 指令</li>
+          <li>🔍 扫描默认路径（.codex / .claude / .trae-cn）</li>
+          <li>📁 自选文件夹扫描，任意位置都行</li>
+          <li>名称校验：小写字母+数字+连字符</li>
+          <li>支持许可证、兼容性、允许工具声明</li>
+        </ul>
+      </div>
+      <div class="feat-visual">
+        <div style="display:flex;gap:8px;margin-bottom:12px;">
+          <div style="flex:1;padding:10px;background:var(--accent);color:var(--bg);border-radius:6px;font-size:11px;font-weight:600;text-align:center;">🔍 扫描默认路径</div>
+          <div style="flex:1;padding:10px;background:var(--surfaceRaised);border-radius:6px;font-size:11px;text-align:center;border:1px solid var(--border);">📁 选择文件夹</div>
+        </div>
+        <div style="padding:12px;background:var(--bg);border-radius:8px;border:1px solid var(--border);">
+          <div style="font-size:11px;color:var(--success);margin-bottom:8px;">✓ 导入了 3 个技能</div>
+          <div style="padding:6px 8px;background:var(--surface);border-radius:4px;margin-bottom:4px;font-family:monospace;font-size:11px;">/code-review</div>
+          <div style="padding:6px 8px;background:var(--surface);border-radius:4px;margin-bottom:4px;font-family:monospace;font-size:11px;">/weekly-report</div>
+          <div style="padding:6px 8px;background:var(--surface);border-radius:4px;font-family:monospace;font-size:11px;">/deploy</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Mobile pairing ── -->
+<section class="block" id="mobile">
+  <div class="container">
+    <div class="section-head reveal">
+      <span class="section-tag">移动端</span>
+      <h2>手机扫码，远程操控</h2>
+      <p>扫一下二维码，手机变身高能遥控器。发消息、批操作、看进度、管日程，全在掌中。</p>
+    </div>
+
+    <div class="pair-demo reveal">
+      <div class="pair-desktop">
+        <h4>桌面端 · 设置 → 移动端</h4>
+        <div class="qr-mock" id="qrMock"></div>
+        <div class="pair-code">739284</div>
+        <div style="font-size:11px;color:var(--muted);">6 位配对码（一次性）</div>
+      </div>
+
+      <div class="pair-arrow">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+        <div class="lbl">扫码<br>配对</div>
+      </div>
+
+      <div class="pair-phone">
+        <h4>手机端 · PWA</h4>
+        <div class="pair-phone-mock">
+          <div class="screen">
+            <div class="msg-in">已连接到 My-PC</div>
+            <div class="msg-out">git status 看看</div>
+            <div class="msg-in">On branch main, nothing to commit</div>
+            <div class="msg-out">批准网页操作 ✓</div>
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--success);margin-top:10px;">● 已连接</div>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:60px;" class="reveal">
+      <div style="text-align:center;padding:20px;">
+        <div style="font-size:28px;margin-bottom:8px;">💬</div>
+        <div style="font-size:13px;font-weight:600;">远程对话</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">发消息执行编程任务</div>
+      </div>
+      <div style="text-align:center;padding:20px;">
+        <div style="font-size:28px;margin-bottom:8px;">✅</div>
+        <div style="font-size:13px;font-weight:600;">操作确认</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">批准/拒绝危险操作</div>
+      </div>
+      <div style="text-align:center;padding:20px;">
+        <div style="font-size:28px;margin-bottom:8px;">📊</div>
+        <div style="font-size:13px;font-weight:600;">任务进度</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">实时推送状态变化</div>
+      </div>
+      <div style="text-align:center;padding:20px;">
+        <div style="font-size:28px;margin-bottom:8px;">📅</div>
+        <div style="font-size:13px;font-weight:600;">日程管理</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">自然语言创建日程</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Security ── -->
+<section class="block" id="security" style="background: var(--bg-2);">
+  <div class="container">
+    <div class="section-head reveal">
+      <span class="section-tag">安全</span>
+      <h2>密钥永不裸奔</h2>
+      <p>所有敏感信息走 OS 凭据存储，绝不写入明文 JSON。配对码一次性，Relay 只存派生证明。</p>
+    </div>
+    <div class="sec-grid reveal">
+      <div class="sec-card">
+        <div class="ico">🔐</div>
+        <h3>OS 凭据存储</h3>
+        <p>API Key、Relay Token、配对码全部通过系统 keyring 保存（Windows Credential Manager / macOS Keychain）。gateway-config.json 里看不到任何密钥。</p>
+      </div>
+      <div class="sec-card">
+        <div class="ico">🔑</div>
+        <h3>一次性配对码</h3>
+        <p>6 位数字配对码，配对成功后立即清空。Relay 只保存 SHA-256 派生证明，无法反推原码。设备凭据独立持久化。</p>
+      </div>
+      <div class="sec-card">
+        <div class="ico">🚫</div>
+        <h3>设备撤销</h3>
+        <p>桌面端可随时踢掉已配对设备，被撤销设备立即断连并清除凭据。重新连接必须重新扫码配对。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Download ── -->
+<section class="block" id="download">
+  <div class="container">
+    <div class="download-box reveal">
+      <h2>开始使用 Hone</h2>
+      <p>下载 Windows 安装包，28MB 装好即用。内置 CLI 和 Node 运行时，无需额外依赖。</p>
+      <div class="download-actions">
+        <a href="https://github.com/guo6x/Hone/releases" target="_blank" class="btn btn-primary">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          下载 Windows 安装包
+        </a>
+        <a href="https://github.com/guo6x/Hone" target="_blank" class="btn btn-ghost">查看源码</a>
+      </div>
+      <div class="download-meta">
+        v0.3.0-alpha · 28MB · user 权限安装（无 UAC）· 默认装到 LOCALAPPDATA，可改 D 盘
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Footer ── -->
+<footer>
+  <div class="container">
+    <a href="#" class="brand">
+      <span class="brand-logo">
+        <svg viewBox="0 0 32 32" fill="none"><path d="M6,26 L6,22 L26,22 L26,26 Z" fill="#0C0E12" opacity="0.85"/><path d="M10,10 L22,10 L24,22 L8,22 Z" fill="#0C0E12" opacity="0.4"/><circle cx="19" cy="11" r="1" fill="#0C0E12" opacity="0.7"/></svg>
+      </span>
+      <span class="brand-name">磨石 <span class="en">Hone</span></span>
+    </a>
+    <div class="links">
+      <a href="https://github.com/guo6x/Hone" target="_blank">GitHub</a>
+      <a href="https://github.com/guo6x/Hone/releases" target="_blank">下载</a>
+      <a href="https://github.com/guo6x/Hone/issues" target="_blank">问题反馈</a>
+      <a href="https://github.com/guo6x/Hone/blob/main/USAGE.md" target="_blank">使用文档</a>
+    </div>
+    <div class="copy">© 2026 Hone · v0.3.0-alpha · MIT License</div>
+  </div>
+</footer>
+
+<script>
+  // ── Mobile nav ──
+  document.getElementById('navBurger').addEventListener('click', function() {
+    document.getElementById('navLinks').classList.toggle('open');
+  });
+  document.querySelectorAll('#navLinks a').forEach(function(a) {
+    a.addEventListener('click', function() {
+      document.getElementById('navLinks').classList.remove('open');
+    });
+  });
+
+  // ── Feature tabs ──
+  document.querySelectorAll('.feat-tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      var target = tab.dataset.tab;
+      document.querySelectorAll('.feat-tab').forEach(function(t) { t.classList.remove('active'); });
+      document.querySelectorAll('.feat-panel').forEach(function(p) { p.classList.remove('active'); });
+      tab.classList.add('active');
+      document.querySelector('.feat-panel[data-panel="' + target + '"]').classList.add('active');
+    });
+  });
+
+  // ── QR mock (random pattern) ──
+  (function() {
+    var qr = document.getElementById('qrMock');
+    if (!qr) return;
+    // 固定种子，让图案稳定
+    var seed = 739284;
+    function rng() { seed = (seed * 9301 + 49297) % 233280; return seed / 233280; }
+    for (var i = 0; i < 64; i++) {
+      var s = document.createElement('span');
+      // 留出三个角的定位方块
+      var row = Math.floor(i / 8), col = i % 8;
+      var isCorner = (row < 2 && col < 2) || (row < 2 && col > 5) || (row > 5 && col < 2);
+      s.className = (isCorner || rng() > 0.5) ? 'on' : 'off';
+      qr.appendChild(s);
+    }
+  })();
+
+  // ── Reveal on scroll ──
+  var observer = new IntersectionObserver(function(entries) {
+    entries.forEach(function(e) {
+      if (e.isIntersecting) {
+        e.target.classList.add('in');
+        observer.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+  document.querySelectorAll('.reveal').forEach(function(el) { observer.observe(el); });
+
+  // ── Smooth scroll for anchor links ──
+  document.querySelectorAll('a[href^="#"]').forEach(function(a) {
+    a.addEventListener('click', function(e) {
+      var id = a.getAttribute('href');
+      if (id.length > 1) {
+        var el = document.querySelector(id);
+        if (el) { e.preventDefault(); el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+      }
+    });
+  });
+</script>
+
+</body>
+</html>
