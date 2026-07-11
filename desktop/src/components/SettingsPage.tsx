@@ -1,43 +1,36 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { LANG, type Lang } from '../i18n/translations';
-import { type SettingsData, type SkillInfo, type McpInfo } from '../data/mock';
+import { type SettingsData, type SkillInfo, type McpInfo, type ProviderProfile, type SkillConfig, type McpServer } from '../data/mock';
 import { type ThemeName } from '../hooks/useTheme';
 import { isTauri } from '../tauri/useTauri';
+import { clearUserData, syncMcps, syncSkills, syncMcpsV2, syncSkillsV2 } from '../tauri/api';
+import { ProviderSection } from './settings/ProviderSection';
+import { SkillSection } from './settings/SkillSection';
+import { McpSection } from './settings/McpSection';
+import { MobileAccessSection } from './settings/MobileAccessSection';
+import type { GatewayConnectionInfo } from '../tauri/types';
 
-type Section = 'provider' | 'gateway' | 'data' | 'skills' | 'buddy' | 'mcp' | 'browser' | 'appearance' | 'about';
+type Section = 'provider' | 'gateway' | 'mobile' | 'data' | 'skills' | 'buddy' | 'mcp' | 'browser' | 'appearance' | 'about';
 
-const navItems: { key: Section; zh: string; en: string }[] = [
-  { key: 'provider', zh: '提供方', en: 'Provider' },
-  { key: 'gateway', zh: '网关', en: 'Gateway' },
-  { key: 'data', zh: '数据', en: 'Data' },
+interface NavEntry {
+  key: Section;
+  zh: string;
+  en: string;
+  group?: string; // 分组标题
+}
+
+const navItems: NavEntry[] = [
+  { key: 'provider', zh: '提供方', en: 'AI Providers', group: 'AI' },
   { key: 'skills', zh: '技能', en: 'Skills' },
-  { key: 'buddy', zh: '智能伙伴', en: 'AI Buddy' },
+  { key: 'gateway', zh: '网关', en: 'Gateway', group: '连接' },
+  { key: 'mobile', zh: '移动端', en: 'Mobile' },
   { key: 'mcp', zh: 'MCP', en: 'MCP Servers' },
   { key: 'browser', zh: '浏览器', en: 'Browser' },
+  { key: 'buddy', zh: '智能伙伴', en: 'AI Buddy' },
+  { key: 'data', zh: '数据', en: 'Data', group: '系统' },
   { key: 'appearance', zh: '外观', en: 'Appearance' },
   { key: 'about', zh: '关于', en: 'About' },
 ];
-
-// Internal provider keys match those expected by Rust gateway_manager.rs.
-const providers = [
-  { key: 'deepseek', label: 'DeepSeek' },
-  { key: 'openai', label: 'OpenAI' },
-  { key: 'custom', label: 'Custom (OpenAI 兼容)' },
-] as const;
-
-// Suggested model names per provider — shown as quick-pick chips, but the
-// model field stays a free-text input so any model name is accepted.
-const MODEL_PRESETS: Record<string, string[]> = {
-  deepseek: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v3', 'deepseek-v4-pro'],
-  openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'o1-mini', 'o3-mini'],
-  custom: ['llama-3.3-70b', 'qwen2.5-72b', 'glm-4-plus', 'kimi-k2'],
-};
-
-const DEFAULT_BASE_URLS: Record<string, string> = {
-  deepseek: 'https://api.deepseek.com',
-  openai: 'https://api.openai.com',
-  custom: '',
-};
 
 const themes: { key: ThemeName; zh: string; en: string; colors: [string, string, string] }[] = [
   { key: 'dark', zh: '暗夜黑', en: 'Dark', colors: ['#1a1a2e', '#16213e', '#0f3460'] },
@@ -46,13 +39,15 @@ const themes: { key: ThemeName; zh: string; en: string; colors: [string, string,
   { key: 'midnight', zh: '深蓝夜', en: 'Midnight', colors: ['#0d1117', '#161b22', '#1f6feb'] },
 ];
 
-export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hydrated = false }: {
+export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hydrated = false, mobileConnection, onRotateMobilePairing }: {
   settings: SettingsData;
   setSettings: (s: SettingsData) => void;
   lang: Lang;
   theme: ThemeName;
   setTheme: (t: ThemeName) => void;
   hydrated?: boolean;
+  mobileConnection: GatewayConnectionInfo | null;
+  onRotateMobilePairing: () => Promise<GatewayConnectionInfo | null>;
 }) {
   const [section, setSection] = useState<Section>('provider');
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
@@ -96,6 +91,76 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
       const saved = localStorage.getItem('hone-mcps');
       return saved ? JSON.parse(saved) : [];
     } catch { return []; }
+  });
+
+  // 2026 modernized state
+  const [providerProfiles, setProviderProfiles] = useState<ProviderProfile[]>(() => {
+    try {
+      const saved = localStorage.getItem('hone-providers');
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    // 迁移旧的单 provider 配置
+    if (settings.apiKey || settings.provider) {
+      return [{
+        id: 'legacy-default',
+        name: settings.customProviderName || settings.provider || 'Default',
+        kind: (settings.provider as ProviderProfile['kind']) || 'deepseek',
+        apiKey: settings.apiKey || '',
+        baseUrl: settings.baseUrl || '',
+        model: settings.model || '',
+        temperature: settings.temperature ? parseFloat(settings.temperature) : undefined,
+        maxTokens: settings.maxTokens ? parseInt(settings.maxTokens) : undefined,
+        enabled: true,
+        isDefault: true,
+      }];
+    }
+    return [];
+  });
+  const [skillsV2, setSkillsV2] = useState<SkillConfig[]>(() => {
+    try {
+      const saved = localStorage.getItem('hone-skills-v2');
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    // 迁移旧 skills
+    try {
+      const oldSkills = localStorage.getItem('hone-skills');
+      if (oldSkills) {
+        const parsed: SkillInfo[] = JSON.parse(oldSkills);
+        return parsed.map(s => ({
+          id: s.id || `skill_${Date.now()}_${Math.random()}`,
+          name: s.name || 'unnamed',
+          description: s.desc || s.descEn || '',
+          instructions: `# ${s.name}\n\n${s.desc || s.descEn || ''}\n\n## Instructions\n当用户提到触发词「${s.trigger || s.name}」时，执行此技能。`,
+          allowedTools: [],
+          enabled: s.enabled,
+          trigger: s.trigger,
+        }));
+      }
+    } catch {}
+    return [];
+  });
+  const [mcpsV2, setMcpsV2] = useState<McpServer[]>(() => {
+    try {
+      const saved = localStorage.getItem('hone-mcps-v2');
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    // 迁移旧 mcps
+    try {
+      const oldMcps = localStorage.getItem('hone-mcps');
+      if (oldMcps) {
+        const parsed: McpInfo[] = JSON.parse(oldMcps);
+        return parsed.map(m => ({
+          id: m.id || `mcp_${Date.now()}_${Math.random()}`,
+          name: m.name,
+          transport: 'sse' as const,
+          url: m.url,
+          enabled: true,
+          status: m.status || 'disconnected',
+          tools: m.tools,
+        }));
+      }
+    } catch {}
+    return [];
   });
 
   const [isLocalHydrated, setIsLocalHydrated] = useState(false);
@@ -144,29 +209,94 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
     }
   }, [settings?.workspaceDir, settings?.relayUrl, settings?.localPort, settings?.gatewayAutoStart, isLocalHydrated]);
 
-  // Persist skills to localStorage
+  // Persist skills to localStorage + sync to ~/.claude/skills/
   const updateSkills = useCallback((next: SkillInfo[]) => {
     setSkills(next);
     try { localStorage.setItem('hone-skills', JSON.stringify(next)); } catch {}
+    if (isTauri()) {
+      syncSkills(next.map(skill => ({
+        name: skill.name,
+        desc: skill.desc || '',
+        descEn: skill.descEn || '',
+        trigger: skill.trigger || skill.name,
+        enabled: Boolean(skill.enabled),
+      }))).catch((e) => {
+        console.warn('Skill sync failed:', e);
+      });
+    }
   }, []);
 
-  // Persist mcps to localStorage
+  // Persist mcps to localStorage + sync to ~/.claude/.mcp.json
   const updateMcps = useCallback((next: McpInfo[]) => {
     setMcps(next);
     try { localStorage.setItem('hone-mcps', JSON.stringify(next)); } catch {}
+    if (isTauri()) {
+      syncMcps(next.map(mcp => ({
+        name: mcp.name,
+        url: mcp.url || '',
+      }))).catch((e) => {
+        console.warn('MCP sync failed:', e);
+      });
+    }
+  }, []);
+
+  // 2026 v2 update callbacks
+  const updateProviders = useCallback((next: ProviderProfile[]) => {
+    setProviderProfiles(next);
+    try { localStorage.setItem('hone-providers', JSON.stringify(next)); } catch {}
+    // 同步默认 provider 到旧字段（兼容 GatewayConfig）
+    const def = next.find(p => p.isDefault && p.enabled);
+    if (def) {
+      setProvider(def.kind);
+      setApiKeyDraft(def.apiKey);
+      setModel(def.model);
+      setBaseUrl(def.baseUrl);
+      setCustomProviderName(def.name);
+      setTemperature(def.temperature?.toString() || '');
+      setMaxTokens(def.maxTokens?.toString() || '');
+    }
+  }, []);
+
+  const updateSkillsV2 = useCallback((next: SkillConfig[]) => {
+    setSkillsV2(next);
+    try { localStorage.setItem('hone-skills-v2', JSON.stringify(next)); } catch {}
+    if (isTauri()) {
+      syncSkillsV2(next.map(s => ({
+        id: s.id,
+        name: s.name,
+        description: s.description,
+        license: s.license,
+        compatibility: s.compatibility,
+        metadata: s.metadata,
+        allowedTools: s.allowedTools,
+        instructions: s.instructions,
+        enabled: s.enabled,
+      }))).catch((e) => console.warn('Skill v2 sync failed:', e));
+    }
+  }, []);
+
+  const updateMcpsV2 = useCallback((next: McpServer[]) => {
+    setMcpsV2(next);
+    try { localStorage.setItem('hone-mcps-v2', JSON.stringify(next)); } catch {}
+    if (isTauri()) {
+      syncMcpsV2(next.map(m => ({
+        id: m.id,
+        name: m.name,
+        transport: m.transport,
+        command: m.command,
+        args: m.args,
+        env: m.env,
+        url: m.url,
+        headers: m.headers,
+        enabled: m.enabled,
+      }))).catch((e) => console.warn('MCP v2 sync failed:', e));
+    }
   }, []);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState('0.3.0-alpha');
   const [saved, setSaved] = useState(false);
-  // 创建表单状态
-  const [showSkillForm, setShowSkillForm] = useState(false);
-  const [newSkillName, setNewSkillName] = useState('');
-  const [newSkillDesc, setNewSkillDesc] = useState('');
-  const [newSkillTrigger, setNewSkillTrigger] = useState('');
-  const [showMcpForm, setShowMcpForm] = useState(false);
-  const [newMcpName, setNewMcpName] = useState('');
-  const [newMcpUrl, setNewMcpUrl] = useState('');
-  const saveTimer = React.useRef<ReturnType<typeof setTimeout>>();
+  const saveTimer = useRef<ReturnType<typeof setTimeout>>();
 
   // 自动保存：任一字段变更后延迟 600ms 同步到父状态
   const autoSave = useCallback(() => {
@@ -194,70 +324,54 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
         browserHeadless,
         browserMaxSteps,
         buddySpecies,
+        providers: providerProfiles,
       } as any);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     }, 600);
-  }, [provider, apiKeyDraft, model, baseUrl, customProviderName, temperature, maxTokens, autoStart, relayUrl, localPort, workspace, logRetention, browserEnabled, guiModelUrl, guiModelName, guiModelKey, browserHeadless, browserMaxSteps, buddySpecies, setSettings, isLocalHydrated]);
+  }, [provider, apiKeyDraft, model, baseUrl, customProviderName, temperature, maxTokens, autoStart, relayUrl, localPort, workspace, logRetention, browserEnabled, guiModelUrl, guiModelName, guiModelKey, browserHeadless, browserMaxSteps, buddySpecies, providerProfiles, setSettings, isLocalHydrated]);
 
   useEffect(() => { autoSave(); }, [autoSave]);
 
+  // Clear pending save timer on unmount to avoid state updates after teardown.
+  useEffect(() => () => { if (saveTimer.current) clearTimeout(saveTimer.current); }, []);
+
+  // Fetch real app version from Tauri on mount
+  useEffect(() => {
+    if (isTauri()) {
+      import('@tauri-apps/api/app').then(({ getVersion }) => {
+        getVersion().then(v => setAppVersion(v)).catch(() => {});
+      }).catch(() => {});
+    }
+  }, []);
+
   const t = (zh: string, en: string) => (lang === 'zh' ? zh : en);
 
-  const doTestConnection = async () => {
-    setTesting(true);
-    setTestResult(null);
-
-    if (!isTauri()) {
-      setTesting(false);
-      setTestResult({
-        ok: false,
-        text: t('浏览器模式下无法测试 — 请使用桌面端。', 'Browser mode cannot test — use desktop app.'),
-      });
-      return;
-    }
-
-    try {
-      const { testProvider } = await import('../tauri/api');
-      const result = await testProvider({
-        provider,
-        apiKey: apiKeyDraft,
-        baseUrl: baseUrl || DEFAULT_BASE_URLS[provider] || '',
-        model,
-      });
-      setTestResult({ ok: true, text: result });
-    } catch (e: any) {
-      setTestResult({
-        ok: false,
-        text: `${t('连接失败', 'Failed')}: ${e?.message ?? String(e)}`,
-      });
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  const handleCheckUpdate = () => {
+  const handleCheckUpdate = async () => {
     setCheckingUpdate(true);
     setUpdateStatus(null);
-    // Version check: compare current version against the latest release.
-    // When a release feed is available, fetch it here.
-    setTimeout(() => {
-      setCheckingUpdate(false);
+    try {
+      await new Promise(resolve => setTimeout(resolve, 150));
       setUpdateStatus(t(
-        '✓ 当前版本 v0.3.0-alpha。更新检查功能即将上线。',
-        '✓ v0.3.0-alpha. Update check coming soon.',
+        `当前版本 v${appVersion}。尚未配置官方更新源，请以发布页或安装包为准。`,
+        `Current version v${appVersion}. No official update feed is configured yet; use the release page or installer as source of truth.`,
       ));
-      setTimeout(() => setUpdateStatus(null), 4000);
-    }, 600);
+    } catch {
+      setUpdateStatus(t(`当前版本 v${appVersion}`, `Current version v${appVersion}`));
+    } finally {
+      setCheckingUpdate(false);
+      setTimeout(() => setUpdateStatus(null), 5000);
+    }
   };
 
-  const handleClearData = () => {
+  const handleClearData = async () => {
+    // 1. Clear frontend state
     setSettings({
-      provider: 'DeepSeek',
+      provider: 'deepseek',
       apiKey: '',
-      model: 'deepseek-v3',
+      model: 'deepseek-chat',
       gatewayAutoStart: false,
-      relayUrl: '',
+      relayUrl: 'wss://hone-relay.marsailleippi79.workers.dev/connect/default',
       localPort: '18789',
       workspaceDir: '',
       logRetention: '30',
@@ -265,24 +379,56 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
       guiModelUrl: '',
       browserHeadless: true,
       browserMaxSteps: '15',
+      customProviderName: '',
+      temperature: '',
+      maxTokens: '',
+      guiModelName: '',
+      guiModelKey: '',
+      buddySpecies: 'robot',
     });
     setApiKeyDraft('');
     setRelayUrl('');
     setLocalPort('18789');
     setWorkspace('');
-    setModel('deepseek-v3');
-    setProvider('DeepSeek');
+    setModel('deepseek-chat');
+    setProvider('deepseek');
     setLogRetention('30');
     setAutoStart(false);
     setBrowserEnabled(false);
     setGuiModelUrl('');
     setBrowserHeadless(true);
     setBrowserMaxSteps('15');
+    setCustomProviderName('');
+    setTemperature('');
+    setMaxTokens('');
+    setGuiModelName('');
+    setGuiModelKey('');
+    setBuddySpecies('robot');
     setSkills([]);
+    setSkillsV2([]);
     setMcps([]);
+    setMcpsV2([]);
+    setProviderProfiles([]);
     try { localStorage.removeItem('hone-skills'); } catch {}
+    try { localStorage.removeItem('hone-skills-v2'); } catch {}
     try { localStorage.removeItem('hone-mcps'); } catch {}
+    try { localStorage.removeItem('hone-mcps-v2'); } catch {}
+    try { localStorage.removeItem('hone-providers'); } catch {}
     try { localStorage.removeItem('hone-settings-extra'); } catch {}
+
+    // 2. Clear backend data in ~/.hone/
+    if (isTauri()) {
+      try {
+        await clearUserData();
+        await syncSkills([]);
+        await syncMcps([]);
+        await syncSkillsV2([]);
+        await syncMcpsV2([]);
+      } catch (e) {
+        console.warn('Clear data (Tauri):', e);
+      }
+    }
+
     setShowDanger(false);
     setConfirmClear(false);
   };
@@ -364,159 +510,34 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
     },
   };
 
-  const renderNav = () => (
-    <div style={s.nav}>
-      {navItems.map((item) => (
-        <div key={item.key} style={s.navItem(section === item.key)} onClick={() => setSection(item.key)}>
-          <div style={s.navDot(section === item.key)} />
-          {item[lang === 'zh' ? 'zh' : 'en']}
-        </div>
-      ))}
-    </div>
-  );
-
-  const renderProvider = () => {
-    const presets = MODEL_PRESETS[provider] || [];
-    const baseUrlPlaceholder = DEFAULT_BASE_URLS[provider] || 'https://your-endpoint.com';
+  const renderNav = () => {
+    let lastGroup = '';
     return (
-      <div style={s.section}>
-        <h2 style={s.title}>{t('选择提供商', 'Choose Provider')}</h2>
-        <p style={s.desc}>{t('选择 AI 模型提供商并配置 API 密钥', 'Select an AI model provider and configure your API key.')}</p>
-        <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
-          {providers.map((p) => (
-            <button
-              key={p.key}
-              style={{
-                ...s.btn,
-                flex: 1,
-                background: provider === p.key ? 'var(--hone-surfaceRaised)' : 'var(--hone-surface)',
-                borderColor: provider === p.key ? 'var(--hone-accent)' : 'var(--hone-border)',
-              }}
-              onClick={() => setProvider(p.key)}
-            >
-              {p.label}
-            </button>
-          ))}
-        </div>
-
-        {provider === 'custom' && (
-          <>
-            <label style={s.label}>{t('提供商显示名', 'Provider Display Name')}</label>
-            <input
-              style={{ ...s.input, marginBottom: 16 }}
-              value={customProviderName}
-              onChange={(e) => setCustomProviderName(e.target.value)}
-              placeholder="Custom"
-            />
-          </>
-        )}
-
-        <label style={s.label}>{t('API Key', 'API Key')}</label>
-        <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-          <input
-            type={apiKeyVisible ? 'text' : 'password'}
-            style={s.input}
-            value={apiKeyDraft}
-            onChange={(e) => setApiKeyDraft(e.target.value)}
-            placeholder="sk-..."
-          />
-          <button style={s.btn} onClick={() => setApiKeyVisible(!apiKeyVisible)}>
-            {apiKeyVisible ? t('隐藏', 'Hide') : t('显示', 'Show')}
-          </button>
-        </div>
-
-        <label style={s.label}>{t('Base URL (OpenAI 兼容)', 'Base URL (OpenAI compatible)')}</label>
-        <input
-          style={{ ...s.input, marginBottom: 4 }}
-          value={baseUrl}
-          onChange={(e) => setBaseUrl(e.target.value)}
-          placeholder={baseUrlPlaceholder}
-        />
-        <p style={{ fontSize: 12, color: 'var(--hone-muted)', marginTop: 0, marginBottom: 16 }}>
-          {t('留空使用默认。代理 / 中转 API / 第三方网关都填这里。', 'Leave empty for provider default. Use this for proxies, relays, or third-party gateways.')}
-        </p>
-
-        <label style={s.label}>{t('模型名', 'Model Name')}</label>
-        <input
-          style={{ ...s.input, marginBottom: 8 }}
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          placeholder={presets[0] || 'model-name'}
-        />
-        {presets.length > 0 && (
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 16 }}>
-            {presets.map((m) => (
-              <button
-                key={m}
-                style={{
-                  ...s.btn,
-                  padding: '4px 10px', fontSize: 11,
-                  borderColor: model === m ? 'var(--hone-accent)' : 'var(--hone-border)',
-                  color: model === m ? 'var(--hone-accent)' : 'var(--hone-muted)',
-                }}
-                onClick={() => setModel(m)}
-              >
-                {m}
-              </button>
-            ))}
-          </div>
-        )}
-
-        <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
-          <div style={{ flex: 1 }}>
-            <label style={s.label}>{t('温度', 'Temperature')}</label>
-            <input
-              type="number"
-              step="0.1"
-              min="0"
-              max="2"
-              style={s.input}
-              value={temperature}
-              onChange={(e) => setTemperature(e.target.value)}
-              placeholder="0.7"
-            />
-            <p style={{ fontSize: 11, color: 'var(--hone-muted)', marginTop: 4 }}>
-              {t('0-2，越高越发散。留空用默认。', '0–2, higher = more random. Empty = default.')}
-            </p>
-          </div>
-          <div style={{ flex: 1 }}>
-            <label style={s.label}>{t('最大输出 tokens', 'Max Output Tokens')}</label>
-            <input
-              type="number"
-              step="128"
-              min="0"
-              max="32768"
-              style={s.input}
-              value={maxTokens}
-              onChange={(e) => setMaxTokens(e.target.value)}
-              placeholder="4096"
-            />
-            <p style={{ fontSize: 11, color: 'var(--hone-muted)', marginTop: 4 }}>
-              {t('每次回复最多生成多少 token。留空用默认。', 'Cap per reply. Empty = default.')}
-            </p>
-          </div>
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-          <button
-            style={{ ...s.btnAccent, opacity: testing ? 0.6 : 1 }}
-            disabled={testing}
-            onClick={doTestConnection}
-          >
-            {testing ? t('测试中...', 'Testing...') : t('🔌 测试连接', '🔌 Test Connection')}
-          </button>
-          {testResult && (
-            <span style={{
-              fontSize: 13,
-              color: testResult.ok ? 'var(--hone-success)' : 'var(--hone-danger)',
-            }}>
-              {testResult.text}
-            </span>
-          )}
-        </div>
+      <div style={s.nav}>
+        {navItems.map((item) => {
+          const showGroup = item.group && item.group !== lastGroup;
+          if (item.group) lastGroup = item.group;
+          return (
+            <React.Fragment key={item.key}>
+              {showGroup && (
+                <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--hone-muted)', padding: '12px 16px 4px', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  {item.group}
+                </div>
+              )}
+              <div style={s.navItem(section === item.key)} onClick={() => setSection(item.key)}>
+                <div style={s.navDot(section === item.key)} />
+                {item[lang === 'zh' ? 'zh' : 'en']}
+              </div>
+            </React.Fragment>
+          );
+        })}
       </div>
     );
   };
+
+  const renderProvider = () => (
+    <ProviderSection providers={providerProfiles} onChange={updateProviders} lang={lang} />
+  );
 
   const renderGateway = () => (
     <div style={s.section}>
@@ -561,6 +582,14 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
     </div>
   );
 
+  const renderMobile = () => (
+    <MobileAccessSection
+      connection={mobileConnection}
+      lang={lang}
+      onRotate={onRotateMobilePairing}
+    />
+  );
+
   const renderData = () => (
     <div style={s.section}>
       <h2 style={s.title}>{t('数据管理', 'Data Management')}</h2>
@@ -582,13 +611,6 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
                 const picked = await open({ directory: true, multiple: false });
                 if (picked && typeof picked === 'string') {
                   setWorkspace(picked);
-                  // Validate via set_hone_path
-                  try {
-                    const { invoke } = await import('@tauri-apps/api/core');
-                    await invoke('set_hone_path', { newPath: picked });
-                  } catch (err) {
-                    console.warn('set_hone_path validation:', err);
-                  }
                 }
               } catch (e) {
                 console.error('Directory picker failed:', e);
@@ -637,117 +659,11 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
   );
 
   const renderSkills = () => (
-    <div style={s.section}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-        <h2 style={{ ...s.title, margin: 0 }}>{t('技能管理', 'Skills Management')}</h2>
-        <button style={s.btnAccent} onClick={() => setShowSkillForm(!showSkillForm)}>
-          {showSkillForm ? t('取消', 'Cancel') : t('+ 新建技能', '+ New Skill')}
-        </button>
-      </div>
-      <p style={s.desc}>{t('管理和配置自定义技能', 'Manage and configure custom skills.')}</p>
-
-      {showSkillForm && (
-        <div style={{ ...s.card, marginBottom: 12 }}>
-          <input style={s.input} placeholder={t('技能名称 (如: deploy)', 'Skill name (e.g. deploy)')} value={newSkillName} onChange={e => setNewSkillName(e.target.value)} />
-          <input style={{ ...s.input, marginTop: 8 }} placeholder={t('描述', 'Description')} value={newSkillDesc} onChange={e => setNewSkillDesc(e.target.value)} />
-          <input style={{ ...s.input, marginTop: 8 }} placeholder={t('触发词', 'Trigger word')} value={newSkillTrigger} onChange={e => setNewSkillTrigger(e.target.value)} />
-          <button
-            style={{ ...s.btnAccent, marginTop: 10 }}
-            disabled={!newSkillName.trim()}
-            onClick={() => {
-              if (!newSkillName.trim()) return;
-              updateSkills([...skills, { id: Date.now().toString(), name: newSkillName.trim(), desc: newSkillDesc, descEn: newSkillDesc, trigger: newSkillTrigger || newSkillName, enabled: true }]);
-              setNewSkillName(''); setNewSkillDesc(''); setNewSkillTrigger('');
-              setShowSkillForm(false);
-            }}
-          >
-            {t('创建', 'Create')}
-          </button>
-        </div>
-      )}
-
-      {skills.map((skill: SkillInfo) => (
-        <div key={skill.name} style={s.card}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{ fontSize: 20 }}>📦</span>
-              <div>
-                <div style={{ fontSize: 14, fontWeight: 600, ...s.mono }}>/{skill.name}</div>
-                <div style={{ fontSize: 12, color: 'var(--hone-muted)' }}>{lang === 'zh' ? skill.desc : skill.descEn}</div>
-              </div>
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ fontSize: 12, color: skill.enabled ? 'var(--hone-success)' : 'var(--hone-muted)' }}>
-                {skill.enabled ? t('已启用', 'Enabled') : t('已禁用', 'Disabled')}
-              </span>
-              <div style={s.toggleTrack(skill.enabled)} onClick={() => {
-                updateSkills(skills.map((s) => s.name === skill.name ? { ...s, enabled: !s.enabled } : s));
-              }}>
-                <div style={s.toggleThumb(skill.enabled)} />
-              </div>
-            </div>
-          </div>
-          <div style={{ fontSize: 11, color: 'var(--hone-muted)', ...s.mono }}>
-            {t('触发词: ', 'Trigger: ')}<span style={{ color: 'var(--hone-text)' }}>{skill.trigger}</span>
-          </div>
-        </div>
-      ))}
-    </div>
+    <SkillSection skills={skillsV2} onChange={updateSkillsV2} lang={lang} />
   );
 
   const renderMcp = () => (
-    <div style={s.section}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-        <h2 style={{ ...s.title, margin: 0 }}>{t('MCP 服务器', 'MCP Servers')}</h2>
-        <button style={s.btnAccent} onClick={() => { setShowMcpForm(!showMcpForm); setShowSkillForm(false); }}>
-          {showMcpForm ? t('取消', 'Cancel') : t('+ 添加 MCP 服务器', '+ Add MCP Server')}
-        </button>
-      </div>
-      <p style={s.desc}>{t('管理 Model Context Protocol 服务器', 'Manage Model Context Protocol servers.')}</p>
-
-      {showMcpForm && (
-        <div style={{ ...s.card, marginBottom: 12 }}>
-          <input style={s.input} placeholder={t('MCP 名称 (如: filesystem)', 'MCP name (e.g. filesystem)')} value={newMcpName} onChange={e => setNewMcpName(e.target.value)} />
-          <input style={{ ...s.input, marginTop: 8 }} placeholder={t('URL (如: http://localhost:3456)', 'URL (e.g. http://localhost:3456)')} value={newMcpUrl} onChange={e => setNewMcpUrl(e.target.value)} />
-          <button
-            style={{ ...s.btnAccent, marginTop: 10 }}
-            disabled={!newMcpName.trim() || !newMcpUrl.trim()}
-            onClick={() => {
-              if (!newMcpName.trim() || !newMcpUrl.trim()) return;
-              updateMcps([...mcps, { id: Date.now().toString(), name: newMcpName.trim(), url: newMcpUrl.trim(), status: 'disconnected', config: '{}', tools: 0 }]);
-              setNewMcpName(''); setNewMcpUrl('');
-              setShowMcpForm(false);
-            }}
-          >
-            {t('创建', 'Create')}
-          </button>
-        </div>
-      )}
-
-      {mcps.map((mcp: McpInfo) => (
-        <div key={mcp.name} style={s.card}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{ fontSize: 18 }}>🔌</span>
-              <div style={{ fontSize: 14, fontWeight: 600 }}>{mcp.name}</div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
-                <span style={{
-                  width: 8, height: 8, borderRadius: '50%',
-                  background: mcp.status === 'connected' ? 'var(--hone-success)' : 'var(--hone-muted)',
-                }} />
-                <span style={{ color: mcp.status === 'connected' ? 'var(--hone-success)' : 'var(--hone-muted)' }}>
-                  {mcp.status === 'connected' ? t('已连接', 'Connected') : mcp.status === 'error' ? t('连接失败', 'Error') : t('未连接', 'Disconnected')}
-                </span>
-              </div>
-            </div>
-          </div>
-          <div style={{ ...s.mono, fontSize: 12, color: 'var(--hone-muted)', marginBottom: 6 }}>{mcp.url}</div>
-          <div style={{ fontSize: 12, color: 'var(--hone-muted)' }}>
-            {t('配置: ', 'Config: ')}{mcp.config}{t(' | 工具数: ', ' | Tools: ')}{mcp.tools}
-          </div>
-        </div>
-      ))}
-    </div>
+    <McpSection mcps={mcpsV2} onChange={updateMcpsV2} lang={lang} />
   );
 
   const renderAppearance = () => (
@@ -786,7 +702,7 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
         <div style={s.row}>
           <span style={{ fontSize: 13, color: 'var(--hone-muted)', width: 100 }}>{t('版本', 'Version')}</span>
-          <span style={s.mono}>v0.3.0-alpha</span>
+          <span style={s.mono}>v{appVersion}</span>
         </div>
         <div style={s.row}>
           <span style={{ fontSize: 13, color: 'var(--hone-muted)', width: 100 }}>{t('更新', 'Update')}</span>
@@ -931,6 +847,7 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
     switch (section) {
       case 'provider': return renderProvider();
       case 'gateway': return renderGateway();
+      case 'mobile': return renderMobile();
       case 'data': return renderData();
       case 'skills': return renderSkills();
       case 'buddy': return renderBuddy();

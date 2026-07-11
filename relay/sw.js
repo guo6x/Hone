@@ -1,39 +1,31 @@
-// Hone PWA Service Worker — offline support
-const CACHE = 'hone-v1';
+const CACHE = 'hone-mobile-v3'
+const PRECACHE = ['/', '/manifest.json']
 
-self.addEventListener('install', function(event) {
+self.addEventListener('install', event => {
+  event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(PRECACHE)))
+  self.skipWaiting()
+})
+
+self.addEventListener('activate', event => {
   event.waitUntil(
-    caches.open(CACHE).then(function(cache) {
-      return cache.addAll([
-        '/',
-        '/manifest.json',
-      ]);
-    })
-  );
-  self.skipWaiting();
-});
+    caches.keys().then(keys => Promise.all(
+      keys.filter(key => key !== CACHE).map(key => caches.delete(key)),
+    )),
+  )
+  self.clients.claim()
+})
 
-self.addEventListener('activate', function(event) {
-  event.waitUntil(
-    caches.keys().then(function(keys) {
-      return Promise.all(
-        keys.filter(function(k) { return k !== CACHE; }).map(function(k) { return caches.delete(k); })
-      );
-    })
-  );
-  self.clients.claim();
-});
-
-self.addEventListener('fetch', function(event) {
+self.addEventListener('fetch', event => {
+  if (event.request.method !== 'GET') return
   event.respondWith(
-    caches.match(event.request).then(function(cached) {
-      return cached || fetch(event.request).then(function(response) {
-        if (response && response.status === 200 && response.type === 'basic') {
-          const clone = response.clone();
-          caches.open(CACHE).then(function(cache) { cache.put(event.request, clone); });
+    fetch(event.request)
+      .then(response => {
+        if (response.ok && new URL(event.request.url).origin === self.location.origin) {
+          const copy = response.clone()
+          void caches.open(CACHE).then(cache => cache.put(event.request, copy))
         }
-        return response;
-      });
-    })
-  );
-});
+        return response
+      })
+      .catch(() => caches.match(event.request).then(hit => hit || caches.match('/'))),
+  )
+})

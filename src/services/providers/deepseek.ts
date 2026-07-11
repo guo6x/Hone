@@ -1,6 +1,6 @@
 /**
  * DeepSeek Provider —— 实现 AIProvider 接口。
- * 默认使用 DeepSeek V4 Pro 模型，通过 OpenAI 兼容 API 调用。
+ * 默认使用 DeepSeek Chat 模型，通过 OpenAI 兼容 API 调用。
  */
 import { randomUUID } from 'crypto'
 import type { AIProvider, CreateMessageParams, ProviderResponse, StreamChunk } from './types.js'
@@ -17,7 +17,7 @@ export function createDeepSeekProvider(): AIProvider {
   const defaultModel =
     process.env.HONE_DEEPSEEK_MODEL ||
     process.env.DEEPSEEK_MODEL ||
-    'deepseek-v4-pro'
+    'deepseek-chat'
 
   return {
     name: 'DeepSeek',
@@ -95,7 +95,7 @@ export function createDeepSeekProvider(): AIProvider {
         stop: 'end_turn',
         tool_calls: 'tool_use',
         length: 'max_tokens',
-        content_filter: 'stop_sequence',
+        content_filter: 'end_turn',
       }
 
       return {

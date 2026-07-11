@@ -1,4 +1,4 @@
-import React, { type PropsWithChildren, type Ref, useImperativeHandle, useRef, useState } from 'react';
+import React, { type PropsWithChildren, type Ref, useCallback, useImperativeHandle, useRef, useState } from 'react';
 import type { Except } from 'type-fest';
 import { markScrollActivity } from '../../bootstrap/state.js';
 import type { DOMElement } from '../dom.js';
@@ -86,6 +86,10 @@ function ScrollBox({
   ...style
 }: PropsWithChildren<ScrollBoxProps>): React.ReactNode {
   const domRef = useRef<DOMElement>(null);
+  const setRef = useCallback((el: DOMElement | null) => {
+    domRef.current = el;
+    if (el) el.scrollTop ??= 0;
+  }, []);
   // scrollTo/scrollBy bypass React: they mutate scrollTop on the DOM node,
   // mark it dirty, and call the root's throttled scheduleRender directly.
   // The Ink renderer reads scrollTop from the node — no React state needed,
@@ -214,10 +218,7 @@ function ScrollBox({
   // stickyScroll is passed as a DOM attribute (via ink-box directly) so it's
   // available on the first render — ref callbacks fire after the initial
   // commit, which is too late for the first frame.
-  return <ink-box ref={el => {
-    domRef.current = el;
-    if (el) el.scrollTop ??= 0;
-  }} style={{
+  return <ink-box ref={setRef} style={{
     flexWrap: 'nowrap',
     flexDirection: style.flexDirection ?? 'row',
     flexGrow: style.flexGrow ?? 0,

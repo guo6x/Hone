@@ -2,12 +2,39 @@
  * L1 Gateway tools — scheduling and dispatch only.
  * Gateway NEVER touches files or runs shell commands directly.
  */
-import type { Tool } from '../types.js'
+import type { Tool } from '../Tool.js'
 import { getMemoryTool } from '../memory/auto-memory.js'
 import { getSkillCreateTool } from '../skills/skill_create.js'
 import type { PersistedSchedule } from './scheduler.js'
 import { saveSchedules } from './scheduler.js'
 import type { BrowserAgent } from './browser/types.js'
+
+/** 校验 cron 表达式：5 段格式，每段合法字符。返回 true 表示有效。 */
+function validateCron(expr: string): boolean {
+  if (!expr || typeof expr !== 'string') return false
+  const parts = expr.trim().split(/\s+/)
+  if (parts.length !== 5) return false
+  // 每段的合法字符：分时日月周
+  // 分(0-59) 时(0-23) 日(1-31) 月(1-12) 周(0-7)
+  const patterns = [
+    /^([0-9*,/\-]+)$/, // minute
+    /^([0-9*,/\-]+)$/, // hour
+    /^([0-9*,/\-]+)$/, // day
+    /^([0-9*,/\-]+)$/, // month
+    /^([0-9*,/\-]+)$/, // weekday
+  ]
+  return parts.every((p, i) => patterns[i].test(p))
+}
+
+/** 校验 URL 协议：仅允许 http/https（防止 javascript:/file: 等协议注入）。 */
+function validateUrlProtocol(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
 
 export interface ScheduleEntry {
   id: string
@@ -27,10 +54,17 @@ export interface ScheduleEntry {
 export interface GatewayContext {
   schedules: Map<string, ScheduleEntry>
   pendingPairings: Map<string, { clientId: string; code: string; resolve: (approved: boolean) => void }>
-  dispatchTask(task: string): Promise<string>
+  dispatchTask(task: string): Promise<TaskRunResult>
   sendNotification(msg: string): void
   persistSchedules(): void
   browserAgent: BrowserAgent | null
+}
+
+export interface TaskRunResult {
+  taskId: string
+  status: 'completed' | 'failed' | 'cancelled' | 'timed_out' | 'denied'
+  result: string
+  cwd?: string
 }
 
 export function getGatewayTools(ctx: GatewayContext): Tool[] {
@@ -64,6 +98,9 @@ export function getGatewayTools(ctx: GatewayContext): Tool[] {
       isEnabled: () => true,
       checkPermissions: async () => ({ behavior: 'passthrough' as const }),
       execute: async (input: any) => {
+        if (!validateCron(input.trigger)) {
+          return { content: [{ type: 'text', text: `无效的 cron 表达式: "${input.trigger}"。请使用 5 段标准格式，如 "0 9 * * *"。` }] }
+        }
         const id = `sched_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
         const entry: ScheduleEntry = {
           id,
@@ -138,7 +175,7 @@ export function getGatewayTools(ctx: GatewayContext): Tool[] {
       checkPermissions: async () => ({ behavior: 'passthrough' as const }),
       execute: async (input: any) => {
         const result = await ctx.dispatchTask(input.task)
-        return { content: [{ type: 'text', text: result }] }
+        return { content: [{ type: 'text', text: result.result }] }
       },
     },
     {
@@ -183,6 +220,9 @@ export function getGatewayTools(ctx: GatewayContext): Tool[] {
       checkPermissions: async () => ({ behavior: 'passthrough' as const }),
       execute: async (input: any) => {
         if (!ctx.browserAgent) return { content: [{ type: 'text', text: '浏览器代理未启用。请设置 HONE_BROWSER_ENABLED=true' }] }
+        if (!validateUrlProtocol(input.url)) {
+          return { content: [{ type: 'text', text: `无效的 URL 或不支持的协议: "${input.url}"。仅支持 http/https。` }] }
+        }
         const state = await ctx.browserAgent.navigate(input.profile || 'default', input.url)
         return { content: [{ type: 'text', text: `已导航到: ${state.title} (${state.url})` }] }
       },

@@ -108,7 +108,7 @@ export async function showSetupScreens(root: Root, permissionMode: PermissionMod
   let onboardingShown = false;
   if (!config.theme || !config.hasCompletedOnboarding // always show onboarding at least once
   ) {
-    if (process.env.DEEPSEEK_API_KEY) {
+    if (process.env.HONE_DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY) {
       completeOnboarding();
       onboardingShown = false; // We didn't actually "show" it
     } else {
@@ -136,7 +136,7 @@ export async function showSetupScreens(root: Root, permissionMode: PermissionMod
     // If it returns true, the TrustDialog would auto-resolve regardless of
     // security features, so we can skip the dynamic import and render cycle.
     if (!checkHasTrustDialogAccepted()) {
-      if (process.env.DEEPSEEK_API_KEY) {
+      if (process.env.HONE_DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY) {
         // Skip TrustDialog in DeepSeek mode
       } else {
         const {

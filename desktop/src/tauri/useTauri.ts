@@ -1,14 +1,12 @@
 /**
  * Tauri-aware data hook. Uses IPC when running inside Tauri, falls back to mock data in browser.
  */
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import * as api from './api';
-import type { MachineInfo, GatewayConfig, GatewayStatus, DiscoveredGateway } from './types';
+import type { MachineInfo, GatewayConfig, GatewayConnectionInfo, GatewayStatus, DiscoveredGateway } from './types';
 import {
   type MachineInfo as MockMachine,
-  type SessionInfo,
   type ScheduleInfo,
-  type StatusBarData,
   type GatewayStatus as MockGatewayStatus,
 } from '../data/mock';
 
@@ -17,7 +15,10 @@ import {
 let _isTauri: boolean | null = null;
 export function isTauri(): boolean {
   if (_isTauri === null) {
-    _isTauri = typeof window !== 'undefined' && '__TAURI__' in window;
+    // Tauri v2: __TAURI_INTERNALS__ is always injected (even without withGlobalTauri).
+    // Tauri v1 / withGlobalTauri=true: __TAURI__ is also present.
+    _isTauri = typeof window !== 'undefined' &&
+      ('__TAURI_INTERNALS__' in window || '__TAURI__' in window);
   }
   return _isTauri;
 }
@@ -28,6 +29,9 @@ interface GatewayState {
   status: GatewayStatus | MockGatewayStatus;
   uptime: number | null;
   version: string;
+  /** When the Rust side reports `Error(String)`, the message is kept here so
+   *  the UI can show *why* the gateway is offline instead of just "offline". */
+  errorMessage: string | null;
 }
 
 export function useGateway() {
@@ -35,6 +39,7 @@ export function useGateway() {
     status: 'Stopped' as const,
     uptime: null,
     version: '—',
+    errorMessage: null,
   }));
   const [loading, setLoading] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
@@ -45,16 +50,21 @@ export function useGateway() {
       const status = await api.gatewayStatus();
       const uptime = await api.gatewayUptime();
       let statusStr: MockGatewayStatus['status'];
+      let errMsg: string | null = null;
       if (status === 'Running') statusStr = 'online';
       else if (status === 'Starting') statusStr = 'starting';
       else if (status === 'Stopping') statusStr = 'stopping';
-      else if (typeof status === 'object' && 'Error' in status) statusStr = 'offline';
+      else if (typeof status === 'object' && 'Error' in status) {
+        statusStr = 'offline';
+        errMsg = status.Error; // preserve the real failure reason
+      }
       else statusStr = 'offline';
 
       setGw(prev => ({
         ...prev,
-        status: { status: statusStr, uptime: prev.version, version: prev.version } as MockGatewayStatus,
+        status: { status: statusStr, uptime: uptime != null ? String(uptime) : '—', version: prev.version } as MockGatewayStatus,
         uptime,
+        errorMessage: errMsg,
       }));
     } catch {
       // use mock
@@ -69,8 +79,44 @@ export function useGateway() {
     try {
       if (isTauri()) {
         await api.gatewayStart(honePath, relayUrl);
+        // Don't optimistically flip to "Running" — the daemon takes a few
+        // seconds to boot (Node cold start + cli.js load + relay handshake).
+        // Poll the real status so the UI reflects actual progress instead of
+        // pretending to be ready while the daemon is still coming up.
+        setGw(prev => ({ ...prev, status: 'Starting' as const, errorMessage: null }));
+        const pollStart = Date.now();
+        const POLL_TIMEOUT_MS = 30_000;
+        const POLL_INTERVAL_MS = 400;
+        while (Date.now() - pollStart < POLL_TIMEOUT_MS) {
+          await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+          try {
+            const status = await api.gatewayStatus();
+            const uptime = await api.gatewayUptime();
+            if (status === 'Running') {
+              setGw(prev => ({
+                ...prev,
+                status: { status: 'online', uptime: uptime != null ? String(uptime) : '—', version: prev.version } as MockGatewayStatus,
+                uptime,
+                errorMessage: null,
+              }));
+              break;
+            }
+            if (typeof status === 'object' && 'Error' in status) {
+              // Daemon reported an error — surface it immediately instead of
+              // polling for 30s against a dead process.
+              setGw(prev => ({
+                ...prev,
+                status: { status: 'offline', uptime: '—', version: prev.version } as MockGatewayStatus,
+                errorMessage: status.Error,
+              }));
+              break;
+            }
+            // Still Starting — keep polling.
+          } catch {
+            // status query failed; keep polling
+          }
+        }
       }
-      setGw(prev => ({ ...prev, status: 'Running' as const }));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error('gateway start failed:', msg);
@@ -114,12 +160,24 @@ export function useMachines() {
         id: m.id,
         name: m.name,
         host: m.host,
+        port: m.port,
+        // ConnectionMethod is a Rust enum serialized as a tagged union
+        // ({ Local: {...} } | { Ssh: {...} } | { Tunnel: {...} }).
+        // MachineInfo.method is a plain string, so flatten to a label.
+        method: m.method
+          ? ('Local' in m.method ? 'local'
+            : 'Ssh' in m.method ? 'ssh'
+            : 'Tunnel' in m.method ? 'tunnel'
+            : undefined)
+          : undefined,
         status: m.status === 'Online' ? 'online' as const
           : m.status === 'Busy' ? 'busy' as const
           : 'offline' as const,
         sessions: m.sessions,
         os: m.os,
         cpu: m.cpu,
+        lastSeen: m.last_seen,
+        addedAt: m.added_at,
       })));
     } catch (e) {
       setError(String(e));
@@ -136,7 +194,7 @@ export function useMachines() {
       return id;
     } catch (e) {
       setError(String(e));
-      return '';
+      throw e;
     }
   }, [fetchMachines]);
 
@@ -232,6 +290,31 @@ export function useTauriConfig() {
   return { config, save, refreshConfig: fetchConfig };
 }
 
+export function useGatewayConnectionInfo() {
+  const [info, setInfo] = useState<GatewayConnectionInfo | null>(null);
+
+  const refresh = useCallback(async () => {
+    if (!isTauri()) return;
+    try {
+      setInfo(await api.gatewayConnectionInfo());
+    } catch (error) {
+      console.error('gateway_connection_info failed:', error);
+      setInfo(null);
+    }
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const rotatePairing = useCallback(async () => {
+    if (!isTauri()) return null;
+    const next = await api.mobilePairingRotate();
+    setInfo(next);
+    return next;
+  }, []);
+
+  return { info, refresh, rotatePairing };
+}
+
 // ── Empty defaults for components that don't need live IPC yet ──
 
 // ── Schedules (persisted via Tauri IPC) ──
@@ -249,10 +332,22 @@ export function useSchedules(): {
       setLoading(false);
       return;
     }
-    api.schedulesList()
-      .then(setSchedules)
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const next = await api.schedulesList();
+        if (!cancelled) setSchedules(next);
+      } catch {
+        // Keep the last known schedule list during a transient IPC failure.
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void refresh();
+    // The Gateway persists run metadata in the same schedule store. Polling
+    // keeps the management view in sync without maintaining a second engine.
+    const timer = setInterval(() => { void refresh(); }, 15_000);
+    return () => { cancelled = true; clearInterval(timer); };
   }, []);
 
   const save = useCallback(async (s: ScheduleInfo[]) => {
@@ -268,19 +363,4 @@ export function useSchedules(): {
   }, [schedules]);
 
   return { schedules, save, loading };
-}
-
-export function useMockSessions(): [SessionInfo[]] {
-  return [[]];
-}
-
-export function useMockSchedules(): [
-  ScheduleInfo[],
-  (s: ScheduleInfo[]) => void,
-] {
-  return useState<ScheduleInfo[]>([]);
-}
-
-export function useMockStatusBar(): StatusBarData {
-  return { uptime: '—', latency: '—', tokensToday: '0', lastBackup: '—' };
 }

@@ -10,13 +10,9 @@ class_name = "RelayRoom"
 tag = "v3"
 new_sqlite_classes = ["RelayRoom"]
 
-[vars]
-# Set AUTH_TOKEN in production to require gateway authentication.
-# Generate via: openssl rand -hex 32
-# AUTH_TOKEN = ""
-
-[env.production]
-vars = { AUTH_TOKEN = "" }
+# Each installation owns a random room and gateway credential. The Durable
+# Object stores only the credential hash, so a global shared AUTH_TOKEN is not
+# used and the old /connect/default room is no longer a supported deployment.
 
 # Routes (optional — can also use workers.dev subdomain)
 # [[routes]]

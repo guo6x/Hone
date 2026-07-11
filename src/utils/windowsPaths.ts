@@ -20,6 +20,17 @@ function checkPathExists(p: string): boolean {
   }
 }
 
+function commonGitBashPaths(): string[] {
+  return [
+    process.env['ProgramFiles'] &&
+      pathWin32.join(process.env['ProgramFiles'], 'Git', 'bin', 'bash.exe'),
+    process.env['ProgramFiles(x86)'] &&
+      pathWin32.join(process.env['ProgramFiles(x86)'], 'Git', 'bin', 'bash.exe'),
+    process.env.LOCALAPPDATA &&
+      pathWin32.join(process.env.LOCALAPPDATA, 'Programs', 'Git', 'bin', 'bash.exe'),
+  ].filter((p): p is string => Boolean(p))
+}
+
 /**
  * Find an executable using where.exe on Windows
  * @param executable - The name of the executable to find
@@ -108,6 +119,12 @@ export const findGitBashPath = memoize((): string => {
   const gitPath = findExecutable('git')
   if (gitPath) {
     const bashPath = pathWin32.join(gitPath, '..', '..', 'bin', 'bash.exe')
+    if (checkPathExists(bashPath)) {
+      return bashPath
+    }
+  }
+
+  for (const bashPath of commonGitBashPaths()) {
     if (checkPathExists(bashPath)) {
       return bashPath
     }

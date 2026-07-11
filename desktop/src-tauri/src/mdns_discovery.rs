@@ -15,6 +15,7 @@ pub struct DiscoveredGateway {
 pub enum DiscoveryError {
     #[error("mDNS service error: {0}")]
     ServiceError(String),
+    #[allow(dead_code)]
     #[error("Timeout")]
     Timeout,
 }
@@ -38,6 +39,11 @@ impl MdnsDiscovery {
     ) -> Result<mpsc::Receiver<DiscoveredGateway>, DiscoveryError> {
         use mdns_sd::{ServiceDaemon, ServiceEvent};
 
+        // Cancel any previously active browse task before starting a new one.
+        if let Some(tx) = self.cancel_tx.take() {
+            let _ = tx.send(());
+        }
+
         let (tx, rx) = mpsc::channel(32);
         let daemon =
             ServiceDaemon::new().map_err(|e| DiscoveryError::ServiceError(e.to_string()))?;
@@ -59,8 +65,10 @@ impl MdnsDiscovery {
                     event = receiver.recv_async() => {
                         match event {
                             Ok(ServiceEvent::ServiceResolved(info)) => {
-                                let host = info.get_addresses().iter()
-                                    .next()
+                                let addr = info.get_addresses().iter()
+                                    .find(|a| a.is_ipv4())
+                                    .or_else(|| info.get_addresses().iter().next());
+                                let host = addr
                                     .map(|a| a.to_string())
                                     .unwrap_or_else(|| "unknown".to_string());
 
@@ -114,6 +122,7 @@ impl MdnsDiscovery {
         Ok(rx)
     }
 
+    #[allow(dead_code)]
     pub fn stop(&mut self) {
         if let Some(tx) = self.cancel_tx.take() {
             let _ = tx.send(());

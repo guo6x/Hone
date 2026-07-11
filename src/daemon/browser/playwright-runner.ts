@@ -18,6 +18,19 @@ import path from 'path'
 const contexts = new Map<string, BrowserContext>()
 const pages = new Map<string, Page>()
 
+/** 校验 URL 协议：仅允许 http/https，防止 javascript:/file: 等危险协议注入。 */
+export function validateUrl(url: string): void {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error(`不支持的协议: ${parsed.protocol}，仅允许 http/https`)
+    }
+  } catch (e: any) {
+    if (e.message?.includes('不支持的协议')) throw e
+    throw new Error(`无效的 URL: ${url}`)
+  }
+}
+
 function profileUserDataDir(config: BrowserConfig, profileName: string): string {
   return path.join(config.dataDir, 'profiles', profileName, 'userData')
 }
@@ -78,6 +91,7 @@ export async function openProfileForLogin(
   pages.set(profileName, page)
   if (startUrl) {
     try {
+      validateUrl(startUrl)
       await page.goto(startUrl, { waitUntil: 'domcontentloaded' })
     } catch {
       // ignore — user may navigate elsewhere
@@ -113,6 +127,7 @@ export async function navigate(
   profileName: string,
   url: string,
 ): Promise<BrowserState> {
+  validateUrl(url)
   const page = await getPage(config, profileName)
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.defaultTimeout })
 
@@ -131,8 +146,13 @@ export async function navigate(
 /**
  * Extract structured page content for DOM fallback.
  */
-export async function extractPage(config: BrowserConfig, profileName: string): Promise<PageExtraction> {
+export async function extractPage(config: BrowserConfig, profileName: string, selector?: string): Promise<PageExtraction> {
   const page = await getPage(config, profileName)
+  if (selector) {
+    // 用 selector 提取指定元素的文本
+    const text = await page.$$eval(selector, els => els.map(e => e.textContent || '').join('\n')).catch(() => '')
+    return { text, title: await page.title().catch(() => ''), url: page.url() } as PageExtraction
+  }
   return page.evaluate(getPageExtractionScript()) as Promise<PageExtraction>
 }
 
@@ -187,6 +207,7 @@ export async function executeAction(
     }
     case 'navigate': {
       if (action.url) {
+        validateUrl(action.url)
         await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: config.defaultTimeout })
       }
       break

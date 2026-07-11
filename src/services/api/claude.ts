@@ -532,7 +532,7 @@ export async function verifyApiKey(
   isNonInteractiveSession: boolean,
 ): Promise<boolean> {
   // Skip API verification if running in print mode (isNonInteractiveSession) or DeepSeek mode
-  if (isNonInteractiveSession || process.env.DEEPSEEK_API_KEY) {
+  if (isNonInteractiveSession || process.env.HONE_DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY) {
     return true
   }
 

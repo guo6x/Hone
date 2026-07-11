@@ -349,6 +349,31 @@
     opacity: 0; transition: opacity 0.3s; pointer-events: none;
   }
   #toast.show { opacity: 1; }
+
+  /* Explicit execution confirmation. Remote requests are fail-closed until
+     the paired device accepts or rejects this prompt. */
+  #confirmation-overlay {
+    display: none; position: fixed; inset: 0; z-index: 400;
+    background: var(--scrim); align-items: flex-end; justify-content: center;
+  }
+  #confirmation-overlay.active { display: flex; }
+  #confirmation-panel {
+    width: 100%; max-width: 500px; background: var(--surfaceRaised);
+    border: 1px solid var(--warning); border-radius: 16px 16px 0 0;
+    padding: 20px 18px calc(20px + var(--safe-bottom)); display: flex;
+    flex-direction: column; gap: 12px; animation: slideUp 0.2s ease-out;
+  }
+  #confirmation-panel h2 { font-size: 17px; color: var(--text); }
+  #confirmation-description {
+    max-height: 36vh; overflow: auto; white-space: pre-wrap; word-break: break-word;
+    padding: 12px; border-radius: var(--radius-sm); background: var(--codeBg);
+    border: 1px solid var(--border); color: var(--text); font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+    -webkit-user-select: text; user-select: text;
+  }
+  .confirmation-actions { display: flex; gap: 10px; }
+  .confirmation-actions button { flex: 1; min-height: 44px; border-radius: var(--radius-sm); font: 600 14px inherit; cursor: pointer; }
+  .confirmation-actions .deny { border: 1px solid var(--danger); background: var(--dangerMuted); color: var(--danger); }
+  .confirmation-actions .approve { border: none; background: var(--accent); color: #0C0E12; }
 </style>
 </head>
 <body>
@@ -416,6 +441,18 @@
   </div>
 </div>
 
+<!-- ── Execution Confirmation ── -->
+<div id="confirmation-overlay">
+  <div id="confirmation-panel" role="dialog" aria-modal="true" aria-labelledby="confirmation-title">
+    <h2 id="confirmation-title">Confirm action</h2>
+    <div id="confirmation-description"></div>
+    <div class="confirmation-actions">
+      <button class="deny" onclick="respondConfirmation(false)">Reject</button>
+      <button class="approve" onclick="respondConfirmation(true)">Approve</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── Install Banner ── -->
 <div id="install-banner">
   <span class="text"><strong>Hone</strong> — install to home screen</span>
@@ -460,10 +497,12 @@
     ws: null,
     connected: false, registered: false,
     clientId: null, gatewayInfo: null,
+    deviceId: null, deviceToken: null, pairingId: null,
     lastHeartbeat: 0,
     reconnectTimer: null, reconnectDelay: 1000,
     heartbeatTimer: null,
     schedules: [],
+    pendingConfirmation: null,
     lang: navigator.language.startsWith('zh') ? 'zh' : 'en'
   };
 
@@ -513,10 +552,16 @@
   const scheduleInput = $('#schedule-input');
   const scheduleList = $('#schedule-list');
   const toast = $('#toast');
+  const confirmationOverlay = $('#confirmation-overlay');
+  const confirmationDescription = $('#confirmation-description');
 
-  /* ─── localStorage ─── */
-  relayInput.value = localStorage.getItem('hone_relay_url') || '';
-  codeInput.value = localStorage.getItem('hone_pairing_code') || '';
+  /* ─── Persistent device identity ─── */
+  const query = new URLSearchParams(location.search);
+  relayInput.value = query.get('relay') || localStorage.getItem('hone_relay_url') || '';
+  codeInput.value = query.get('code') || '';
+  state.pairingId = query.get('pairingId') || localStorage.getItem('hone_pairing_id') || null;
+  state.deviceId = localStorage.getItem('hone_device_id') || null;
+  state.deviceToken = localStorage.getItem('hone_device_token') || null;
 
   /* ─── Toast ─── */
   let toastTimer = null;
@@ -533,11 +578,15 @@
     const code = codeInput.value.trim();
 
     if (!url) { showToast(tr('needUrl')); return; }
-    if (!code) { showToast(tr('needCode')); return; }
-    if (code.length !== 6 || !/^\d{6}$/.test(code)) { showToast(tr('codeDigits')); return; }
+    const hasDeviceCredential = !!(state.deviceId && state.deviceToken);
+    if (!hasDeviceCredential) {
+      if (!state.pairingId) { showToast('请扫描桌面端二维码开始配对'); return; }
+      if (!code) { showToast(tr('needCode')); return; }
+      if (code.length !== 6 || !/^\d{6}$/.test(code)) { showToast(tr('codeDigits')); return; }
+    }
 
     localStorage.setItem('hone_relay_url', url);
-    localStorage.setItem('hone_pairing_code', code);
+    if (state.pairingId) localStorage.setItem('hone_pairing_id', state.pairingId);
 
     setStatus(tr('connecting'), '');
     btnConnect.disabled = true;
@@ -569,7 +618,6 @@
     clearInterval(state.heartbeatTimer);
     state.connected = false;
     state.registered = false;
-    state.clientId = null;
     state.gatewayInfo = null;
     state.reconnectDelay = 1000;
   }
@@ -588,7 +636,15 @@
 
     ws.onopen = function() {
       setStatus(tr('waiting'), '');
-      ws.send(JSON.stringify({ type: 'register', role: 'client', pairingCode: code }));
+      const registration = {
+        type: 'register',
+        role: 'client',
+        deviceId: state.deviceId || undefined,
+        deviceToken: state.deviceToken || undefined,
+        pairingId: state.deviceId ? undefined : state.pairingId,
+        pairingCode: state.deviceId ? undefined : code,
+      };
+      ws.send(JSON.stringify(registration));
     };
 
     ws.onmessage = function(e) {
@@ -604,8 +660,17 @@
         setGatewayOffline(true);
         showToast(tr('gatewayOffline'));
       }
-      if (evt.code === 4003) { onConnFail(tr('pairFailed')); return; }
-      if (evt.code === 4000) { onConnFail(tr('badFormat')); return; }
+      if (evt.code === 4003) {
+        if (state.deviceId) {
+          localStorage.removeItem('hone_device_id');
+          localStorage.removeItem('hone_device_token');
+          state.deviceId = null;
+          state.deviceToken = null;
+        }
+        onConnFail(tr('pairFailed'), false);
+        return;
+      }
+      if (evt.code === 4000) { onConnFail(tr('badFormat'), false); return; }
       if (evt.code !== 4000 || state.registered) scheduleReconnect(url, code);
     };
 
@@ -622,12 +687,13 @@
     }, state.reconnectDelay);
   }
 
-  function onConnFail(msg) {
+  function onConnFail(msg, retry = true) {
     state.ws = null;
+    clearTimeout(state.reconnectTimer);
     setStatus(msg, 'error');
     btnConnect.disabled = false;
     btnConnect.textContent = 'Connect';
-    scheduleReconnect(relayInput.value.trim(), codeInput.value.trim());
+    if (retry) scheduleReconnect(relayInput.value.trim(), codeInput.value.trim());
   }
 
   /* ─── Message Handling ─── */
@@ -640,6 +706,16 @@
       state.registered = true;
       state.connected = true;
       state.clientId = msg.clientId || null;
+      if (msg.deviceId) {
+        state.deviceId = msg.deviceId;
+        localStorage.setItem('hone_device_id', msg.deviceId);
+      }
+      if (msg.deviceToken) {
+        state.deviceToken = msg.deviceToken;
+        localStorage.setItem('hone_device_token', msg.deviceToken);
+        // The one-time code is never retained after a device credential exists.
+        codeInput.value = '';
+      }
       state.reconnectDelay = 1000;
       state.gatewayInfo = msg.gateway || null;
 
@@ -679,12 +755,40 @@
       break;
 
     case 'task_progress':
-      addSystem(msg.status || 'Processing...', '');
+      addSystem(msg.text || msg.status || 'Processing...', '');
       break;
 
     case 'task_complete':
       removeTyping();
       addSystem((msg.result || tr('taskDone')), 'completed');
+      break;
+
+    case 'task_cancelling':
+      addSystem('正在取消任务…', 'started');
+      break;
+
+    case 'task_cancelled':
+      removeTyping();
+      addSystem('任务已取消', 'completed');
+      break;
+
+    case 'confirmation_required':
+      showConfirmation('task', msg.confirmId, msg.description || 'Confirm task execution');
+      break;
+
+    case 'browser_confirm_required':
+      showConfirmation('browser', msg.taskId, msg.description || 'Confirm browser action');
+      break;
+
+    case 'browser_task_progress':
+      if (msg.step && msg.step.action) {
+        addSystem('网页步骤 ' + (msg.step.stepNumber || '') + ': ' + (msg.step.action.action || 'working'), 'started');
+      }
+      break;
+
+    case 'browser_task_result':
+      removeTyping();
+      addSystem(msg.status === 'success' ? '网页任务已完成' : ('网页任务失败: ' + (msg.error || msg.status || 'unknown')), msg.status === 'success' ? 'completed' : 'error');
       break;
 
     case 'heartbeat':
@@ -696,6 +800,14 @@
     case 'gateway_disconnected':
       setGatewayOffline(true);
       showToast(msg.message || tr('gatewayOffline'));
+      break;
+
+    case 'device_revoked':
+      localStorage.removeItem('hone_device_id');
+      localStorage.removeItem('hone_device_token');
+      state.deviceId = null;
+      state.deviceToken = null;
+      showToast('此设备已被桌面端移除，需要重新扫描二维码');
       break;
 
     case 'schedule_created':
@@ -752,6 +864,28 @@
     messagesEl.appendChild(div);
     scrollBottom();
   }
+
+  function showConfirmation(kind, id, description) {
+    if (!id) return;
+    state.pendingConfirmation = { kind: kind, id: id };
+    confirmationDescription.textContent = description;
+    confirmationOverlay.classList.add('active');
+  }
+
+  window.respondConfirmation = function(approved) {
+    const pending = state.pendingConfirmation;
+    if (!pending || !state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      showToast('连接已断开，无法确认');
+      return;
+    }
+    const payload = pending.kind === 'browser'
+      ? { type: 'browser_confirm', taskId: pending.id, approved: !!approved }
+      : { type: 'confirmation_response', confirmId: pending.id, approved: !!approved };
+    state.ws.send(JSON.stringify(payload));
+    state.pendingConfirmation = null;
+    confirmationOverlay.classList.remove('active');
+    addSystem(approved ? '已批准操作' : '已拒绝操作', approved ? 'completed' : 'error');
+  };
 
   let typingEl = null;
   function addTyping() {
@@ -939,7 +1073,11 @@
   }
 
   /* ─── Auto-connect ─── */
-  if (relayInput.value && codeInput.value && codeInput.value.length === 6 && /^\d{6}$/.test(codeInput.value)) {
+  if (
+    relayInput.value
+    && ((state.deviceId && state.deviceToken)
+      || (state.pairingId && codeInput.value.length === 6 && /^\d{6}$/.test(codeInput.value)))
+  ) {
     setTimeout(connect, 500);
   }
 })();

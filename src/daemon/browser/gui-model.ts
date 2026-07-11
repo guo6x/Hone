@@ -100,11 +100,24 @@ async function queryVisionModel(
     ],
   }
 
-  const res = await fetch(config.url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  })
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 30_000)
+  let res: Response
+  try {
+    res = await fetch(config.url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      throw new Error('Vision model 请求超时（30s）— 模型可能不可用或响应过慢')
+    }
+    throw err
+  } finally {
+    clearTimeout(timeout)
+  }
   if (!res.ok) {
     const errText = await res.text().catch(() => '')
     throw new Error(`Vision model HTTP ${res.status}: ${errText.slice(0, 300)}`)

@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
 pub struct PtySession {
+    #[allow(dead_code)]
     pub id: String,
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -161,5 +162,16 @@ impl PtyManager {
             }
         }
         Ok(())
+    }
+
+    /// Kill all active PTY sessions. Called on app shutdown to reap child processes.
+    pub fn close_all(&self) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            for (_, session) in sessions.drain() {
+                if let Ok(mut k) = session.killer.lock() {
+                    let _ = k.kill();
+                }
+            }
+        }
     }
 }

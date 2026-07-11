@@ -17,8 +17,9 @@ FIX_BRIEF*.md
 FIX_REPORT*.md
 gw-out.* gw-err.*
 
-# Internal roadmap — kept locally, not published
+# Internal strategy docs — kept locally, not published
 HONE_EVOLUTION.md
+HONE_PRODUCT.md
 
 # Backup / build output
 *.backup

@@ -4,22 +4,25 @@
  */
 import type { AIProvider, CreateMessageParams, ProviderResponse, StreamChunk } from './types.js'
 
-export function createOpenAIProvider(): AIProvider {
+export function createOpenAIProvider(config?: { apiKey?: string; baseUrl?: string; model?: string; name?: string }): AIProvider {
   const apiKey =
+    config?.apiKey ||
     process.env.HONE_OPENAI_API_KEY ||
     process.env.OPENAI_API_KEY ||
     ''
   const baseUrl =
+    config?.baseUrl ||
     process.env.HONE_OPENAI_BASE_URL ||
     process.env.OPENAI_BASE_URL ||
     'https://api.openai.com'
   const defaultModel =
+    config?.model ||
     process.env.HONE_OPENAI_MODEL ||
     process.env.OPENAI_MODEL ||
     'gpt-4o'
 
   return {
-    name: 'OpenAI',
+    name: config?.name || 'OpenAI',
 
     async createMessage(params: CreateMessageParams): Promise<ProviderResponse> {
       if (!apiKey) {
@@ -90,17 +93,23 @@ export function createOpenAIProvider(): AIProvider {
           usage: data.usage
             ? { inputTokens: data.usage.prompt_tokens, outputTokens: data.usage.completion_tokens }
             : undefined,
-          stopReason: 'tool_use',
+          stopReason: stopReasonMap['tool_calls'],
         }
       }
 
+      const stopReasonMap: Record<string, string> = {
+        stop: 'end_turn',
+        tool_calls: 'tool_use',
+        length: 'max_tokens',
+        content_filter: 'end_turn',
+      }
       return {
         content: message?.content || '',
         model: data.model,
         usage: data.usage
           ? { inputTokens: data.usage.prompt_tokens, outputTokens: data.usage.completion_tokens }
           : undefined,
-        stopReason: choice?.finish_reason,
+        stopReason: stopReasonMap[choice?.finish_reason || 'stop'] || 'end_turn',
       }
     },
 

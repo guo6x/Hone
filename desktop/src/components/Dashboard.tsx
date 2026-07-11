@@ -26,6 +26,8 @@ interface DashboardProps {
   search: string;
   setSearch: (s: string) => void;
   onOpenWorkspace?: (cwd: string) => void;
+  activeMachine?: string | null;
+  onSelectMachine?: (id: string) => void;
 }
 
 interface EmptyProps { lang: Lang; onAddMachine: () => void }
@@ -158,9 +160,15 @@ export default function Dashboard({
       return s.machineName.toLowerCase().includes(q) || s.task.toLowerCase().includes(q);
     })
     .sort((a, b) => {
-      const aVal = String(a[sortBy as keyof SessionInfo] ?? '');
-      const bVal = String(b[sortBy as keyof SessionInfo] ?? '');
-      return sortDir === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+      const aRaw = a[sortBy as keyof SessionInfo]
+      const bRaw = b[sortBy as keyof SessionInfo]
+      // 数值字段按数值比较（tokensUsed/elapsed 等），避免 "9" > "100" 的字典序错误
+      if (typeof aRaw === 'number' && typeof bRaw === 'number') {
+        return sortDir === 'asc' ? aRaw - bRaw : bRaw - aRaw
+      }
+      const aVal = String(aRaw ?? '')
+      const bVal = String(bRaw ?? '')
+      return sortDir === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal)
     });
 
   function handleSort(colKey: string) {
@@ -314,7 +322,13 @@ export default function Dashboard({
             <tbody>
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={5} style={styles.tdEmpty}>{lang === 'zh' ? '没有匹配的会话' : 'No matching sessions'}</td>
+                  <td colSpan={5} style={styles.tdEmpty}>
+                    {sessions.length === 0
+                      ? (lang === 'zh'
+                        ? '还没有任务记录 — 启动 Gateway 并发送消息后，这里会显示执行记录'
+                        : 'No tasks yet — start the Gateway and send a message, executions will appear here')
+                      : (lang === 'zh' ? '没有匹配的会话' : 'No matching sessions')}
+                  </td>
                 </tr>
               ) : (
                 filtered.map(s => {

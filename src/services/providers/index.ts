@@ -9,7 +9,7 @@
  *   5. 默认 → DeepSeek
  *
  * 可用提供商:
- *   - deepseek: DeepSeek API（默认模型 deepseek-v4-pro）
+ *   - deepseek: DeepSeek API（默认模型 deepseek-chat）
  *   - openai:   OpenAI / Azure OpenAI / 兼容 API
  *   - custom:   自定义 OpenAI 兼容端点（设置 HONE_CUSTOM_BASE_URL）
  */
@@ -48,33 +48,13 @@ function createProvider(name: string): AIProvider {
     }
     case 'custom': {
       // Custom provider 使用独立的 HONE_CUSTOM_* 环境变量，与 OpenAI 隔离。
-      // 复用 OpenAI 兼容的 chat completions 调用逻辑，但参数全部来自 CUSTOM 命名空间。
-      const savedKey = process.env.OPENAI_API_KEY
-      const savedBase = process.env.OPENAI_BASE_URL
-      const savedModel = process.env.OPENAI_MODEL
-      try {
-        process.env.OPENAI_API_KEY =
-          process.env.HONE_CUSTOM_API_KEY || ''
-        process.env.OPENAI_BASE_URL =
-          process.env.HONE_CUSTOM_BASE_URL || 'https://api.openai.com'
-        if (process.env.HONE_CUSTOM_MODEL) {
-          process.env.OPENAI_MODEL = process.env.HONE_CUSTOM_MODEL
-        }
-        const provider = createOpenAIProvider()
-        return {
-          ...provider,
-          name: process.env.HONE_CUSTOM_NAME || 'Custom',
-        }
-      } finally {
-        // Restore originals — provider closes over current env at creation,
-        // but other code may still rely on OPENAI_* being unchanged.
-        if (savedKey === undefined) delete process.env.OPENAI_API_KEY
-        else process.env.OPENAI_API_KEY = savedKey
-        if (savedBase === undefined) delete process.env.OPENAI_BASE_URL
-        else process.env.OPENAI_BASE_URL = savedBase
-        if (savedModel === undefined) delete process.env.OPENAI_MODEL
-        else process.env.OPENAI_MODEL = savedModel
-      }
+      // 直接通过参数传递配置，避免临时修改 process.env 导致的竞态条件。
+      return createOpenAIProvider({
+        apiKey: process.env.HONE_CUSTOM_API_KEY || '',
+        baseUrl: process.env.HONE_CUSTOM_BASE_URL || 'https://api.openai.com',
+        model: process.env.HONE_CUSTOM_MODEL || 'gpt-4o',
+        name: process.env.HONE_CUSTOM_NAME || 'Custom',
+      })
     }
     case 'deepseek':
     default:

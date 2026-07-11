@@ -5,6 +5,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   GatewayConfig,
+  GatewayConnectionInfo,
   GatewayStatus,
   MachineInfo,
   DiscoveredGateway,
@@ -145,6 +146,14 @@ export function getConfig(): Promise<GatewayConfig> {
   return invoke('get_config');
 }
 
+export function gatewayConnectionInfo(): Promise<GatewayConnectionInfo> {
+  return invoke('gateway_connection_info');
+}
+
+export function mobilePairingRotate(): Promise<GatewayConnectionInfo> {
+  return invoke('mobile_pairing_rotate');
+}
+
 export function saveConfig(config: GatewayConfig, honePath: string): Promise<void> {
   return invoke('save_config', { config, honePath });
 }
@@ -181,6 +190,94 @@ export interface CanvasSessionInfo {
   modified_at: string;
 }
 
+export interface CanvasDocumentInfo extends CanvasSessionInfo {
+  content: string;
+}
+
 export function canvasSessionsList(): Promise<CanvasSessionInfo[]> {
   return invoke('canvas_sessions_list');
+}
+
+export function canvasDocumentsList(): Promise<CanvasDocumentInfo[]> {
+  return invoke('canvas_documents_list');
+}
+
+// ── Desktop-managed user data ──
+
+export interface SkillSyncInfo {
+  name: string;
+  desc: string;
+  descEn: string;
+  trigger: string;
+  enabled: boolean;
+}
+
+export interface McpSyncInfo {
+  name: string;
+  url: string;
+}
+
+export function syncSkills(skills: SkillSyncInfo[]): Promise<string> {
+  return invoke('settings_sync_skills', { skills });
+}
+
+export function syncMcps(mcps: McpSyncInfo[]): Promise<string> {
+  return invoke('settings_sync_mcps', { mcps });
+}
+
+export function clearUserData(): Promise<string> {
+  return invoke('settings_clear_user_data');
+}
+
+// ── Provider model fetch ──
+
+export interface ModelInfo {
+  id: string;
+  ownedBy?: string;
+}
+
+export function providerFetchModels(baseUrl: string, apiKey: string): Promise<ModelInfo[]> {
+  return invoke('provider_fetch_models', { baseUrl, apiKey });
+}
+
+// ── MCP v2 sync ──
+
+export interface McpServerV2 {
+  id: string;
+  name: string;
+  transport: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  enabled: boolean;
+}
+
+export function syncMcpsV2(mcps: McpServerV2[]): Promise<string> {
+  return invoke('settings_sync_mcps_v2', { mcps });
+}
+
+// ── Skills v2 sync ──
+
+export interface SkillConfigV2 {
+  id: string;
+  name: string;
+  description: string;
+  license?: string;
+  compatibility?: string;
+  metadata?: Record<string, unknown>;
+  allowedTools?: string[];
+  instructions: string;
+  enabled: boolean;
+}
+
+export function syncSkillsV2(skills: SkillConfigV2[]): Promise<string> {
+  return invoke('settings_sync_skills_v2', { skills });
+}
+
+// ── Scan local skills ──
+
+export function scanLocalSkills(customPath?: string): Promise<SkillConfigV2[]> {
+  return invoke('skills_scan_local', { customPath: customPath ?? null });
 }

@@ -3,6 +3,7 @@
 // undici is lazy-required inside getProxyAgent/configureGlobalAgents to defer
 // ~1.5MB when no HTTPS_PROXY/mTLS env vars are set (the common case).
 import axios, { type AxiosInstance } from 'axios'
+import { execFileSync } from 'child_process'
 import type { LookupOptions } from 'dns'
 import type { Agent } from 'http'
 import { HttpsProxyAgent, type HttpsProxyAgentOptions } from 'https-proxy-agent'
@@ -56,13 +57,65 @@ export function getAddressFamily(options: LookupOptions): 0 | 4 | 6 {
 
 type EnvLike = Record<string, string | undefined>
 
+const getWindowsSystemProxyUrl = memoize((): string | undefined => {
+  if (process.platform !== 'win32') return undefined
+
+  const readValue = (name: string): string | undefined => {
+    try {
+      const output = execFileSync(
+        'reg',
+        [
+          'query',
+          String.raw`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`,
+          '/v',
+          name,
+        ],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+      )
+      const line = output
+        .split(/\r?\n/)
+        .map(l => l.trim())
+        .find(l => l.startsWith(name))
+      return line?.split(/\s+/).at(-1)
+    } catch {
+      return undefined
+    }
+  }
+
+  const enabled = readValue('ProxyEnable')
+  if (enabled !== '0x1' && enabled !== '1') return undefined
+
+  const raw = readValue('ProxyServer')?.trim()
+  if (!raw) return undefined
+
+  const endpoint = raw.includes(';')
+    ? raw
+        .split(';')
+        .map(part => part.trim())
+        .find(part => part.startsWith('https=') || part.startsWith('http='))
+        ?.replace(/^https?=/, '')
+    : raw
+
+  if (!endpoint) return undefined
+  if (endpoint.startsWith('http://') || endpoint.startsWith('https://')) {
+    return endpoint
+  }
+  return `http://${endpoint}`
+})
+
 /**
  * Get the active proxy URL if one is configured
  * Prefers lowercase variants over uppercase (https_proxy > HTTPS_PROXY > http_proxy > HTTP_PROXY)
  * @param env Environment variables to check (defaults to process.env for production use)
  */
 export function getProxyUrl(env: EnvLike = process.env): string | undefined {
-  return env.https_proxy || env.HTTPS_PROXY || env.http_proxy || env.HTTP_PROXY
+  return (
+    env.https_proxy ||
+    env.HTTPS_PROXY ||
+    env.http_proxy ||
+    env.HTTP_PROXY ||
+    getWindowsSystemProxyUrl()
+  )
 }
 
 /**

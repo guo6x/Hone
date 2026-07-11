@@ -1,120 +1,227 @@
 /**
- * Daemon-side SQLite store: messages, schedule runs, agent self-created flags, preferences.
+ * Daemon-side JSON file store: messages, schedule runs, agent self-created flags, preferences.
  *
- * Uses Node 22's built-in `node:sqlite` — no native module install needed.
- * Lives at <HONE_DATA_DIR>/hone.db (shared with desktop, which reads via Tauri IPC).
+ * Originally used node:sqlite, but node:sqlite has SQLITE_IOERR_FSTAT bugs on Windows.
+ * Switched to JSON file storage — simpler, no native deps, sufficient for daemon's data volume.
+ * Lives at <HONE_DATA_DIR>/hone-data.json
  */
-import { DatabaseSync } from 'node:sqlite'
 import * as path from 'path'
 import * as fs from 'fs'
 
-let _db: DatabaseSync | null = null
+interface HoneData {
+  messages: StoredMessage[]
+  schedule_runs: ScheduleRun[]
+  preferences: Record<string, { value: string; updated_at: number }>
+  agent_schedules: AgentScheduleInfo[]
+  tracked_items: TrackedItem[]
+  tracked_item_observations: TrackedItemObservation[]
+  agent_recommendations: AgentRecommendation[]
+  usage_records: UsageRecord[]
+  _ids: { messages: number; runs: number; obs: number; recs: number }
+}
+
+// ── Usage / cost tracking ─────────────────────────────────────────────────
+export interface UsageRecord {
+  /** YYYY-MM-DD */
+  date: string
+  inputTokens: number
+  outputTokens: number
+  calls: number
+  /** Optional cost in CNY, computed from HONE_TOKEN_PRICE env if set */
+  costCny?: number
+}
+
+/** Default daily token budget (input+output). 0 = unlimited. Override via HONE_DAILY_TOKEN_BUDGET. */
+function getDailyTokenBudget(): number {
+  const v = Number(process.env.HONE_DAILY_TOKEN_BUDGET)
+  return Number.isFinite(v) && v > 0 ? v : 0
+}
+
+/** Approximate CNY cost per 1M tokens. Override via HONE_TOKEN_PRICE_CNY_PER_MILLION.
+ *  Default: DeepSeek-chat pricing ≈ ¥1/M input + ¥2/M output → blended ~¥1.5/M. */
+function getTokenPricePerMillion(): { input: number; output: number } {
+  const v = Number(process.env.HONE_TOKEN_PRICE_CNY_PER_MILLION)
+  if (Number.isFinite(v) && v > 0) return { input: v, output: v }
+  return { input: 1, output: 2 }
+}
+
+function todayStr(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+/** Record a single LLM call's token usage. Returns updated daily totals (for budget checks). */
+export function recordUsage(input: { inputTokens: number; outputTokens: number }): {
+  today: UsageRecord
+  budgetExceeded: boolean
+} {
+  const d = loadData()
+  if (!d.usage_records) d.usage_records = []
+
+  const today = todayStr()
+  let rec = d.usage_records.find(r => r.date === today)
+  if (!rec) {
+    rec = { date: today, inputTokens: 0, outputTokens: 0, calls: 0 }
+    d.usage_records.push(rec)
+  }
+
+  rec.inputTokens += input.inputTokens || 0
+  rec.outputTokens += input.outputTokens || 0
+  rec.calls += 1
+
+  const price = getTokenPricePerMillion()
+  rec.costCny = (rec.inputTokens * price.input + rec.outputTokens * price.output) / 1_000_000
+
+  // Cap at 400 days of usage records (older aggregated away)
+  if (d.usage_records.length > 400) {
+    d.usage_records = d.usage_records.slice(-400)
+  }
+
+  scheduleSave()
+
+  const budget = getDailyTokenBudget()
+  const totalToday = rec.inputTokens + rec.outputTokens
+  const budgetExceeded = budget > 0 && totalToday > budget
+
+  if (budgetExceeded) {
+    console.error(`[Usage] ⚠️ 今日 token 用量 ${totalToday} 已超出预算 ${budget}`)
+  }
+
+  return { today: { ...rec }, budgetExceeded }
+}
+
+export interface UsageStats {
+  today: UsageRecord
+  thisMonth: { inputTokens: number; outputTokens: number; calls: number; costCny: number }
+  total: { inputTokens: number; outputTokens: number; calls: number; costCny: number }
+  dailyBudget: number
+  todayRemaining: number  // -1 if unlimited
+}
+
+export function getUsageStats(): UsageStats {
+  const d = loadData()
+  if (!d.usage_records) d.usage_records = []
+
+  const today = todayStr()
+  const monthPrefix = today.slice(0, 7) // YYYY-MM
+
+  const todayRec = d.usage_records.find(r => r.date === today) || {
+    date: today, inputTokens: 0, outputTokens: 0, calls: 0, costCny: 0,
+  }
+
+  let monthInput = 0, monthOutput = 0, monthCalls = 0, monthCost = 0
+  let totalInput = 0, totalOutput = 0, totalCalls = 0, totalCost = 0
+  for (const r of d.usage_records) {
+    totalInput += r.inputTokens
+    totalOutput += r.outputTokens
+    totalCalls += r.calls
+    totalCost += r.costCny || 0
+    if (r.date.startsWith(monthPrefix)) {
+      monthInput += r.inputTokens
+      monthOutput += r.outputTokens
+      monthCalls += r.calls
+      monthCost += r.costCny || 0
+    }
+  }
+
+  const budget = getDailyTokenBudget()
+  const todayTotal = todayRec.inputTokens + todayRec.outputTokens
+  return {
+    today: todayRec,
+    thisMonth: { inputTokens: monthInput, outputTokens: monthOutput, calls: monthCalls, costCny: monthCost },
+    total: { inputTokens: totalInput, outputTokens: totalOutput, calls: totalCalls, costCny: totalCost },
+    dailyBudget: budget,
+    todayRemaining: budget > 0 ? Math.max(0, budget - todayTotal) : -1,
+  }
+}
+
+let _data: HoneData | null = null
+let _saveTimer: ReturnType<typeof setTimeout> | null = null
 
 function getDataDir(): string {
   if (process.env.HONE_DATA_DIR) return process.env.HONE_DATA_DIR
-  const home = process.env.HOME || process.env.USERPROFILE || '~'
+  const home = process.env.HOME || process.env.USERPROFILE || '.'
   return path.join(home, '.hone')
 }
 
-export function getDb(): DatabaseSync {
-  if (_db) return _db
+function getFilePath(): string {
+  return path.join(getDataDir(), 'hone-data.json')
+}
+
+function loadData(): HoneData {
+  if (_data) return _data
   const dir = getDataDir()
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-  const dbPath = path.join(dir, 'hone.db')
-  const db = new DatabaseSync(dbPath)
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA synchronous = NORMAL;
+  const fp = getFilePath()
+  try {
+    if (fs.existsSync(fp)) {
+      const raw = fs.readFileSync(fp, 'utf-8')
+      _data = JSON.parse(raw)
+      // Ensure all arrays exist
+      const d = _data!
+      d.messages = d.messages || []
+      d.schedule_runs = d.schedule_runs || []
+      d.preferences = d.preferences || {}
+      d.agent_schedules = d.agent_schedules || []
+      d.tracked_items = d.tracked_items || []
+      d.tracked_item_observations = d.tracked_item_observations || []
+      d.agent_recommendations = d.agent_recommendations || []
+      d.usage_records = d.usage_records || []
+      d._ids = d._ids || { messages: 0, runs: 0, obs: 0, recs: 0 }
+    } else {
+      _data = {
+        messages: [], schedule_runs: [], preferences: {}, agent_schedules: [],
+        tracked_items: [], tracked_item_observations: [], agent_recommendations: [],
+        usage_records: [],
+        _ids: { messages: 0, runs: 0, obs: 0, recs: 0 },
+      }
+    }
+  } catch (e) {
+    console.error('[Storage] 数据文件损坏，备份后重置:', e)
+    try {
+      const backupPath = fp + `.corrupt-${Date.now()}`
+      fs.renameSync(fp, backupPath)
+      console.error(`[Storage] 损坏文件已备份到: ${backupPath}`)
+    } catch {}
+    _data = {
+      messages: [], schedule_runs: [], preferences: {}, agent_schedules: [],
+      tracked_items: [], tracked_item_observations: [], agent_recommendations: [],
+      usage_records: [],
+      _ids: { messages: 0, runs: 0, obs: 0, recs: 0 },
+    }
+  }
+  return _data
+}
 
-    CREATE TABLE IF NOT EXISTS messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts INTEGER NOT NULL,
-      direction TEXT NOT NULL,          -- 'in' (user→gateway) | 'out' (gateway→user) | 'system'
-      text TEXT NOT NULL,
-      intent_action TEXT,                -- 'reply' | 'dispatch' | 'schedule' | 'browser'
-      intent_task TEXT,
-      result_text TEXT,
-      client_id TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+/** Debounced save — coalesces rapid writes into a single file write. */
+function scheduleSave(): void {
+  if (_saveTimer) clearTimeout(_saveTimer)
+  _saveTimer = setTimeout(() => {
+    _saveTimer = null
+    if (!_data) return
+    try {
+      // 原子写入：先写临时文件再 rename，防止崩溃时数据文件被截断/损坏
+      const fp = getFilePath()
+      const tmp = fp + '.tmp'
+      fs.writeFileSync(tmp, JSON.stringify(_data, null, 2), 'utf-8')
+      fs.renameSync(tmp, fp)
+    } catch (e: any) {
+      console.error(`[Storage] Save failed: ${e.message}`)
+    }
+  }, 200)
+}
 
-    CREATE TABLE IF NOT EXISTS schedule_runs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      schedule_id TEXT NOT NULL,
-      started_at INTEGER NOT NULL,
-      finished_at INTEGER,
-      status TEXT,                       -- 'ok' | 'fail'
-      result TEXT,
-      error TEXT,
-      duration_ms INTEGER
-    );
-    CREATE INDEX IF NOT EXISTS idx_runs_sched ON schedule_runs(schedule_id, started_at DESC);
-
-    CREATE TABLE IF NOT EXISTS preferences (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS agent_schedules (
-      schedule_id TEXT PRIMARY KEY,
-      created_at INTEGER NOT NULL,
-      confidence REAL NOT NULL,
-      source_pattern TEXT,
-      user_corrected INTEGER NOT NULL DEFAULT 0   -- 1 if user has modified/disabled
-    );
-
-    -- Generic "things the user committed me to track".
-    -- kind = 'stock' | 'job' | 'deadline' | 'topic' | 'project' | anything else.
-    -- user_position is a free-form JSON describing the user's commitment:
-    --   for stocks: { shares, avg_cost, broker?, broker_authorized? }
-    --   for jobs:   { stage, company, role, contact }
-    --   for deadlines: { due_at, what }
-    CREATE TABLE IF NOT EXISTS tracked_items (
-      id TEXT PRIMARY KEY,
-      kind TEXT NOT NULL,
-      identifier TEXT NOT NULL,
-      display_name TEXT,
-      user_position TEXT,                 -- JSON
-      status TEXT NOT NULL,               -- 'watching' | 'committed' | 'closed' | 'archived'
-      notes TEXT,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      closed_at INTEGER,
-      monitor_schedule_id TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_tracked_kind ON tracked_items(kind, status);
-    CREATE INDEX IF NOT EXISTS idx_tracked_identifier ON tracked_items(identifier);
-
-    -- Snapshots from each periodic check (price, agent's interpretation, signal).
-    CREATE TABLE IF NOT EXISTS tracked_item_observations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      item_id TEXT NOT NULL,
-      ts INTEGER NOT NULL,
-      data_json TEXT NOT NULL,            -- raw observation
-      agent_assessment TEXT,
-      signal TEXT,                        -- 'none' | 'buy' | 'sell' | 'alert'
-      FOREIGN KEY (item_id) REFERENCES tracked_items(id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_obs_item ON tracked_item_observations(item_id, ts DESC);
-
-    -- Every recommendation the agent made (incl. for non-tracked things).
-    -- item_id may be NULL for one-off advice. user_response/outcome filled in over time.
-    CREATE TABLE IF NOT EXISTS agent_recommendations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      item_id TEXT,
-      ts INTEGER NOT NULL,
-      recommendation TEXT NOT NULL,
-      reasoning TEXT,
-      user_response TEXT,                 -- 'accepted' | 'rejected' | 'ignored' | NULL
-      outcome TEXT,                       -- 'good' | 'bad' | NULL
-      outcome_notes TEXT,
-      reviewed_at INTEGER
-    );
-    CREATE INDEX IF NOT EXISTS idx_rec_item ON agent_recommendations(item_id, ts DESC);
-  `)
-  _db = db
-  return db
+/** Flush pending writes immediately (used on shutdown). */
+export function closeDb(): void {
+  if (_saveTimer) {
+    clearTimeout(_saveTimer)
+    _saveTimer = null
+  }
+  if (_data) {
+    try {
+      fs.writeFileSync(getFilePath(), JSON.stringify(_data, null, 2), 'utf-8')
+    } catch {}
+  }
+  _data = null
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────
@@ -131,37 +238,17 @@ export interface StoredMessage {
 }
 
 export function recordMessage(m: Omit<StoredMessage, 'id'>): void {
-  const db = getDb()
-  db.prepare(
-    `INSERT INTO messages (ts, direction, text, intent_action, intent_task, result_text, client_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    m.ts,
-    m.direction,
-    m.text,
-    m.intent_action ?? null,
-    m.intent_task ?? null,
-    m.result_text ?? null,
-    m.client_id ?? null,
-  )
+  const d = loadData()
+  d._ids.messages = (d._ids.messages || 0) + 1
+  d.messages.push({ ...m, id: d._ids.messages })
+  // Cap at 2000 messages
+  if (d.messages.length > 2000) d.messages = d.messages.slice(-2000)
+  scheduleSave()
 }
 
 export function getRecentMessages(limit: number = 20): StoredMessage[] {
-  const db = getDb()
-  const rows = db.prepare(
-    `SELECT id, ts, direction, text, intent_action, intent_task, result_text, client_id
-     FROM messages ORDER BY ts DESC LIMIT ?`,
-  ).all(limit) as any[]
-  return rows.reverse().map(r => ({
-    id: r.id,
-    ts: r.ts,
-    direction: r.direction,
-    text: r.text,
-    intent_action: r.intent_action ?? undefined,
-    intent_task: r.intent_task ?? undefined,
-    result_text: r.result_text ?? undefined,
-    client_id: r.client_id ?? undefined,
-  }))
+  const d = loadData()
+  return d.messages.slice(-limit).reverse()
 }
 
 // ── Schedule runs ─────────────────────────────────────────────────────────
@@ -178,11 +265,12 @@ export interface ScheduleRun {
 }
 
 export function startRun(scheduleId: string): number {
-  const db = getDb()
-  const info = db.prepare(
-    `INSERT INTO schedule_runs (schedule_id, started_at) VALUES (?, ?)`,
-  ).run(scheduleId, Date.now())
-  return Number(info.lastInsertRowid)
+  const d = loadData()
+  d._ids.runs = (d._ids.runs || 0) + 1
+  const run: ScheduleRun = { id: d._ids.runs, schedule_id: scheduleId, started_at: Date.now() }
+  d.schedule_runs.push(run)
+  scheduleSave()
+  return run.id
 }
 
 export function finishRun(
@@ -191,58 +279,46 @@ export function finishRun(
   result?: string,
   error?: string,
 ): void {
-  const db = getDb()
-  const finishedAt = Date.now()
-  const row = db.prepare(`SELECT started_at FROM schedule_runs WHERE id = ?`).get(runId) as any
-  const durationMs = row?.started_at ? finishedAt - row.started_at : null
-  db.prepare(
-    `UPDATE schedule_runs SET finished_at = ?, status = ?, result = ?, error = ?, duration_ms = ?
-     WHERE id = ?`,
-  ).run(finishedAt, status, result ?? null, error ?? null, durationMs, runId)
+  const d = loadData()
+  const run = d.schedule_runs.find(r => r.id === runId)
+  if (run) {
+    run.finished_at = Date.now()
+    run.status = status
+    run.result = result
+    run.error = error
+    run.duration_ms = run.finished_at - run.started_at
+  }
+  scheduleSave()
 }
 
 export function getScheduleRuns(scheduleId: string, limit: number = 50): ScheduleRun[] {
-  const db = getDb()
-  const rows = db.prepare(
-    `SELECT id, schedule_id, started_at, finished_at, status, result, error, duration_ms
-     FROM schedule_runs WHERE schedule_id = ?
-     ORDER BY started_at DESC LIMIT ?`,
-  ).all(scheduleId, limit) as any[]
-  return rows.map(r => ({
-    id: r.id,
-    schedule_id: r.schedule_id,
-    started_at: r.started_at,
-    finished_at: r.finished_at ?? undefined,
-    status: r.status ?? undefined,
-    result: r.result ?? undefined,
-    error: r.error ?? undefined,
-    duration_ms: r.duration_ms ?? undefined,
-  }))
+  const d = loadData()
+  return d.schedule_runs
+    .filter(r => r.schedule_id === scheduleId)
+    .sort((a, b) => b.started_at - a.started_at)
+    .slice(0, limit)
 }
 
 // ── Preferences ───────────────────────────────────────────────────────────
 
 export function setPref(key: string, value: unknown): void {
-  const db = getDb()
-  db.prepare(
-    `INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-  ).run(key, JSON.stringify(value), Date.now())
+  const d = loadData()
+  d.preferences[key] = { value: JSON.stringify(value), updated_at: Date.now() }
+  scheduleSave()
 }
 
 export function getPref<T = unknown>(key: string, fallback?: T): T | undefined {
-  const db = getDb()
-  const row = db.prepare(`SELECT value FROM preferences WHERE key = ?`).get(key) as any
-  if (!row) return fallback
-  try { return JSON.parse(row.value) as T } catch { return fallback }
+  const d = loadData()
+  const p = d.preferences[key]
+  if (!p) return fallback
+  try { return JSON.parse(p.value) as T } catch { return fallback }
 }
 
 export function listPrefs(): Record<string, unknown> {
-  const db = getDb()
-  const rows = db.prepare(`SELECT key, value FROM preferences`).all() as any[]
+  const d = loadData()
   const out: Record<string, unknown> = {}
-  for (const r of rows) {
-    try { out[r.key] = JSON.parse(r.value) } catch { out[r.key] = r.value }
+  for (const [k, v] of Object.entries(d.preferences)) {
+    try { out[k] = JSON.parse(v.value) } catch { out[k] = v.value }
   }
   return out
 }
@@ -254,19 +330,23 @@ export function markScheduleAgentCreated(
   confidence: number,
   sourcePattern: string,
 ): void {
-  const db = getDb()
-  db.prepare(
-    `INSERT INTO agent_schedules (schedule_id, created_at, confidence, source_pattern)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(schedule_id) DO NOTHING`,
-  ).run(scheduleId, Date.now(), confidence, sourcePattern)
+  const d = loadData()
+  if (!d.agent_schedules.find(s => s.schedule_id === scheduleId)) {
+    d.agent_schedules.push({
+      schedule_id: scheduleId,
+      created_at: Date.now(),
+      confidence,
+      source_pattern: sourcePattern,
+      user_corrected: false,
+    })
+    scheduleSave()
+  }
 }
 
 export function markScheduleCorrected(scheduleId: string): void {
-  const db = getDb()
-  db.prepare(
-    `UPDATE agent_schedules SET user_corrected = 1 WHERE schedule_id = ?`,
-  ).run(scheduleId)
+  const d = loadData()
+  const s = d.agent_schedules.find(s => s.schedule_id === scheduleId)
+  if (s) { s.user_corrected = true; scheduleSave() }
 }
 
 export interface AgentScheduleInfo {
@@ -278,34 +358,13 @@ export interface AgentScheduleInfo {
 }
 
 export function getAgentScheduleInfo(scheduleId: string): AgentScheduleInfo | null {
-  const db = getDb()
-  const row = db.prepare(
-    `SELECT schedule_id, created_at, confidence, source_pattern, user_corrected
-     FROM agent_schedules WHERE schedule_id = ?`,
-  ).get(scheduleId) as any
-  if (!row) return null
-  return {
-    schedule_id: row.schedule_id,
-    created_at: row.created_at,
-    confidence: row.confidence,
-    source_pattern: row.source_pattern ?? undefined,
-    user_corrected: !!row.user_corrected,
-  }
+  const d = loadData()
+  return d.agent_schedules.find(s => s.schedule_id === scheduleId) || null
 }
 
 export function listAgentSchedules(): AgentScheduleInfo[] {
-  const db = getDb()
-  const rows = db.prepare(
-    `SELECT schedule_id, created_at, confidence, source_pattern, user_corrected
-     FROM agent_schedules ORDER BY created_at DESC`,
-  ).all() as any[]
-  return rows.map(r => ({
-    schedule_id: r.schedule_id,
-    created_at: r.created_at,
-    confidence: r.confidence,
-    source_pattern: r.source_pattern ?? undefined,
-    user_corrected: !!r.user_corrected,
-  }))
+  const d = loadData()
+  return d.agent_schedules.slice().sort((a, b) => b.created_at - a.created_at)
 }
 
 // ── Tracked items (positions, watchlist, deadlines, anything) ────────────
@@ -328,26 +387,6 @@ export interface TrackedItem {
   monitor_schedule_id?: string
 }
 
-function rowToItem(r: any): TrackedItem {
-  let pos: Record<string, unknown> | undefined
-  if (r.user_position) {
-    try { pos = JSON.parse(r.user_position) } catch {}
-  }
-  return {
-    id: r.id,
-    kind: r.kind,
-    identifier: r.identifier,
-    display_name: r.display_name ?? undefined,
-    user_position: pos,
-    status: r.status,
-    notes: r.notes ?? undefined,
-    created_at: r.created_at,
-    updated_at: r.updated_at,
-    closed_at: r.closed_at ?? undefined,
-    monitor_schedule_id: r.monitor_schedule_id ?? undefined,
-  }
-}
-
 /** Create or upsert a tracked item by (kind, identifier). Returns the id. */
 export function upsertTrackedItem(input: {
   kind: TrackedItemKind
@@ -358,90 +397,75 @@ export function upsertTrackedItem(input: {
   notes?: string
   monitor_schedule_id?: string
 }): string {
-  const db = getDb()
+  const d = loadData()
   const now = Date.now()
-  const existing = db.prepare(
-    `SELECT id FROM tracked_items WHERE kind = ? AND identifier = ?`,
-  ).get(input.kind, input.identifier) as any
+  const existing = d.tracked_items.find(
+    t => t.kind === input.kind && t.identifier === input.identifier
+  )
   if (existing) {
-    db.prepare(
-      `UPDATE tracked_items
-       SET display_name = COALESCE(?, display_name),
-           user_position = COALESCE(?, user_position),
-           status = COALESCE(?, status),
-           notes = COALESCE(?, notes),
-           monitor_schedule_id = COALESCE(?, monitor_schedule_id),
-           updated_at = ?
-       WHERE id = ?`,
-    ).run(
-      input.display_name ?? null,
-      input.user_position ? JSON.stringify(input.user_position) : null,
-      input.status ?? null,
-      input.notes ?? null,
-      input.monitor_schedule_id ?? null,
-      now,
-      existing.id,
-    )
+    if (input.display_name !== undefined) existing.display_name = input.display_name
+    if (input.user_position !== undefined) existing.user_position = input.user_position
+    if (input.status !== undefined) existing.status = input.status
+    if (input.notes !== undefined) existing.notes = input.notes
+    if (input.monitor_schedule_id !== undefined) existing.monitor_schedule_id = input.monitor_schedule_id
+    existing.updated_at = now
+    scheduleSave()
     return existing.id
   }
   const id = `ti_${input.kind}_${input.identifier}_${now}`
-  db.prepare(
-    `INSERT INTO tracked_items
-     (id, kind, identifier, display_name, user_position, status, notes, created_at, updated_at, monitor_schedule_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
+  const item: TrackedItem = {
     id,
-    input.kind,
-    input.identifier,
-    input.display_name ?? null,
-    input.user_position ? JSON.stringify(input.user_position) : null,
-    input.status ?? 'watching',
-    input.notes ?? null,
-    now,
-    now,
-    input.monitor_schedule_id ?? null,
-  )
+    kind: input.kind,
+    identifier: input.identifier,
+    display_name: input.display_name,
+    user_position: input.user_position,
+    status: input.status ?? 'watching',
+    notes: input.notes,
+    created_at: now,
+    updated_at: now,
+    monitor_schedule_id: input.monitor_schedule_id,
+  }
+  d.tracked_items.push(item)
+  scheduleSave()
   return id
 }
 
 export function listTrackedItems(filter?: { kind?: TrackedItemKind; status?: TrackedItemStatus }): TrackedItem[] {
-  const db = getDb()
-  let q = `SELECT * FROM tracked_items WHERE 1=1`
-  const args: any[] = []
-  if (filter?.kind) { q += ` AND kind = ?`; args.push(filter.kind) }
-  if (filter?.status) { q += ` AND status = ?`; args.push(filter.status) }
-  q += ` ORDER BY updated_at DESC`
-  return (db.prepare(q).all(...args) as any[]).map(rowToItem)
+  const d = loadData()
+  let items = d.tracked_items.slice()
+  if (filter?.kind) items = items.filter(t => t.kind === filter.kind)
+  if (filter?.status) items = items.filter(t => t.status === filter.status)
+  return items.sort((a, b) => b.updated_at - a.updated_at)
 }
 
 export function getTrackedItem(id: string): TrackedItem | null {
-  const db = getDb()
-  const r = db.prepare(`SELECT * FROM tracked_items WHERE id = ?`).get(id) as any
-  return r ? rowToItem(r) : null
+  const d = loadData()
+  return d.tracked_items.find(t => t.id === id) || null
 }
 
 export function getTrackedItemByIdentifier(kind: TrackedItemKind, identifier: string): TrackedItem | null {
-  const db = getDb()
-  const r = db.prepare(
-    `SELECT * FROM tracked_items WHERE kind = ? AND identifier = ?`,
-  ).get(kind, identifier) as any
-  return r ? rowToItem(r) : null
+  const d = loadData()
+  return d.tracked_items.find(t => t.kind === kind && t.identifier === identifier) || null
 }
 
 export function closeTrackedItem(id: string, notes?: string): void {
-  const db = getDb()
-  const now = Date.now()
-  db.prepare(
-    `UPDATE tracked_items SET status = 'closed', closed_at = ?, updated_at = ?, notes = COALESCE(?, notes)
-     WHERE id = ?`,
-  ).run(now, now, notes ?? null, id)
+  const d = loadData()
+  const item = d.tracked_items.find(t => t.id === id)
+  if (item) {
+    item.status = 'closed'
+    item.closed_at = Date.now()
+    item.updated_at = Date.now()
+    if (notes) item.notes = notes
+    scheduleSave()
+  }
 }
 
 export function removeTrackedItem(id: string): void {
-  const db = getDb()
-  db.prepare(`DELETE FROM tracked_item_observations WHERE item_id = ?`).run(id)
-  db.prepare(`DELETE FROM agent_recommendations WHERE item_id = ?`).run(id)
-  db.prepare(`DELETE FROM tracked_items WHERE id = ?`).run(id)
+  const d = loadData()
+  d.tracked_items = d.tracked_items.filter(t => t.id !== id)
+  d.tracked_item_observations = d.tracked_item_observations.filter(o => o.item_id !== id)
+  d.agent_recommendations = d.agent_recommendations.filter(r => r.item_id !== id)
+  scheduleSave()
 }
 
 // ── Observations ──────────────────────────────────────────────────────────
@@ -461,35 +485,31 @@ export function recordObservation(input: {
   agent_assessment?: string
   signal?: Signal
 }): number {
-  const db = getDb()
-  const info = db.prepare(
-    `INSERT INTO tracked_item_observations (item_id, ts, data_json, agent_assessment, signal)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(
-    input.item_id,
-    Date.now(),
-    JSON.stringify(input.data),
-    input.agent_assessment ?? null,
-    input.signal ?? null,
-  )
-  return Number(info.lastInsertRowid)
+  const d = loadData()
+  d._ids.obs = (d._ids.obs || 0) + 1
+  const obs: TrackedItemObservation = {
+    id: d._ids.obs,
+    item_id: input.item_id,
+    ts: Date.now(),
+    data: input.data,
+    agent_assessment: input.agent_assessment,
+    signal: input.signal,
+  }
+  d.tracked_item_observations.push(obs)
+  // Cap at 5000 observations
+  if (d.tracked_item_observations.length > 5000) {
+    d.tracked_item_observations = d.tracked_item_observations.slice(-5000)
+  }
+  scheduleSave()
+  return obs.id
 }
 
 export function getObservations(itemId: string, limit: number = 50): TrackedItemObservation[] {
-  const db = getDb()
-  const rows = db.prepare(
-    `SELECT id, item_id, ts, data_json, agent_assessment, signal
-     FROM tracked_item_observations WHERE item_id = ?
-     ORDER BY ts DESC LIMIT ?`,
-  ).all(itemId, limit) as any[]
-  return rows.map(r => ({
-    id: r.id,
-    item_id: r.item_id,
-    ts: r.ts,
-    data: (() => { try { return JSON.parse(r.data_json) } catch { return {} } })(),
-    agent_assessment: r.agent_assessment ?? undefined,
-    signal: r.signal ?? undefined,
-  }))
+  const d = loadData()
+  return d.tracked_item_observations
+    .filter(o => o.item_id === itemId)
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, limit)
 }
 
 export function getLatestObservation(itemId: string): TrackedItemObservation | null {
@@ -519,73 +539,48 @@ export function recordRecommendation(input: {
   recommendation: string
   reasoning?: string
 }): number {
-  const db = getDb()
-  const info = db.prepare(
-    `INSERT INTO agent_recommendations (item_id, ts, recommendation, reasoning)
-     VALUES (?, ?, ?, ?)`,
-  ).run(
-    input.item_id ?? null,
-    Date.now(),
-    input.recommendation,
-    input.reasoning ?? null,
-  )
-  return Number(info.lastInsertRowid)
+  const d = loadData()
+  d._ids.recs = (d._ids.recs || 0) + 1
+  const rec: AgentRecommendation = {
+    id: d._ids.recs,
+    item_id: input.item_id,
+    ts: Date.now(),
+    recommendation: input.recommendation,
+    reasoning: input.reasoning,
+  }
+  d.agent_recommendations.push(rec)
+  scheduleSave()
+  return rec.id
 }
 
 export function updateRecommendationResponse(id: number, response: RecResponse): void {
-  const db = getDb()
-  db.prepare(
-    `UPDATE agent_recommendations SET user_response = ? WHERE id = ?`,
-  ).run(response, id)
+  const d = loadData()
+  const rec = d.agent_recommendations.find(r => r.id === id)
+  if (rec) { rec.user_response = response; scheduleSave() }
 }
 
 export function reviewRecommendation(id: number, outcome: RecOutcome, notes?: string): void {
-  const db = getDb()
-  db.prepare(
-    `UPDATE agent_recommendations SET outcome = ?, outcome_notes = ?, reviewed_at = ? WHERE id = ?`,
-  ).run(outcome, notes ?? null, Date.now(), id)
+  const d = loadData()
+  const rec = d.agent_recommendations.find(r => r.id === id)
+  if (rec) { rec.outcome = outcome; rec.outcome_notes = notes; rec.reviewed_at = Date.now(); scheduleSave() }
 }
 
 export function getRecommendations(itemId?: string, limit: number = 50): AgentRecommendation[] {
-  const db = getDb()
-  const sql = itemId
-    ? `SELECT * FROM agent_recommendations WHERE item_id = ? ORDER BY ts DESC LIMIT ?`
-    : `SELECT * FROM agent_recommendations ORDER BY ts DESC LIMIT ?`
-  const args = itemId ? [itemId, limit] : [limit]
-  const rows = db.prepare(sql).all(...args) as any[]
-  return rows.map(r => ({
-    id: r.id,
-    item_id: r.item_id ?? undefined,
-    ts: r.ts,
-    recommendation: r.recommendation,
-    reasoning: r.reasoning ?? undefined,
-    user_response: r.user_response ?? undefined,
-    outcome: r.outcome ?? undefined,
-    outcome_notes: r.outcome_notes ?? undefined,
-    reviewed_at: r.reviewed_at ?? undefined,
-  }))
+  const d = loadData()
+  let recs = d.agent_recommendations.slice()
+  if (itemId) recs = recs.filter(r => r.item_id === itemId)
+  return recs.sort((a, b) => b.ts - a.ts).slice(0, limit)
 }
 
 /** Compute recent track record: how many recs reviewed, and how many were good. */
 export function getRecommendationStats(itemId?: string): { total: number; reviewed: number; good: number; bad: number } {
-  const db = getDb()
-  const sql = itemId
-    ? `SELECT COUNT(*) total,
-              SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) reviewed,
-              SUM(CASE WHEN outcome = 'good' THEN 1 ELSE 0 END) good,
-              SUM(CASE WHEN outcome = 'bad' THEN 1 ELSE 0 END) bad
-       FROM agent_recommendations WHERE item_id = ?`
-    : `SELECT COUNT(*) total,
-              SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) reviewed,
-              SUM(CASE WHEN outcome = 'good' THEN 1 ELSE 0 END) good,
-              SUM(CASE WHEN outcome = 'bad' THEN 1 ELSE 0 END) bad
-       FROM agent_recommendations`
-  const args = itemId ? [itemId] : []
-  const r = db.prepare(sql).get(...args) as any
+  const d = loadData()
+  let recs = d.agent_recommendations
+  if (itemId) recs = recs.filter(r => r.item_id === itemId)
   return {
-    total: r.total || 0,
-    reviewed: r.reviewed || 0,
-    good: r.good || 0,
-    bad: r.bad || 0,
+    total: recs.length,
+    reviewed: recs.filter(r => r.outcome).length,
+    good: recs.filter(r => r.outcome === 'good').length,
+    bad: recs.filter(r => r.outcome === 'bad').length,
   }
 }

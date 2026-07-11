@@ -15,7 +15,7 @@ FileDescription = "Hone — AI Coding Console"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
@@ -38,6 +38,7 @@ thiserror = "2"
 dirs = "6"
 reqwest = { version = "0.12", features = ["json"] }
 portable-pty = "0.8"
+keyring = "4.1.4"
 
 [features]
 default = ["custom-protocol"]

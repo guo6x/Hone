@@ -43,7 +43,7 @@ export interface DetectedPattern {
 // ── Log paths ──
 
 function getLogDir(): string {
-  const home = process.env.HOME || process.env.USERPROFILE || '~'
+  const home = os.homedir()
   return path.join(home, '.hone', 'logs')
 }
 
@@ -170,7 +170,7 @@ export function detectPatterns(logs?: ActivityLogEntry[]): DetectedPattern[] {
         confidence,
         evidence: cliStarts.slice(0, 5).map(e => `  ${e.day} — ${e.hour}:00`),
         suggestedSchedule: {
-          text: `每天早上 ${peak.key - 1}:45 检查今日任务`,
+          text: `每天早上 ${Math.max(0, peak.key - 1)}:45 检查今日任务`,
           task: '检查待办事项并总结',
           cron: `45 ${Math.max(0, peak.key - 1)} * * *`,
         },

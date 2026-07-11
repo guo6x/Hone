@@ -9,8 +9,11 @@ pub fn apply_to_command(cmd: &mut Command) {
 
 #[cfg(windows)]
 fn apply_to_command_impl(cmd: &mut Command) {
-    if std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH").is_some() {
-        return;
+    if let Some(existing) = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH") {
+        let existing = PathBuf::from(existing);
+        if existing.is_file() {
+            return;
+        }
     }
 
     if let Some(path) = find_git_bash_path() {
@@ -24,7 +27,7 @@ fn apply_to_command_impl(_cmd: &mut Command) {}
 #[cfg(windows)]
 fn find_git_bash_path() -> Option<PathBuf> {
     for path in common_git_bash_paths() {
-        if path.exists() {
+        if path.is_file() {
             return Some(path);
         }
     }
@@ -67,7 +70,12 @@ fn common_git_bash_paths() -> Vec<PathBuf> {
 
 #[cfg(windows)]
 fn find_git_bash_from_git() -> Option<PathBuf> {
-    let output = Command::new("where.exe").arg("git").output().ok()?;
+    let mut cmd = Command::new("where.exe");
+    cmd.arg("git");
+    // Hide console window — this runs on every gateway/CLI spawn path.
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -87,7 +95,7 @@ fn find_git_bash_from_git() -> Option<PathBuf> {
             continue;
         };
         let bash_path = git_root.join("bin").join("bash.exe");
-        if bash_path.exists() {
+        if bash_path.is_file() {
             return Some(bash_path);
         }
     }

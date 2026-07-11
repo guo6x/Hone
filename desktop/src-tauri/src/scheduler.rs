@@ -11,14 +11,16 @@
 // can display history.
 
 use crate::windows_git_bash;
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use crate::windows_proxy;
+use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::Command as StdCommand;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
+use tokio::process::Command;
 use tokio::time::{interval, Duration};
 
 // ── Schedule types (mirrors frontend ScheduleInfo) ─────────────────────────
@@ -172,10 +174,15 @@ struct SchedulerState {
 ///
 /// `relay_url` is optional — if provided the scheduler will also attempt
 /// to notify the relay when a task completes.
-pub fn spawn(app_handle: tauri::AppHandle, hone_path: String, _relay_url: Option<String>) {
+pub fn spawn(
+    app_handle: tauri::AppHandle,
+    node_path: String,
+    hone_path: String,
+    _relay_url: Option<String>,
+) -> tauri::async_runtime::JoinHandle<()> {
     let state = Arc::new(Mutex::new(SchedulerState::default()));
 
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let mut tick = interval(Duration::from_secs(30));
 
         // Give the app a moment to fully launch before the first check.
@@ -197,33 +204,86 @@ pub fn spawn(app_handle: tauri::AppHandle, hone_path: String, _relay_url: Option
                 if !sched.enabled {
                     continue;
                 }
-                if sched.trigger != "cron" || sched.cron.is_empty() {
+                if sched.cron.is_empty() {
                     continue;
                 }
 
-                // Parse and evaluate cron
-                let expr = match CronExpr::parse(&sched.cron) {
-                    Some(e) => e,
-                    None => {
-                        warn!(
-                            "Scheduler: invalid cron '{}' for schedule {}",
-                            sched.cron, sched.id
-                        );
-                        continue;
-                    }
+                // Determine if schedule should fire based on trigger type.
+                // The frontend stores trigger-specific data in the `cron` field:
+                //   - cron:     cron expression (e.g. "0 9 * * *")
+                //   - interval: minutes as string (e.g. "30")
+                //   - once:     datetime-local string (e.g. "2026-07-09T09:00")
+                let trigger_matches = if sched.trigger == "cron" {
+                    let expr = match CronExpr::parse(&sched.cron) {
+                        Some(e) => e,
+                        None => {
+                            warn!(
+                                "Scheduler: invalid cron '{}' for schedule {}",
+                                sched.cron, sched.id
+                            );
+                            continue;
+                        }
+                    };
+                    expr.matches(&now)
+                } else if sched.trigger == "interval" {
+                    let interval_min: i64 = match sched.cron.trim().parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            warn!(
+                                "Scheduler: invalid interval '{}' for schedule {}",
+                                sched.cron, sched.id
+                            );
+                            continue;
+                        }
+                    };
+                    interval_min > 0 // actual timing check done in mutex below
+                } else if sched.trigger == "once" {
+                    let at = match chrono::NaiveDateTime::parse_from_str(
+                        &sched.cron,
+                        "%Y-%m-%dT%H:%M",
+                    ) {
+                        Ok(dt) => dt,
+                        Err(_) => {
+                            warn!(
+                                "Scheduler: invalid once datetime '{}' for schedule {}",
+                                sched.cron, sched.id
+                            );
+                            continue;
+                        }
+                    };
+                    // datetime-local gives local time; compare with local now
+                    Local::now().naive_local() >= at
+                } else {
+                    continue;
                 };
 
-                if !expr.matches(&now) {
+                if !trigger_matches {
                     continue;
                 }
 
-                // Prevent double-fire within the same minute
+                // Prevent double-fire / check interval timing
                 {
-                    let mut st = state.lock().unwrap();
+                    // Use unwrap_or_else(into_inner) so a poisoned mutex doesn't
+                    // kill the scheduler permanently — we'd rather keep firing
+                    // tasks with possibly-stale last_fire data than silently
+                    // stop all scheduled work.
+                    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(last) = st.last_fire.get(&sched.id) {
-                        let delta = (now - *last).num_seconds();
-                        if delta < 60 {
-                            continue; // already fired this minute
+                        if sched.trigger == "cron" {
+                            let delta = (now - *last).num_seconds();
+                            if delta < 60 {
+                                continue; // already fired this minute
+                            }
+                        } else if sched.trigger == "interval" {
+                            let interval_sec: i64 =
+                                sched.cron.trim().parse::<i64>().unwrap_or(0) * 60;
+                            let delta = (now - *last).num_seconds();
+                            if delta < interval_sec {
+                                continue;
+                            }
+                        } else if sched.trigger == "once" {
+                            // Once schedules should never fire twice
+                            continue;
                         }
                     }
                     st.last_fire.insert(sched.id.clone(), now);
@@ -242,12 +302,22 @@ pub fn spawn(app_handle: tauri::AppHandle, hone_path: String, _relay_url: Option
                 };
 
                 let start = std::time::Instant::now();
-                let result = execute_task(&hone_path, &task);
+                // Run the CLI execution with a 5-minute timeout. Because
+                // execute_task uses tokio::process::Command with kill_on_drop,
+                // a timeout actually kills the child process instead of
+                // orphaning it on a leaked spawn_blocking thread.
+                let result = match tokio::time::timeout(
+                    Duration::from_secs(300),
+                    execute_task(&node_path, &hone_path, &task),
+                ).await {
+                    Ok(r) => r,
+                    Err(_) => Err("CLI task timed out (5 min)".into()),
+                };
                 let duration_ms = start.elapsed().as_millis() as u64;
 
                 // Record the log entry
                 {
-                    let mut st = state.lock().unwrap();
+                    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     let entry = ExecutionLog {
                         schedule_id: sched.id.clone(),
                         triggered_at: now.to_rfc3339(),
@@ -274,7 +344,7 @@ pub fn spawn(app_handle: tauri::AppHandle, hone_path: String, _relay_url: Option
                 }
             }
         }
-    });
+    })
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -301,27 +371,61 @@ fn load_schedules(app: &tauri::AppHandle) -> Result<Vec<ScheduleInfo>, String> {
         return Ok(Vec::new());
     }
     let data = std::fs::read_to_string(&path).map_err(|e| format!("read error: {}", e))?;
-    let schedules: Vec<ScheduleInfo> = serde_json::from_str(&data).unwrap_or_default();
+    let schedules: Vec<ScheduleInfo> = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("Scheduler: schedules JSON parse failed ({}), backing up and resetting", e);
+            let backup = path.with_extension(format!("json.corrupt-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()));
+            let _ = std::fs::rename(&path, &backup);
+            Vec::new()
+        }
+    };
     Ok(schedules)
 }
 
 /// Execute a task by calling the hone CLI.
 ///
 /// Runs `node <hone_path>/dist/cli.js -p "<task>"` in non-interactive mode.
-fn execute_task(hone_path: &str, task: &str) -> Result<String, String> {
+///
+/// Uses `tokio::process::Command` with `kill_on_drop(true)` so that when the
+/// caller drops the future (e.g. on timeout or app shutdown), the CLI child
+/// process is killed instead of being orphaned and continuing to run in the
+/// background after the desktop app exits.
+async fn execute_task(node_path: &str, hone_path: &str, task: &str) -> Result<String, String> {
     let cli_js = format!("{}/dist/cli.js", hone_path);
 
     info!(
         "Scheduler: executing '{} {} -p \"{}\"'",
-        "node", cli_js, task
+        node_path, cli_js, task
     );
 
-    let mut cmd = Command::new("node");
-    cmd.arg(&cli_js).arg("-p").arg(task);
-    windows_git_bash::apply_to_command(&mut cmd);
+    // Build a std::process::Command first so the existing
+    // windows_git_bash / windows_proxy helpers (which take &mut
+    // std::process::Command) can apply env/proxy settings.
+    let mut std_cmd = StdCommand::new(node_path);
+    std_cmd.arg(&cli_js).arg("-p").arg(task);
+    windows_git_bash::apply_to_command(&mut std_cmd);
+    windows_proxy::apply_to_command(&mut std_cmd);
+
+    // Hide the console window on Windows — scheduler runs in the background
+    // and should never pop up a cmd.exe window for each scheduled task.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let mut cmd = Command::from(std_cmd);
+    // Critical: kill the child if this future is dropped (timeout / app exit).
+    cmd.kill_on_drop(true);
 
     let output = cmd
         .output()
+        .await
         .map_err(|e| format!("Failed to spawn CLI: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -389,9 +493,24 @@ fn update_schedule_run(
         }
     }
 
-    let json = serde_json::to_string_pretty(&schedules).unwrap_or_default();
-    if let Err(e) = std::fs::write(&path, json) {
-        warn!("Scheduler: failed to write updated schedules: {}", e);
+    // Serialize; on failure abort the write so we don't truncate the file
+    // with an empty string (which would silently wipe all schedules).
+    let json = match serde_json::to_string_pretty(&schedules) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("Scheduler: failed to serialize schedules: {}", e);
+            return;
+        }
+    };
+    // Atomic write: tmp + rename, so a crash mid-write can't corrupt the file.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        warn!("Scheduler: failed to write schedules tmp file: {}", e);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        warn!("Scheduler: failed to rename schedules tmp file: {}", e);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -403,6 +522,12 @@ fn save_execution_log(
     let st = state.lock().map_err(|e| format!("lock error: {}", e))?;
     let json = serde_json::to_string_pretty(&st.execution_log)
         .map_err(|e| format!("serialize error: {}", e))?;
-    std::fs::write(&path, json).map_err(|e| format!("write error: {}", e))?;
+    // Atomic write: tmp + rename, so a crash mid-write can't corrupt the file.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json).map_err(|e| format!("write error: {}", e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename error: {}", e)
+    })?;
     Ok(())
 }

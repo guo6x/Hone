@@ -1,5 +1,7 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { type Lang, LANG } from '../i18n/translations';
+import { isTauri } from '../tauri/useTauri';
+import { canvasDocumentsList, type CanvasDocumentInfo } from '../tauri/api';
 
 /** Minimal markdown → HTML converter. Handles headers, lists, code, bold, italic, links. */
 function mdToHtml(src: string): string {
@@ -110,11 +112,48 @@ const CanvasViewer: React.FC<Props> = ({ lang, connection }) => {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  // Mirror selectedId into a ref so mergeDocs (defined inside an effect that
+  // doesn't re-run on selectedId changes) always reads the latest value.
+  const selectedIdRef = useRef<number | null>(selectedId);
+  selectedIdRef.current = selectedId;
 
   useEffect(() => {
+    let gatewayDocs: Doc[] = [];
+    let localDocs: Doc[] = [];
+    const mergeDocs = () => {
+      // Merge local canvas sessions with gateway messages, local first
+      const merged = [...localDocs, ...gatewayDocs];
+      setDocs(merged);
+      setLoading(false);
+      if (merged.length > 0 && selectedIdRef.current === null) setSelectedId(merged[0].id);
+    };
+
+    // 1. Fetch local canvas sessions via Tauri IPC
+    if (isTauri()) {
+      canvasDocumentsList().then((sessions: CanvasDocumentInfo[]) => {
+        localDocs = sessions.map((s, index) => ({
+          id: -(index + 1),
+          ts: new Date(s.modified_at).getTime() || Date.now(),
+          title: s.name,
+          text: s.content,
+          kind: classifyKind(s.content),
+          intent: 'canvas',
+        }));
+        mergeDocs();
+      }).catch((e) => {
+        // Don't swallow IPC errors silently — surface them so the user knows
+        // why local canvas documents aren't showing. Gateway docs (if any)
+        // still get merged below.
+        const msg = String(e?.message || e);
+        setErr(lang === 'zh' ? `本地画布加载失败: ${msg}` : `Local canvas load failed: ${msg}`);
+        mergeDocs();
+      });
+    }
+
+    // 2. Also fetch from Gateway WebSocket
     if (!connection) {
       setErr(lang === 'zh' ? 'Gateway 未连接' : 'Gateway not connected');
-      setLoading(false);
+      mergeDocs();
       return;
     }
     const unsub = connection.subscribe((msg: any) => {
@@ -130,15 +169,14 @@ const CanvasViewer: React.FC<Props> = ({ lang, connection }) => {
             intent: m.intent_action,
           }))
           .reverse(); // newest first
-        setDocs(list);
-        setLoading(false);
-        if (list.length > 0 && selectedId === null) setSelectedId(list[0].id);
+        gatewayDocs = list;
+        mergeDocs();
       }
     });
     const sent = connection.send({ type: 'messages_list_request', limit: 200 });
     if (!sent) {
       setErr(lang === 'zh' ? 'Gateway 离线' : 'Gateway offline');
-      setLoading(false);
+      mergeDocs();
     }
     const refreshTimer = setInterval(() => {
       connection.send({ type: 'messages_list_request', limit: 200 });
@@ -212,6 +250,18 @@ const CanvasViewer: React.FC<Props> = ({ lang, connection }) => {
               >
                 {lang === 'zh' ? '复制原文' : 'Copy'}
               </button>
+              {selected.kind === 'html' && (
+                <button
+                  style={styles.toolBtn}
+                  onClick={() => {
+                    const blob = new Blob([selected.text], { type: 'text/html' });
+                    const url = URL.createObjectURL(blob);
+                    window.open(url, '_blank', 'noopener,noreferrer');
+                  }}
+                >
+                  {lang === 'zh' ? '外部打开' : 'Open'}
+                </button>
+              )}
             </div>
             {selected.kind === 'html' ? (
               <iframe
@@ -223,7 +273,11 @@ const CanvasViewer: React.FC<Props> = ({ lang, connection }) => {
                   a { color: #D4A853; }
                   h1, h2, h3 { color: #fff; }
                 </style>${selected.text}`}
-                sandbox="allow-same-origin"
+                // Strictest sandbox: no same-origin, no scripts, no forms.
+                // The HTML comes from gateway/agent output and must not be
+                // able to touch the parent window's localStorage/cookies or
+                // run arbitrary scripts.
+                sandbox=""
                 title={selected.title}
               />
             ) : (

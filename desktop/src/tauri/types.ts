@@ -15,10 +15,37 @@ export interface GatewayConfig {
   temperature?: number;
   max_tokens?: number;
   data_dir?: string;
+  workspace_dir?: string;
   browser_enabled?: boolean;
   gui_model_url?: string;
+  gui_model_name?: string;
+  gui_model_key?: string;
   browser_headless?: boolean;
   browser_max_steps?: number;
+  providers?: ProviderProfileConfig[];
+}
+
+export interface GatewayConnectionInfo {
+  local_port: number;
+  local_auth_token: string;
+  relay_url: string;
+  relay_room: string;
+  pairing_id: string;
+  pairing_code: string;
+  machine_name: string;
+}
+
+export interface ProviderProfileConfig {
+  id: string;
+  name: string;
+  kind: string;
+  api_key: string;
+  base_url: string;
+  model: string;
+  temperature?: number;
+  max_tokens?: number;
+  enabled: boolean;
+  is_default: boolean;
 }
 
 export type GatewayStatus =

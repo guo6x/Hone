@@ -6,11 +6,12 @@
  */
 import fs from 'fs/promises'
 import path from 'path'
+import * as os from 'os'
 import type { CredentialEntry } from './types.js'
 import { osEncrypt, osDecrypt, osReEncrypt, getEncryptMethod } from './os-credentials.js'
 
 function getDataDir(): string {
-  const base = process.env.HONE_DATA_DIR || path.join(process.env.HOME || '~', '.hone')
+  const base = process.env.HONE_DATA_DIR || path.join(os.homedir(), '.hone')
   return path.join(base, 'browser')
 }
 

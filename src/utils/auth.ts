@@ -211,6 +211,34 @@ export type ApiKeySource =
   | '/login managed key'
   | 'none'
 
+function normalizeHoneProvider(value: string | undefined): string {
+  return (value ?? '').trim().toLowerCase()
+}
+
+function hasHoneProviderAuth(): boolean {
+  const provider = normalizeHoneProvider(process.env.HONE_PROVIDER)
+
+  if (provider === 'anthropic' || provider === 'claude') {
+    return false
+  }
+  if (provider === 'deepseek') {
+    return Boolean(process.env.HONE_DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY || process.env.HONE_API_KEY)
+  }
+  if (provider === 'openai') {
+    return Boolean(process.env.HONE_OPENAI_API_KEY || process.env.OPENAI_API_KEY || process.env.HONE_API_KEY)
+  }
+  if (provider === 'custom') {
+    return Boolean(process.env.HONE_CUSTOM_API_KEY || process.env.HONE_API_KEY)
+  }
+
+  return Boolean(
+    process.env.HONE_DEEPSEEK_API_KEY ||
+      process.env.DEEPSEEK_API_KEY ||
+      process.env.HONE_OPENAI_API_KEY ||
+      process.env.HONE_CUSTOM_API_KEY,
+  )
+}
+
 export function getAnthropicApiKey(): null | string {
   const { key } = getAnthropicApiKeyWithSource()
   return key
@@ -229,9 +257,10 @@ export function getAnthropicApiKeyWithSource(
   key: null | string
   source: ApiKeySource
 } {
-  // DeepSeek override: skip login if we have a key
-  if (process.env.DEEPSEEK_API_KEY) {
-    return { key: 'dummy-deepseek-key', source: '/login managed key' }
+  // Hone override: skip Claude login only when a Hone-supported third-party
+  // provider is explicitly configured or detectable from provider-specific env.
+  if (hasHoneProviderAuth()) {
+    return { key: 'dummy-hone-key', source: '/login managed key' }
   }
 
   // --bare: hermetic auth. Only ANTHROPIC_API_KEY env or apiKeyHelper from
@@ -301,12 +330,7 @@ export function getAnthropicApiKeyWithSource(
     }
   }
   // Check for ANTHROPIC_API_KEY before checking the apiKeyHelper or /login-managed key
-  if (
-    apiKeyEnv &&
-    getGlobalConfig().customApiKeyResponses?.approved?.includes(
-      normalizeApiKeyForConfig(apiKeyEnv),
-    )
-  ) {
+  if (apiKeyEnv) {
     return {
       key: apiKeyEnv,
       source: 'ANTHROPIC_API_KEY',
@@ -358,8 +382,11 @@ export function getAnthropicApiKeyWithSource(
  */
 export function getApiKeyStatus(): { hasKey: boolean; source: string } {
   const keys = [
+    { key: process.env.HONE_DEEPSEEK_API_KEY, name: 'HONE_DEEPSEEK_API_KEY' },
     { key: process.env.DEEPSEEK_API_KEY, name: 'DEEPSEEK_API_KEY' },
+    { key: process.env.HONE_OPENAI_API_KEY, name: 'HONE_OPENAI_API_KEY' },
     { key: process.env.OPENAI_API_KEY, name: 'OPENAI_API_KEY' },
+    { key: process.env.HONE_CUSTOM_API_KEY, name: 'HONE_CUSTOM_API_KEY' },
     { key: process.env.HONE_API_KEY, name: 'HONE_API_KEY' },
   ]
   for (const k of keys) {
@@ -1184,11 +1211,9 @@ export async function saveApiKey(apiKey: string): Promise<void> {
 }
 
 export function isCustomApiKeyApproved(apiKey: string): boolean {
-  const config = getGlobalConfig()
   const normalizedKey = normalizeApiKeyForConfig(apiKey)
-  return (
-    config.customApiKeyResponses?.approved?.includes(normalizedKey) ?? false
-  )
+  const config = getGlobalConfig()
+  return Boolean(config.customApiKeyResponses?.approved?.includes(normalizedKey))
 }
 
 export async function removeApiKey(): Promise<void> {
@@ -1277,10 +1302,10 @@ export function saveOAuthTokensIfNeeded(tokens: OAuthTokens): {
 }
 
 export const getClaudeAIOAuthTokens = memoize((): OAuthTokens | null => {
-  // DeepSeek override: skip login if we have a key
-  if (process.env.DEEPSEEK_API_KEY) {
+  // Hone override: skip Claude login only for Hone-supported third-party providers.
+  if (hasHoneProviderAuth()) {
     return {
-      accessToken: 'dummy-deepseek-token',
+      accessToken: 'dummy-hone-token',
       refreshToken: null,
       expiresAt: null,
       scopes: ['user:inference'],

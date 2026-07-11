@@ -1,6 +1,10 @@
 /**
  * Hone Worker Registry — tracks connected CLI workers.
  *
+ * NOTE: This module is currently unused. dispatchTask in gateway.ts spawns CLI
+ * subprocesses directly. This module is retained for future multi-worker
+ * scheduling when CLI instances register via WebSocket.
+ *
  * Each CLI instance that connects to the Gateway registers as a worker.
  * The Gateway tracks capabilities (available tools, current workload)
  * and dispatches tasks to the least busy worker.

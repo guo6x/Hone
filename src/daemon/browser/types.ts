@@ -64,7 +64,7 @@ export interface CredentialEntry {
   id: string
   service: string             // "twitter", "github", etc.
   username: string
-  password: string            // encrypted at rest (base64 for now)
+  password: string            // encrypted at rest via OS-level encryption (DPAPI/Keychain/libsecret)
   notes: string
   createdAt: number
 }
@@ -87,6 +87,6 @@ export interface BrowserAgent {
   navigate(profileName: string, url: string): Promise<BrowserState>
   screenshot(profileName: string): Promise<string>
   extract(profileName: string, selector: string): Promise<string>
-  listProfiles(): string[]
+  listProfiles(): Promise<string[]>
   shutdown(): Promise<void>
 }

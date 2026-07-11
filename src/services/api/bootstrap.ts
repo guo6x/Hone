@@ -40,7 +40,7 @@ const bootstrapResponseSchema = lazySchema(() =>
 type BootstrapResponse = z.infer<ReturnType<typeof bootstrapResponseSchema>>
 
 async function fetchBootstrapAPI(): Promise<BootstrapResponse | null> {
-  if (process.env.DEEPSEEK_API_KEY) {
+  if (process.env.HONE_DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY) {
     logForDebugging('[Bootstrap] Skipped: DeepSeek mode')
     return null
   }

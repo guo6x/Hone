@@ -321,7 +321,7 @@ export function calculateShouldShowGrove(
 }
 
 export async function checkGroveForNonInteractive(): Promise<void> {
-  if (process.env.DEEPSEEK_API_KEY) return
+  if (process.env.HONE_DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY) return
   const [settingsResult, configResult] = await Promise.all([
     getGroveSettings(),
     getGroveNoticeConfig(),

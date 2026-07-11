@@ -263,7 +263,7 @@ export function ConsoleOAuthFlow({
   }, [oauthService, setShowPastePrompt, loginWithClaudeAi, mode, orgUUID]);
   const pendingOAuthStartRef = useRef(false);
   useEffect(() => {
-    if (process.env.DEEPSEEK_API_KEY) {
+    if (process.env.HONE_DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY) {
       onDone();
     }
   }, [onDone]);

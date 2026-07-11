@@ -33,9 +33,8 @@ export async function daemonMain(args: string[]): Promise<void> {
         verbose: args.includes('--verbose'),
       }
 
-      runningState = await startGateway(config)
-
-      // Keep process alive
+      // Register signal handlers BEFORE startGateway so Ctrl+C during startup
+      // can still clean up. runningState is null until startGateway resolves.
       const shutdown = async () => {
         if (runningState) {
           await stopGateway(runningState)
@@ -45,6 +44,8 @@ export async function daemonMain(args: string[]): Promise<void> {
       }
       process.on('SIGINT', shutdown)
       process.on('SIGTERM', shutdown)
+
+      runningState = await startGateway(config)
       break
     }
 

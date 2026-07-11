@@ -4575,7 +4575,7 @@ export function REPL({
               {!showSpinner && !isLoading && !userInputOnProcessing && !hasRunningTeammates && isBriefOnly && !viewedAgentTask && <BriefIdleStatus />}
               {isFullscreenEnvEnabled() && <PromptInputQueuedCommands />}
             </>} bottom={<Box flexDirection={true && companionNarrow ? 'column' : 'row'} width="100%" alignItems={true && companionNarrow ? undefined : 'flex-end'}>
-              {true && companionNarrow && isFullscreenEnvEnabled() && companionVisible ? <CompanionSprite /> : null}
+              {true && companionNarrow && isFullscreenEnvEnabled() && companionVisible ? <CompanionSprite scrollRef={scrollRef} /> : null}
               <Box flexDirection="column" flexGrow={1}>
                 {permissionStickyFooter}
                 {/* Immediate local-jsx commands (/btw, /sandbox, /assistant,
@@ -4979,7 +4979,7 @@ export function REPL({
           }} />}
                 {"external" === 'ant' && <DevBar />}
               </Box>
-              {true && !(companionNarrow && isFullscreenEnvEnabled()) && companionVisible ? <CompanionSprite /> : null}
+              {true && !(companionNarrow && isFullscreenEnvEnabled()) && companionVisible ? <CompanionSprite scrollRef={scrollRef} /> : null}
             </Box>} />
       </MCPConnectionManager>
     </KeybindingSetup>;

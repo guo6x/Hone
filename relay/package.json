@@ -1,14 +1,11 @@
 {
   "name": "hone-relay",
-  "version": "1.0.0",
   "private": true,
-  "description": "Hone Relay — Cloudflare Workers WebSocket relay",
+  "type": "module",
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
-    "tail": "wrangler tail"
-  },
-  "devDependencies": {
-    "wrangler": "^4.91.0"
+    "build": "node build-assets.mjs",
+    "test:auth": "node test-auth.mjs",
+    "test:relay": "node test-relay.mjs",
+    "test:local": "node test-relay-room.mjs"
   }
 }

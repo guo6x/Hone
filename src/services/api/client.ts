@@ -362,7 +362,7 @@ function buildFetch(
   fetchOverride: ClientOptions['fetch'],
   source: string | undefined,
 ): ClientOptions['fetch'] {
-  const isDeepSeek = !!process.env.DEEPSEEK_API_KEY;
+  const isDeepSeek = !!(process.env.HONE_DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY);
   // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
   const inner = fetchOverride ?? globalThis.fetch
   // Only send to the first-party API — Bedrock/Vertex/Foundry don't log it
@@ -383,7 +383,7 @@ function buildFetch(
                 method: 'POST',
                 headers: {
                     ...init?.headers,
-                    'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+                    'Authorization': `Bearer ${process.env.HONE_DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify(body)

@@ -1,6 +1,7 @@
 use ssh2::Session;
 use std::io::Read;
 use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -34,6 +35,7 @@ pub enum TunnelError {
     ConnectionFailed(String),
     #[error("Authentication failed: {0}")]
     AuthFailed(String),
+    #[allow(dead_code)]
     #[error("Not connected")]
     NotConnected,
     #[error("IO error: {0}")]
@@ -46,8 +48,15 @@ pub enum TunnelError {
 
 pub struct SshTunnel {
     config: SshConfig,
-    pub(crate) session: Option<Session>,
+    // Wrapped in Arc<Mutex<..>> so the session can be shared between the
+    // tunnel (for disconnect) and concurrent ssh_execute calls without being
+    // "taken out" of the tunnel — which previously caused a race where a
+    // second ssh_execute arriving while the first was in-flight saw
+    // `session = None` and failed with "No active SSH tunnel".
+    pub(crate) session: Option<Arc<Mutex<Session>>>,
+    #[allow(dead_code)]
     local_port: u16,
+    #[allow(dead_code)]
     remote_port: u16,
 }
 
@@ -109,12 +118,18 @@ impl SshTunnel {
             return Err(TunnelError::AuthFailed("all methods exhausted".into()));
         }
 
-        self.session = Some(session);
+        self.session = Some(Arc::new(Mutex::new(session)));
         Ok(())
     }
 
     pub fn disconnect(&mut self) -> Result<(), TunnelError> {
-        if let Some(ref mut session) = self.session.take() {
+        if let Some(session_arc) = self.session.take() {
+            // Lock to ensure no in-flight command is using the session while
+            // we tear it down. If the lock is poisoned, recover it — we're
+            // disconnecting anyway.
+            let session = session_arc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             session
                 .disconnect(None, "client disconnect", None)
                 .map_err(|e| TunnelError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
@@ -122,14 +137,22 @@ impl SshTunnel {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
-        self.session.as_ref().map_or(false, |s| s.authenticated())
+        self.session.as_ref().map_or(false, |s| {
+            s.lock()
+                .map_or(false, |guard| guard.authenticated())
+        })
     }
 
     // -- remote execution ---------------------------------------------------
 
+    #[allow(dead_code)]
     pub fn execute(&self, command: &str) -> Result<String, TunnelError> {
-        let session = self.session.as_ref().ok_or(TunnelError::NotConnected)?;
+        let session_arc = self.session.as_ref().ok_or(TunnelError::NotConnected)?;
+        let session = session_arc
+            .lock()
+            .map_err(|_| TunnelError::Io(std::io::Error::new(std::io::ErrorKind::Other, "session lock poisoned")))?;
 
         let mut channel = session
             .channel_session()

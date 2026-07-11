@@ -7,6 +7,8 @@
  *
  * Usage: node relay/test-auth.mjs
  */
+import { websocketOptions } from './test-proxy.mjs'
+import WebSocket from 'ws'
 
 let passed = 0, failed = 0, warned = 0
 function ok(n) { console.log(`  ✅ ${n}`); passed++ }
@@ -99,7 +101,7 @@ async function testDeployedRelay() {
       resolve()
     }, 12000)
 
-    const gw = new WebSocket(`${RELAY}/connect/${ROOM}`)
+    const gw = new WebSocket(`${RELAY}/connect/${ROOM}`, websocketOptions())
 
     gw.onopen = () => {
       gw.send(JSON.stringify({ type: 'register', role: 'gateway', machineId: 'auth-gw', machineName: 'auth-gw' }))
@@ -131,7 +133,7 @@ async function testDeployedRelay() {
 
     // Client
     setTimeout(() => {
-      const cl = new WebSocket(`${RELAY}/connect/${ROOM}`)
+      const cl = new WebSocket(`${RELAY}/connect/${ROOM}`, websocketOptions())
 
       cl.onopen = () => {
         cl.send(JSON.stringify({ type: 'register', role: 'client', pairingCode: 'auth-test-12345' }))

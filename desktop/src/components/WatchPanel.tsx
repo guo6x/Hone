@@ -8,7 +8,7 @@
  *
  * No SQL access from desktop — daemon owns the data, desktop just renders.
  */
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { type Lang } from '../i18n/translations';
 
 interface Observation {
@@ -63,15 +63,27 @@ const WatchPanel: React.FC<Props> = ({ lang, connection }) => {
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // Ref mirror so the subscribe callback (which should NOT re-subscribe on
+  // every selection change) always reads the latest selectedId.
+  const selectedIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedId;
+  // Ref mirror for `t` so the subscribe callback always uses the current
+  // language. Without this, switching language wouldn't update the error
+  // string produced inside the effect (t is stale in the closure), since
+  // the effect deliberately only depends on `connection` to avoid
+  // re-subscribing (and losing in-flight messages) on every render.
+  const tRef = useRef(t);
+  tRef.current = t;
+
   // Subscribe + initial fetch
   useEffect(() => {
-    if (!connection) { setErr(t('Gateway 未连接', 'Gateway not connected')); setLoading(false); return; }
+    if (!connection) { setErr(tRef.current('Gateway 未连接', 'Gateway not connected')); setLoading(false); return; }
     const unsub = connection.subscribe((msg: any) => {
       if (msg.type === 'tracked_items_list_response') {
         setItems(msg.items || []);
         setLoading(false);
-        if (!selectedId && msg.items?.length > 0) setSelectedId(msg.items[0].id);
-      } else if (msg.type === 'tracked_item_detail_response' && msg.itemId === selectedId) {
+        if (!selectedIdRef.current && msg.items?.length > 0) setSelectedId(msg.items[0].id);
+      } else if (msg.type === 'tracked_item_detail_response' && msg.itemId === selectedIdRef.current) {
         setDetail({ observations: msg.observations || [], recommendations: msg.recommendations || [] });
       } else if (msg.type === 'tracked_items_changed') {
         connection.send({ type: 'tracked_items_list_request' });
@@ -119,13 +131,24 @@ const WatchPanel: React.FC<Props> = ({ lang, connection }) => {
     let priceColor: string | undefined;
     let pnlCell = '';
     if (isStock && d.current != null) {
+      const current = Number(d.current);
       const pct = Number(d.change_pct) || 0;
-      priceCell = `${d.current.toFixed(2)} (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`;
-      priceColor = pct > 0 ? 'var(--hone-danger)' : pct < 0 ? 'var(--hone-success)' : 'var(--hone-muted)';
+      if (!isNaN(current)) {
+        priceCell = `${current.toFixed(2)} (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`;
+        priceColor = pct > 0 ? 'var(--hone-danger)' : pct < 0 ? 'var(--hone-success)' : 'var(--hone-muted)';
+      }
     }
-    if (isStock && p?.shares && p?.avg_cost && d.current) {
-      const pnlPct = ((d.current - p.avg_cost) / p.avg_cost) * 100;
-      pnlCell = `浮${pnlPct >= 0 ? '盈' : '亏'} ${pnlPct.toFixed(2)}%`;
+    if (isStock && p && p.shares != null && p.avg_cost != null && d.current != null) {
+      const current = Number(d.current);
+      const avgCost = Number(p.avg_cost);
+      const shares = Number(p.shares);
+      // Only compute P&L when we actually hold shares and have a cost basis.
+      // Using != null (instead of truthy) so shares=0 still shows "no position"
+      // rather than silently hiding the cell.
+      if (!isNaN(current) && !isNaN(avgCost) && !isNaN(shares) && avgCost !== 0 && shares > 0) {
+        const pnlPct = ((current - avgCost) / avgCost) * 100;
+        pnlCell = `浮${pnlPct >= 0 ? '盈' : '亏'} ${pnlPct.toFixed(2)}%`;
+      }
     }
     const sigDot = ob?.signal && ob.signal !== 'none'
       ? <span style={{ ...styles.signalDot, background: ob.signal === 'sell' ? 'var(--hone-danger)' : ob.signal === 'alert' ? 'var(--hone-warning)' : 'var(--hone-success)' }} title={ob.signal} />

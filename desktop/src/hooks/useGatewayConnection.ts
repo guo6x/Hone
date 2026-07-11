@@ -1,12 +1,12 @@
 /**
- * Global, app-lifetime WebSocket connection to the relay → gateway.
+ * Global, app-lifetime authenticated connection to the local Gateway.
  *
  * Mounted once in App.tsx so all tabs (Dashboard, GatewayChat, WebTaskRunner)
  * share a single connection. Each tab subscribes to events via the `subscribe`
  * callback and reads connection state via `status` / `messages`.
  *
  * Connection lifecycle:
- *   - Auto-connect on mount (if relayUrl provided)
+ *   - Auto-connect on mount after receiving a local capability token from Tauri
  *   - Auto-reconnect with exponential backoff up to MAX_RECONNECT_ATTEMPTS
  *   - Sends 'register' role=client with a stable clientId per app session
  */
@@ -28,9 +28,14 @@ export interface RelayMessage {
 export type RelayEventListener = (msg: RelayMessage) => void;
 
 interface UseGatewayConnectionOptions {
+  /** Relay URL is retained for diagnostics; desktop traffic uses localhost. */
   relayUrl?: string;
   /** Enable/disable the connection (allows pausing without unmount). */
   enabled?: boolean;
+  /** Local daemon WebSocket port (default 18789). */
+  localPort?: number;
+  /** Per-install capability required by the local Gateway handshake. */
+  localToken?: string;
 }
 
 interface UseGatewayConnectionReturn {
@@ -51,14 +56,14 @@ interface UseGatewayConnectionReturn {
   error: string | null;
 }
 
-const MAX_RECONNECT_ATTEMPTS = 10;
-const BASE_RECONNECT_DELAY_MS = 2000;
+const MAX_RECONNECT_ATTEMPTS = 60; // 持续重试60次（约2分钟），覆盖 daemon 冷启动
+const BASE_RECONNECT_DELAY_MS = 1500;
 const PING_INTERVAL_MS = 15_000;
 
 export function useGatewayConnection(
   opts: UseGatewayConnectionOptions,
 ): UseGatewayConnectionReturn {
-  const { relayUrl, enabled = true } = opts;
+  const { relayUrl, enabled = true, localPort: optsLocalPort, localToken } = opts;
 
   const [status, setStatus] = useState<ConnectionStatus>('starting');
   const [latencyMs, setLatencyMs] = useState<number>(-1);
@@ -117,15 +122,35 @@ export function useGatewayConnection(
   };
 
   const connect = useCallback(() => {
-    if (!relayUrl || !enabled) return;
+    // NOTE: we intentionally do NOT check `enabled` here. `enabled` only gates
+    // the auto-connect in useEffect. Manual reconnect() calls (e.g. after the
+    // daemon finishes booting) must always attempt a connection — otherwise
+    // reconnect() is silently dropped when the daemonOnline poll hasn't flipped
+    // enabled=true yet (up to 1s lag), and the UI stays "reconnecting" forever.
+    if (!localToken) return;
     if (wsRef.current && wsRef.current.readyState <= 1) return; // CONNECTING or OPEN
 
     setStatus(prev => (prev === 'online' ? prev : 'starting'));
     setError(null);
 
+    // Prefer a direct local connection to the gateway daemon (ws://localhost:PORT)
+    // over the relay. The daemon listens on 127.0.0.1:HONE_GATEWAY_PORT and
+    // accepts same-machine clients — this bypasses the relay entirely, which is
+    // critical when the relay (Cloudflare Workers) is unreachable due to network
+    // restrictions or proxy issues.
+    //
+    // IMPORTANT: Use `localhost` (not `127.0.0.1`) in the URL. The Tauri CSP
+    // allows `ws://localhost:*` but WebView2 treats `127.0.0.1` and `localhost`
+    // as different origins — a `ws://127.0.0.1:*` connection is silently blocked
+    // by CSP, causing the WS to fail and retry forever ("starting/reconnecting"
+    // loop in the UI). `localhost` resolves to 127.0.0.1 on Windows so the
+    // daemon (bound to 127.0.0.1) still accepts the connection.
+    const port = optsLocalPort || 18789;
+    const targetUrl = `ws://localhost:${port}`;
+
     let ws: WebSocket;
     try {
-      ws = new WebSocket(relayUrl);
+      ws = new WebSocket(targetUrl);
     } catch (e: any) {
       setError(e?.message ?? String(e));
       scheduleReconnect();
@@ -133,14 +158,24 @@ export function useGatewayConnection(
     }
     wsRef.current = ws;
 
+    // Connection timeout: 3s is enough for local connections (ECONNREFUSED
+    // is instant; a successful local connect is sub-millisecond). If the
+    // daemon hasn't started its local WS server yet, we fail fast and retry.
+    const connectTimer = setTimeout(() => {
+      if (ws.readyState === WebSocket.CONNECTING) {
+        try { ws.close(); } catch {}
+      }
+    }, 3000);
+
     ws.onopen = () => {
+      clearTimeout(connectTimer);
       ws.send(JSON.stringify({
         type: 'register',
-        role: 'client',
+        role: 'desktop',
+        token: localToken,
         clientId: clientIdRef.current,
         machineId: 'desktop-' + clientIdRef.current,
         machineName: 'Desktop',
-        pairingCode: 'hone-desktop-auto',
       }));
 
       // Heartbeat ping for latency measurement
@@ -182,8 +217,24 @@ export function useGatewayConnection(
           break;
         case 'message':
         case 'task_complete':
+        case 'browser_task_result':
           // Returning to online from thinking state
           setStatus(prev => (prev === 'thinking' ? 'online' : prev));
+          break;
+        case 'task_started':
+        case 'task_dispatched':
+        case 'browser_task_started':
+          // Gateway picked up work — flip to thinking so the UI reflects activity.
+          setStatus(prev => (prev === 'online' ? 'thinking' : prev));
+          break;
+        case 'pairing_required':
+          // Relay says we need to pair. Drop to offline so the user sees a
+          // problem instead of being stuck in a fake "online" state.
+          setStatus('offline');
+          break;
+        case 'gateway_disconnected':
+          // The gateway daemon on the other side went away.
+          setStatus(prev => (prev === 'online' || prev === 'thinking') ? 'reconnecting' : prev);
           break;
       }
 
@@ -194,6 +245,7 @@ export function useGatewayConnection(
     };
 
     ws.onclose = () => {
+      clearTimeout(connectTimer);
       wsRef.current = null;
       registeredRef.current = false;
       clearPing();
@@ -204,22 +256,35 @@ export function useGatewayConnection(
       }
     };
 
-    ws.onerror = () => {
-      // onclose fires after onerror
+    ws.onerror = (event: any) => {
+      // Surface the real error so the UI can show WHY the connection failed
+      // instead of silently looping between "starting" and "reconnecting".
+      // In Tauri WebView2, CSP violations produce a SecurityError here.
+      const reason = event?.message || event?.code || 'unknown';
+      setError(`WS error: ${reason} (url=${targetUrl})`);
     };
-  }, [relayUrl, enabled]);
+  }, [relayUrl, optsLocalPort, localToken]);
 
   function scheduleReconnect() {
     if (intentionalStopRef.current) return;
     if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
       setStatus('offline');
+      // Surface a clear reason so the UI can show "relay unreachable" instead
+      // of just silently flipping to offline after a long retry storm.
+      setError('Local Gateway unreachable — 检查桌面端 Gateway 是否正在运行');
       return;
     }
     reconnectAttemptsRef.current++;
-    const delay = Math.min(
-      BASE_RECONNECT_DELAY_MS * 2 ** (reconnectAttemptsRef.current - 1),
-      30_000,
-    );
+    // 前 15 次用固定 400ms 间隔快速重试，覆盖 daemon 冷启动（Node.js
+    // 启动 + cli.js 加载 + 端口监听通常需要 2-5 秒）。Rust 端在 spawn
+    // node 后 250ms 就把状态设为 Running，但此时端口可能还没开始监听，
+    // 所以我们需要快速重试直到端口真正可用。之后用指数退避覆盖网络问题。
+    const delay = reconnectAttemptsRef.current <= 15
+      ? 400
+      : Math.min(
+          BASE_RECONNECT_DELAY_MS * 2 ** (reconnectAttemptsRef.current - 16),
+          10_000,
+        );
     setStatus('reconnecting');
     clearReconnect();
     reconnectTimerRef.current = setTimeout(() => {
@@ -241,11 +306,16 @@ export function useGatewayConnection(
 
   // Mount: connect; Unmount: tear down
   useEffect(() => {
-    if (!enabled || !relayUrl) {
+    if (!enabled || !localToken) {
       setStatus('offline');
       return;
     }
     intentionalStopRef.current = false;
+    // Reset the retry counter so a re-enable (daemon just came online) starts
+    // fresh. Without this, if the counter was exhausted during a previous
+    // disabled window, scheduleReconnect() would immediately bail to offline
+    // even though the daemon is now ready.
+    reconnectAttemptsRef.current = 0;
     connect();
     return () => {
       intentionalStopRef.current = true;
@@ -258,7 +328,7 @@ export function useGatewayConnection(
       registeredRef.current = false;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [relayUrl, enabled]);
+  }, [relayUrl, enabled, localToken]);
 
   return {
     status,

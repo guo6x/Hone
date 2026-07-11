@@ -156,7 +156,7 @@ function getStorePath(): string {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
     return path.join(dir, 'schedules.json')
   }
-  const home = process.env.HOME || process.env.USERPROFILE || '~'
+  const home = process.env.HOME || process.env.USERPROFILE || '.'
   const dir = path.join(home, '.hone')
   return path.join(dir, 'schedules.json')
 }
@@ -215,7 +215,11 @@ export function saveSchedules(schedules: Map<string, ScheduleEntry>): void {
         lastStatus: e.lastStatus,
       })
     }
-    fs.writeFileSync(getStorePath(), JSON.stringify(entries, null, 2), 'utf-8')
+    // 原子写入：先写临时文件再 rename，防止崩溃时 schedules.json 被截断/损坏
+    const storePath = getStorePath()
+    const tmp = storePath + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(entries, null, 2), 'utf-8')
+    fs.renameSync(tmp, storePath)
   } catch (err) {
     console.error(`[Scheduler] 保存日程失败: ${err}`)
   }
@@ -229,6 +233,8 @@ interface SchedulerState {
   cronCache: Map<string, (now: Date) => boolean>
   ctx: GatewayContext
   onTrigger: (entry: ScheduleEntry) => Promise<void>
+  /** Last observed schedule-store modification time for desktop edits. */
+  storeMtimeMs: number
 }
 
 const CHECK_INTERVAL_MS = 30_000
@@ -244,18 +250,44 @@ export function createScheduler(
     cronCache: new Map(),
     ctx,
     onTrigger,
+    storeMtimeMs: getStoreMtimeMs(),
   }
 
   const interval = setInterval(() => checkAll(state), CHECK_INTERVAL_MS)
   state.timers.set('__global__', interval as unknown as ReturnType<typeof setTimeout>)
 
   // Initial check after a short delay
-  setTimeout(() => checkAll(state), 2000)
+  const initialTimer = setTimeout(() => checkAll(state), 2000)
+  state.timers.set('__initial__', initialTimer as unknown as ReturnType<typeof setTimeout>)
 
   return state
 }
 
+function getStoreMtimeMs(): number {
+  try {
+    return fs.statSync(getStorePath()).mtimeMs
+  } catch {
+    return 0
+  }
+}
+
+function refreshSchedulesFromStore(state: SchedulerState): void {
+  const currentMtime = getStoreMtimeMs()
+  if (currentMtime <= state.storeMtimeMs) return
+
+  const stored = loadSchedules()
+  state.schedules.clear()
+  for (const [id, entry] of stored) state.schedules.set(id, entry)
+  state.cronCache.clear()
+  state.storeMtimeMs = currentMtime
+  console.error(`[Scheduler] Reloaded ${state.schedules.size} schedules edited by desktop`)
+}
+
 function checkAll(state: SchedulerState): void {
+  // The desktop UI writes the same HONE_DATA_DIR/schedules.json file. Reload
+  // before evaluation so saving, pausing, or deleting a schedule takes effect
+  // without a daemon restart and without a second scheduler process.
+  refreshSchedulesFromStore(state)
   const now = new Date()
   for (const [, entry] of state.schedules) {
     if (!entry.enabled) continue
@@ -271,6 +303,22 @@ function checkAll(state: SchedulerState): void {
         state.cronCache.set(entry.trigger.cron, fn)
       }
       shouldTrigger = matcher(now)
+      // catch-up：回溯检查错过的触发（最多回溯 60 分钟）
+      if (!shouldTrigger && entry.lastTriggeredAt) {
+        const gapMs = now.getTime() - entry.lastTriggeredAt
+        if (gapMs > 60_000) {
+          const cursor = new Date(entry.lastTriggeredAt)
+          cursor.setSeconds(0, 0)
+          const maxBacktrack = Math.min(gapMs, 60 * 60_000)
+          const endTime = cursor.getTime() + maxBacktrack
+          for (let t = cursor.getTime() + 60_000; t <= now.getTime() && t <= endTime; t += 60_000) {
+            if (matcher(new Date(t))) {
+              shouldTrigger = true
+              break
+            }
+          }
+        }
+      }
     } else if (entry.trigger.type === 'interval') {
       const lastTrigger = entry.lastTriggeredAt || 0
       shouldTrigger = now.getTime() - lastTrigger >= entry.trigger.ms
@@ -292,7 +340,8 @@ function checkAll(state: SchedulerState): void {
           lastRunDate.getMinutes() === now.getMinutes() &&
           lastRunDate.getHours() === now.getHours() &&
           lastRunDate.getDate() === now.getDate() &&
-          lastRunDate.getMonth() === now.getMonth()
+          lastRunDate.getMonth() === now.getMonth() &&
+          lastRunDate.getFullYear() === now.getFullYear()
         ) {
           continue
         }
@@ -305,6 +354,11 @@ function checkAll(state: SchedulerState): void {
       entry.lastStatus = undefined
       void state.onTrigger(entry).then(() => {
         // Persist after each trigger
+        saveSchedules(state.schedules)
+      }).catch(err => {
+        console.error('[Scheduler] onTrigger error:', err)
+        // 即使触发失败也要持久化 lastTriggeredAt，防止进程重启后
+        // catch-up 逻辑回溯检查到旧值导致重复触发
         saveSchedules(state.schedules)
       })
     }

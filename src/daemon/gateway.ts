@@ -9,23 +9,31 @@
  *
  * Architecture: Gateway is brain, CLI is muscle. Gateway never touches files.
  */
-import { randomUUID } from 'crypto'
+import { randomUUID, timingSafeEqual } from 'crypto'
+import * as os from 'os'
+import { existsSync, statSync } from 'fs'
 import { getProvider, type ProviderResponse } from '../services/providers/index.js'
-import type { ScheduleEntry, GatewayContext } from './tools.js'
+import type { ScheduleEntry, GatewayContext, TaskRunResult } from './tools.js'
 import { getGatewayTools } from './tools.js'
 import { createScheduler, stopScheduler, loadSchedules, saveSchedules } from './scheduler.js'
-import { gatewayLLM } from './llm.js'
+import { gatewayLLM, buildProviderTools, type ProviderTool } from './llm.js'
 import { getPatternSuggestions, type ActivityLogEntry } from './pattern-learner.js'
 import { createBrowserAgent, type ConfirmCallback, type StepCallback } from './browser/agent.js'
 import type { BrowserAgent } from './browser/types.js'
-import { recordMessage, startRun, finishRun, markScheduleAgentCreated, listAgentSchedules, getScheduleRuns, getAgentScheduleInfo, getRecentMessages, listTrackedItems, recordObservation, upsertTrackedItem } from './storage.js'
+import { recordMessage, startRun, finishRun, markScheduleAgentCreated, listAgentSchedules, getScheduleRuns, getAgentScheduleInfo, getRecentMessages, listTrackedItems, recordObservation, upsertTrackedItem, closeDb, recordUsage, getUsageStats } from './storage.js'
 import { tryStockIntent } from './intent/stock-intent.js'
 import { fetchStockQuotes } from './datasources/stock-cn.js'
 import { tryAutoExecute, listBrokerAdapters } from './brokers/adapter.js'
+import { getWebSocketProxyAgent, getWebSocketProxyUrl } from '../utils/proxy.js'
+import { getWebSocketTLSOptions } from '../utils/mtls.js'
+import { writeFile as fsWriteFile, mkdir as fsMkdir, readFile as fsReadFile } from 'fs/promises'
+import { join as pathJoin } from 'path'
 
 const HEARTBEAT_INTERVAL_MS = 30_000
 const RECONNECT_DELAY_MS = 2000
 const MAX_RECONNECT_ATTEMPTS = 10
+const MAX_GATEWAY_MESSAGE_BYTES = 64 * 1024
+const LOCAL_HANDSHAKE_TIMEOUT_MS = 5_000
 
 export interface GatewayConfig {
   relayUrl: string
@@ -34,6 +42,10 @@ export interface GatewayConfig {
   repo?: string
   branch?: string
   authToken?: string
+  localAuthToken?: string
+  pairingId?: string
+  pairingCode?: string
+  workspaceDir?: string
   verbose?: boolean
 }
 
@@ -43,14 +55,33 @@ export interface GatewayState {
   connected: boolean
   schedules: Map<string, ScheduleEntry>
   clients: Map<string, ClientInfo>
-  pendingConfirmations: Map<string, { description: string; resolve: (approved: boolean) => void }>
+  pendingConfirmations: Map<string, {
+    description: string
+    clientId?: string
+    resolve: (approved: boolean) => void
+  }>
   pendingPairings: Map<string, { clientId: string; code: string; resolve: (approved: boolean) => void }>
   reconnectAttempts: number
   heartbeatTimer: ReturnType<typeof setInterval> | null
   schedulerState: ReturnType<typeof createScheduler> | null
   patternTimer: ReturnType<typeof setInterval> | null
+  patternInitTimer: ReturnType<typeof setTimeout> | null
+  memoryConsolidateTimer: ReturnType<typeof setInterval> | null
+  pairingPollTimer: ReturnType<typeof setInterval> | null
+  reconnectTimer: ReturnType<typeof setTimeout> | null
   running: boolean
   browserAgent: BrowserAgent | null
+  /** Local WebSocket clients (same-machine desktop app) that bypass the relay. */
+  localClients: Set<WebSocket>
+  /** Local WebSocket server (127.0.0.1:port). Closed on stopGateway to release the port. */
+  localServer: { close: (cb?: () => void) => void } | null
+  /** Active confirmation/pairing timeout timers — cleared on stopGateway to prevent leaks. */
+  confirmationTimers: Set<ReturnType<typeof setTimeout>>
+  taskQueue: TaskJob[]
+  runningTasks: Map<string, RunningTask>
+  runningTaskCount: number
+  /** Originating device for an in-flight browser task, used for scoped prompts/events. */
+  browserTaskOwners: Map<string, string | undefined>
 }
 
 interface ClientInfo {
@@ -59,31 +90,70 @@ interface ClientInfo {
   lastSeen: number
 }
 
+interface TaskOrigin {
+  clientId?: string
+  requireConfirmation?: boolean
+}
+
+interface TaskJob {
+  taskId: string
+  task: string
+  cwd: string
+  clientId?: string
+  resolve: (result: TaskRunResult) => void
+}
+
+interface RunningTask {
+  job: TaskJob
+  child: import('child_process').ChildProcess
+  cancelled: boolean
+  timedOut: boolean
+}
+
+/** Provider tools built once at gateway startup; shared with message handler. */
+let gatewayProviderTools: ProviderTool[] | undefined
+
 function log(config: GatewayConfig, msg: string): void {
   if (config.verbose) {
     console.error(`[Gateway] ${msg}`)
   }
 }
 
-// Audit logging: write web_task events to ~/.hone/logs/YYYY-MM-DD.json
-async function logActivity(type: ActivityLogEntry['type'], detail: string): Promise<void> {
+function hasMatchingToken(expected: string | undefined, supplied: unknown): boolean {
+  if (!expected || typeof supplied !== 'string') return false
+  const left = Buffer.from(expected)
+  const right = Buffer.from(supplied)
+  return left.length === right.length && timingSafeEqual(left, right)
+}
+
+function isAllowedLocalOrigin(origin: string | undefined): boolean {
+  // Native Tauri, local Vite development, and non-browser native clients are
+  // all permitted. A normal website origin is rejected before it can attempt
+  // to use a local capability token.
+  if (!origin) return true
+  return /^tauri:\/\//i.test(origin)
+    || /^http:\/\/(tauri\.localhost|localhost|127\.0\.0\.1)(?::\d+)?$/i.test(origin)
+}
+
+// Audit logging: write activity events to ~/.hone/logs/YYYY-MM-DD.json
+async function logActivity(type: ActivityLogEntry['type'], detail: string, extra?: { project?: string; duration?: number }): Promise<void> {
   try {
-    const { writeFile, mkdir, readFile } = await import('fs/promises')
-    const { join } = await import('path')
-    const home = process.env.HOME || process.env.USERPROFILE || '~'
-    const logDir = join(home, '.hone', 'logs')
-    await mkdir(logDir, { recursive: true })
+    const home = os.homedir()
+    const logDir = pathJoin(home, '.hone', 'logs')
+    await fsMkdir(logDir, { recursive: true })
 
     const today = new Date().toISOString().slice(0, 10)
-    const logFile = join(logDir, `${today}.json`)
+    const logFile = pathJoin(logDir, `${today}.json`)
 
     let entries: ActivityLogEntry[] = []
     try {
-      entries = JSON.parse(await readFile(logFile, 'utf-8'))
+      entries = JSON.parse(await fsReadFile(logFile, 'utf-8'))
     } catch {}
 
-    entries.push({ ts: Date.now(), type, detail })
-    await writeFile(logFile, JSON.stringify(entries))
+    entries.push({ ts: Date.now(), type, detail, ...extra })
+    // 上限 500 条/天，防止日志文件无限增长
+    if (entries.length > 500) entries = entries.slice(-500)
+    await fsWriteFile(logFile, JSON.stringify(entries))
   } catch {}
 }
 
@@ -93,51 +163,28 @@ function sendJSON(ws: WebSocket, data: unknown): void {
   }
 }
 
-function createGatewayContext(state: GatewayState): GatewayContext {
+async function createRelayWebSocket(url: string): Promise<WebSocket> {
+  if (typeof Bun !== 'undefined') {
+    return new globalThis.WebSocket(url, {
+      proxy: getWebSocketProxyUrl(url),
+      tls: getWebSocketTLSOptions() || undefined,
+    } as unknown as string[])
+  }
+
+  const { default: WS } = await import('ws')
+  return new WS(url, {
+    agent: getWebSocketProxyAgent(url),
+    ...getWebSocketTLSOptions(),
+  }) as unknown as WebSocket
+}
+
+function createGatewayContext(state: GatewayState, origin: TaskOrigin = {}): GatewayContext {
   return {
     schedules: state.schedules,
     pendingPairings: state.pendingPairings,
     browserAgent: state.browserAgent,
     persistSchedules: () => saveSchedules(state.schedules),
-    dispatchTask: async (task: string) => {
-      // Dispatch to CLI: send a message via relay that triggers local CLI execution
-      // For now, we signal via a message that any connected CLI would pick up
-      const taskId = `task_${Date.now()}`
-      log(state.config, `Dispatching task: ${task}`)
-
-      // In the future, this would spawn a CLI process or signal a running CLI
-      // For MVP, we return the task for manual handling via connected clients
-      broadcast(state, {
-        type: 'task_dispatched',
-        taskId,
-        task,
-        machineId: state.config.machineId,
-        machineName: state.config.machineName,
-        ts: new Date().toISOString(),
-      })
-
-      try {
-        const { execFile } = await import('child_process')
-        const { promisify } = await import('util')
-        const execFileAsync = promisify(execFile)
-
-        const nodePath = process.execPath
-        const cliScript = process.argv[1]
-        // cwd is the hone project root (parent of dist/cli.js)
-        const cwd = cliScript.replace(/[/\\][^/\\]+[/\\][^/\\]+$/, '')
-
-        const { stdout, stderr } = await execFileAsync(nodePath, [cliScript, '-p', task], {
-          timeout: 5 * 60 * 1000, // 5-minute timeout to prevent permanent hang
-          cwd,
-        })
-        return stdout || stderr || '执行完毕'
-      } catch (err: any) {
-        if (err.killed && err.signal === 'SIGTERM') {
-          return `CLI 任务超时 (5分钟)`
-        }
-        return `CLI 任务执行失败: ${err.message || err}`
-      }
-    },
+    dispatchTask: (task: string) => enqueueGatewayTask(state, task, origin),
     sendNotification: (msg: string) => {
       broadcast(state, {
         type: 'notification',
@@ -148,14 +195,260 @@ function createGatewayContext(state: GatewayState): GatewayContext {
   }
 }
 
-function broadcast(state: GatewayState, msg: unknown): void {
+function sendToClient(state: GatewayState, clientId: string | undefined, message: Record<string, unknown>): void {
+  if (!clientId) {
+    broadcast(state, message)
+    return
+  }
+  const targeted = { ...message, target: 'client', clientId }
   if (state.ws && state.ws.readyState === 1) { // 1 = OPEN
-    sendJSON(state.ws, msg)
+    sendJSON(state.ws, targeted)
   }
 }
 
+/** Reply to the device that issued a request. Relay v3 rejects unaddressed
+ * gateway messages, which also prevents one device from receiving another
+ * device's private data. */
+function replyToMessage(state: GatewayState, msg: any, message: Record<string, unknown>): void {
+  const clientId = typeof msg?.clientId === 'string' ? msg.clientId : undefined
+  sendToClient(state, clientId, message)
+}
+
+function broadcast(state: GatewayState, msg: Record<string, unknown>): void {
+  const relayMessage = msg.target ? msg : { ...msg, target: 'all', broadcast: true }
+  if (state.ws && state.ws.readyState === 1) {
+    sendJSON(state.ws, relayMessage)
+  }
+  for (const localClient of state.localClients) {
+    if (localClient.readyState === 1) sendJSON(localClient, msg)
+  }
+}
+
+function emitTask(state: GatewayState, clientId: string | undefined, message: Record<string, unknown>): void {
+  if (clientId) sendToClient(state, clientId, message)
+  else broadcast(state, message)
+}
+
+function resolveTaskWorkspace(state: GatewayState): string {
+  const workspace = state.config.workspaceDir?.trim()
+  if (!workspace) throw new Error('No workspace selected. Choose a project directory before running a task.')
+  if (!existsSync(workspace) || !statSync(workspace).isDirectory()) {
+    throw new Error(`Workspace is not available: ${workspace}`)
+  }
+  return workspace
+}
+
+async function enqueueGatewayTask(state: GatewayState, task: string, origin: TaskOrigin): Promise<TaskRunResult> {
+  const normalized = task.trim()
+  const taskId = randomUUID()
+  if (!normalized) {
+    return { taskId, status: 'failed', result: 'Task is empty.' }
+  }
+  if (normalized.length > 4_000) {
+    return { taskId, status: 'failed', result: 'Task is too large (maximum 4000 characters).' }
+  }
+
+  let cwd: string
+  try {
+    cwd = resolveTaskWorkspace(state)
+  } catch (error) {
+    const result = error instanceof Error ? error.message : String(error)
+    emitTask(state, origin.clientId, { type: 'task_complete', taskId, status: 'failed', result, ts: new Date().toISOString() })
+    return { taskId, status: 'failed', result }
+  }
+
+  emitTask(state, origin.clientId, {
+    type: 'task_dispatched',
+    taskId,
+    task: normalized,
+    machineId: state.config.machineId,
+    machineName: state.config.machineName,
+    cwd,
+    ts: new Date().toISOString(),
+  })
+
+  // Remote device requests always require a human decision. For local desktop
+  // requests, retain an additional guard for clearly destructive instructions.
+  if (origin.requireConfirmation || isHighRiskCommand(normalized)) {
+    const confirmed = await requestUserConfirmation(
+      state,
+      `dispatch_${taskId}`,
+      `Confirm task execution in ${cwd}:\n${normalized.slice(0, 500)}`,
+      origin.clientId,
+    )
+    if (!confirmed) {
+      const result = 'Execution was denied or confirmation expired.'
+      emitTask(state, origin.clientId, { type: 'task_complete', taskId, status: 'denied', result, ts: new Date().toISOString() })
+      return { taskId, status: 'denied', result, cwd }
+    }
+  }
+
+  return new Promise(resolve => {
+    state.taskQueue.push({ taskId, task: normalized, cwd, clientId: origin.clientId, resolve })
+    pumpTaskQueue(state)
+  })
+}
+
+const MAX_CONCURRENT_TASKS = 3
+const TASK_TIMEOUT_MS = 5 * 60_000
+const MAX_TASK_OUTPUT_BYTES = 1_000_000
+
+function pumpTaskQueue(state: GatewayState): void {
+  while (state.runningTaskCount < MAX_CONCURRENT_TASKS && state.taskQueue.length > 0) {
+    const job = state.taskQueue.shift()
+    if (!job) return
+    state.runningTaskCount++
+    void executeTaskJob(state, job).then(result => {
+      job.resolve(result)
+    }).finally(() => {
+      state.runningTaskCount--
+      pumpTaskQueue(state)
+    })
+  }
+}
+
+async function executeTaskJob(state: GatewayState, job: TaskJob): Promise<TaskRunResult> {
+  const startedAt = Date.now()
+  emitTask(state, job.clientId, { type: 'task_started', taskId: job.taskId, task: job.task, cwd: job.cwd, ts: new Date().toISOString() })
+
+  try {
+    const { spawn } = await import('child_process')
+    const cliScript = process.argv[1]
+    const child = spawn(process.execPath, [cliScript, '-p', job.task], {
+      cwd: job.cwd,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const running: RunningTask = { job, child, cancelled: false, timedOut: false }
+    state.runningTasks.set(job.taskId, running)
+
+    return await new Promise<TaskRunResult>(resolve => {
+      let settled = false
+      let outputBytes = 0
+      let output = ''
+      const append = (chunk: Buffer | string, stream: 'stdout' | 'stderr') => {
+        if (settled) return
+        const text = chunk.toString()
+        const remaining = MAX_TASK_OUTPUT_BYTES - outputBytes
+        if (remaining > 0) {
+          const accepted = text.slice(0, remaining)
+          output += accepted
+          outputBytes += Buffer.byteLength(accepted)
+        }
+        emitTask(state, job.clientId, {
+          type: 'task_progress',
+          taskId: job.taskId,
+          stream,
+          text: text.slice(-2_000),
+          ts: new Date().toISOString(),
+        })
+      }
+      const finish = (status: TaskRunResult['status'], result: string) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        state.runningTasks.delete(job.taskId)
+        const finalResult: TaskRunResult = { taskId: job.taskId, status, result, cwd: job.cwd }
+        emitTask(state, job.clientId, {
+          type: 'task_complete',
+          ...finalResult,
+          durationMs: Date.now() - startedAt,
+          ts: new Date().toISOString(),
+        })
+        void logActivity('cli_session', `CLI task: ${job.task.slice(0, 100)}`, {
+          project: job.cwd,
+          duration: Date.now() - startedAt,
+        })
+        void logActivity('tool_call', `dispatch_task: ${job.task.slice(0, 100)}`, { project: job.cwd })
+        resolve(finalResult)
+      }
+      const timeout = setTimeout(() => {
+        running.timedOut = true
+        child.kill('SIGTERM')
+      }, TASK_TIMEOUT_MS)
+
+      child.stdout?.on('data', chunk => append(chunk, 'stdout'))
+      child.stderr?.on('data', chunk => append(chunk, 'stderr'))
+      child.once('error', error => finish('failed', `Task process failed to start: ${error.message}`))
+      child.once('close', code => {
+        if (running.cancelled) finish('cancelled', output || 'Task cancelled.')
+        else if (running.timedOut) finish('timed_out', output || 'Task timed out after 5 minutes.')
+        else if (code === 0) finish('completed', output || 'Task completed.')
+        else finish('failed', output || `Task exited with code ${code ?? -1}.`)
+      })
+    })
+  } catch (error) {
+    const result = error instanceof Error ? error.message : String(error)
+    const failed: TaskRunResult = { taskId: job.taskId, status: 'failed', result, cwd: job.cwd }
+    emitTask(state, job.clientId, { type: 'task_complete', ...failed, ts: new Date().toISOString() })
+    return failed
+  }
+}
+
+function cancelGatewayTask(state: GatewayState, taskId: string, clientId?: string): boolean {
+  const queuedIndex = state.taskQueue.findIndex(job => job.taskId === taskId && (!job.clientId || job.clientId === clientId))
+  if (queuedIndex >= 0) {
+    const [job] = state.taskQueue.splice(queuedIndex, 1)
+    const result: TaskRunResult = { taskId, status: 'cancelled', result: 'Task cancelled before execution.', cwd: job.cwd }
+    emitTask(state, job.clientId, { type: 'task_complete', ...result, ts: new Date().toISOString() })
+    job.resolve(result)
+    return true
+  }
+  const running = state.runningTasks.get(taskId)
+  if (!running || (running.job.clientId && running.job.clientId !== clientId)) return false
+  running.cancelled = true
+  running.child.kill('SIGTERM')
+  emitTask(state, running.job.clientId, { type: 'task_cancelling', taskId, ts: new Date().toISOString() })
+  return true
+}
+
+/** Request confirmation from the originating device, then fail closed on timeout. */
+async function requestUserConfirmation(
+  state: GatewayState,
+  confirmId: string,
+  description: string,
+  clientId?: string,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    state.pendingConfirmations.set(confirmId, { description, clientId, resolve })
+    emitTask(state, clientId, {
+      type: 'confirmation_required',
+      confirmId,
+      description,
+      ts: new Date().toISOString(),
+    })
+    // 120 秒超时自动拒绝；定时器追踪到 state 以便 stopGateway 清理
+    const timer = setTimeout(() => {
+      state.confirmationTimers.delete(timer)
+      if (state.pendingConfirmations.has(confirmId)) {
+        state.pendingConfirmations.delete(confirmId)
+        resolve(false)
+      }
+    }, 120_000)
+    state.confirmationTimers.add(timer)
+  })
+}
+
+/** 高风险命令关键词检测——命中则需用户确认后才执行。 */
+const HIGH_RISK_PATTERNS = [
+  /\brm\s+-rf\b/i, /\bdel\s+\/[sqf]/i, /\brmdir\s+\/s/i,
+  /\bformat\s+[a-z]:/i, /\bmkfs\./i, /\bdd\s+if=/i,
+  /\bgit\s+push\s+.*--force/i, /\bgit\s+push\s+.*-f\b/i,
+  /\bgit\s+reset\s+--hard/i, /\bgit\s+clean\s+-fd/i,
+  /\bdrop\s+(table|database|schema)\b/i, /\btruncate\s+table\b/i,
+  /\bshutdown\b/i, /\breboot\b/i, /\bhalt\b/i,
+  /\b:\(\)\s*\{.*\};:/i, // fork bomb
+  /\bcurl\s+.*\|\s*(bash|sh)\b/i, /\bwget\s+.*\|\s*(bash|sh)\b/i,
+  /\bchmod\s+777\s+\//i,
+  /\bkill\s+-9\s+1\b/i, /\bkillall\b/i,
+]
+
+function isHighRiskCommand(task: string): boolean {
+  return HIGH_RISK_PATTERNS.some(p => p.test(task))
+}
+
 function broadcastBuddyEvent(state: GatewayState, event: string, text?: string, data?: any): void {
-  if (!state.ws) return;
+  if (!state.ws && state.localClients.size === 0) return;
   broadcast(state, {
     type: 'buddy_event',
     event,
@@ -177,30 +470,56 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
     heartbeatTimer: null,
     schedulerState: null,
     patternTimer: null,
+    patternInitTimer: null,
+    memoryConsolidateTimer: null,
+    pairingPollTimer: null,
+    reconnectTimer: null,
     running: true,
     browserAgent: null, // set below after callbacks are created
+    localClients: new Set(),
+    localServer: null,
+    confirmationTimers: new Set(),
+    taskQueue: [],
+    runningTasks: new Map(),
+    runningTaskCount: 0,
+    browserTaskOwners: new Map(),
   }
 
   // Initialize browser agent (null if HONE_BROWSER_ENABLED !== 'true')
   const onConfirm: ConfirmCallback = async (taskId, description) => {
     return new Promise((resolve) => {
-      state.pendingConfirmations.set(taskId, { description, resolve })
-      broadcast(state, {
+      const clientId = state.browserTaskOwners.get(taskId)
+      state.pendingConfirmations.set(taskId, { description, clientId, resolve })
+      emitTask(state, clientId, {
         type: 'browser_confirm_required',
         taskId,
         description,
         ts: new Date().toISOString(),
       })
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        state.confirmationTimers.delete(timer)
         if (state.pendingConfirmations.has(taskId)) {
           state.pendingConfirmations.delete(taskId)
           resolve(false)
         }
       }, 60_000)
+      state.confirmationTimers.add(timer)
     })
   }
-  const onStep: StepCallback = (_taskId, step) => {
-    // Steps are broadcast via the relay
+  const onStep: StepCallback = (taskId, step) => {
+    // Do not forward screenshots by default: they can be large and can contain
+    // sensitive page data. Clients receive action progress instead.
+    emitTask(state, state.browserTaskOwners.get(taskId), {
+      type: 'browser_task_progress',
+      taskId,
+      step: {
+        stepNumber: step.stepNumber,
+        action: step.action,
+        timestamp: step.timestamp,
+        durationMs: step.durationMs,
+      },
+      ts: new Date().toISOString(),
+    })
   }
   const llmCall: import('./browser/agent.js').LLMCallback = async (prompt) => {
     const provider = getProvider()
@@ -208,7 +527,7 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
     // of user-configured HONE_TEMPERATURE — but respects HONE_MAX_TOKENS upper bound.
     const envMax = Number(process.env.HONE_MAX_TOKENS)
     const resp = await provider.createMessage({
-      model: process.env.HONE_MODEL || 'deepseek-v4-pro',
+      model: process.env.HONE_MODEL || 'deepseek-chat',
       messages: [{ role: 'user', content: prompt }],
       maxTokens: Number.isFinite(envMax) && envMax > 0 ? Math.min(envMax, 512) : 512,
       temperature: 0.1,
@@ -227,6 +546,8 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
 
   const gatewayCtx = createGatewayContext(state)
   const tools = getGatewayTools(gatewayCtx)
+  const providerTools = buildProviderTools(tools)
+  gatewayProviderTools = providerTools
 
   // Start the scheduler
   state.schedulerState = createScheduler(state.schedules, gatewayCtx, async (entry: ScheduleEntry) => {
@@ -271,24 +592,35 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
             if (signal !== 'none') {
               broadcastBuddyEvent(state, 'suggestion', `⚠ ${item.display_name || item.identifier}: ${signal === 'sell' ? '止损/止盈信号' : signal === 'alert' ? '异动' : '关注'} (${q.change_pct.toFixed(2)}%)`)
 
-              // If broker_authorized + adapter available, try auto-execute.
-              // Otherwise broadcast for the user to act manually.
+              // If broker_authorized + adapter available, request user confirmation before auto-execute.
+              // Financial transactions must never execute without explicit user approval.
               let autoExecResult: any = null
               if (signal === 'sell' && hasPos && p?.broker_authorized && p?.broker) {
-                autoExecResult = await tryAutoExecute(String(p.broker), {
-                  symbol: item.identifier,
-                  side: 'sell',
-                  quantity: Number(p.shares),
-                  reason: `自动止损/止盈触发: ${assessment}`,
-                })
-                if (autoExecResult?.ok) {
-                  const { recordRecommendation, closeTrackedItem } = await import('./storage.js')
-                  recordRecommendation({
-                    item_id: item.id,
-                    recommendation: `自动卖出 ${p.shares} 股 @ ${autoExecResult.filled_price || q.current}`,
-                    reasoning: assessment,
+                // Request user confirmation for real-money trade
+                const confirmKey = `stock_sell_${item.id}_${Date.now()}`
+                const confirmed = await requestUserConfirmation(state, confirmKey,
+                  `确认卖出 ${item.display_name || item.identifier}？\n` +
+                  `当前价: ${q.current} (${q.change_pct >= 0 ? '+' : ''}${q.change_pct.toFixed(2)}%)\n` +
+                  `持仓: ${p.shares} 股 @ ${p.avg_cost} (浮${pnlPct! >= 0 ? '盈' : '亏'} ${pnlPct!.toFixed(2)}%)\n` +
+                  `触发原因: ${pnlPct! <= -8 ? '止损' : '止盈'}信号`)
+                if (confirmed) {
+                  autoExecResult = await tryAutoExecute(String(p.broker), {
+                    symbol: item.identifier,
+                    side: 'sell',
+                    quantity: Number(p.shares),
+                    reason: `用户确认后执行止损/止盈: ${assessment}`,
                   })
-                  closeTrackedItem(item.id, `Adapter ${p.broker} 自动执行: ${autoExecResult.order_id}`)
+                  if (autoExecResult?.ok) {
+                    const { recordRecommendation, closeTrackedItem } = await import('./storage.js')
+                    recordRecommendation({
+                      item_id: item.id,
+                      recommendation: `用户确认后卖出 ${p.shares} 股 @ ${autoExecResult.filled_price || q.current}`,
+                      reasoning: assessment,
+                    })
+                    closeTrackedItem(item.id, `Adapter ${p.broker} 用户确认后执行: ${autoExecResult.order_id}`)
+                  }
+                } else {
+                  broadcastBuddyEvent(state, 'suggestion', `已跳过自动卖出（用户未确认）。${item.display_name || item.identifier} 请手动决定是否操作。`)
                 }
               }
 
@@ -331,18 +663,19 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
           task: webTask,
           riskLevel: 'low',
         })
-        logActivity('web_task', `${result.status}: ${webTask.slice(0, 80)}`)
+        void logActivity('web_task', `${result.status}: ${webTask.slice(0, 80)}`)
         finalResult = result.status === 'success'
           ? `浏览器任务完成: ${result.finalUrl || ''} (${result.steps.length} 步)`
           : `浏览器任务失败: ${result.error || result.status}`
       } else if (entry.task.startsWith('web:') && !state.browserAgent) {
         finalResult = '浏览器代理未启用，无法执行网页任务'
       } else {
-        const intent = await gatewayLLM(`执行日程任务: ${entry.task}`)
+        const intent = await gatewayLLM(`执行日程任务: ${entry.task}`, providerTools)
         finalResult = intent.reply || '已执行'
 
         if (intent.action === 'dispatch') {
-          finalResult = await gatewayCtx.dispatchTask(intent.task || entry.task)
+          const dispatched = await gatewayCtx.dispatchTask(intent.task || entry.task)
+          finalResult = dispatched.result
         } else if (intent.action === 'browser' && state.browserAgent) {
           const result = await state.browserAgent.executeTask({
             id: `browser_${entry.id}`,
@@ -468,13 +801,31 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
       log(config, `Pattern learner error: ${err}`)
     }
   }
-  setTimeout(() => {
+  state.patternInitTimer = setTimeout(() => {
+    state.patternInitTimer = null
+    if (!state.running) return
     runPatternCheck()
     state.patternTimer = setInterval(runPatternCheck, PATTERN_CHECK_MS)
   }, 5 * 60_000)
 
+  // 记忆整理：每 24 小时运行一次，合并相似记忆、清理过期记忆
+  try {
+    const { autoConsolidate } = await import('../memory/consolidation.js')
+    state.memoryConsolidateTimer = setInterval(async () => {
+      if (!state.running) return
+      try {
+        autoConsolidate()
+        log(config, 'Memory consolidation completed')
+      } catch (err) {
+        log(config, `Memory consolidation error: ${err}`)
+      }
+    }, 24 * 60 * 60_000) // 24 hours
+  } catch (err) {
+    log(config, `Memory consolidation init error: ${err}`)
+  }
+
   log(config, `Gateway starting, relay: ${config.relayUrl}`)
-  console.error(`[Gateway] Hone Gateway 启动中...`)
+  console.error(`[Gateway] Hone 启动中...`)
   console.error(`[Gateway] 机器: ${config.machineName}`)
   console.error(`[Gateway] 中继: ${config.relayUrl}`)
   console.error(`[Gateway] 已加载 ${state.schedules.size} 条日程`)
@@ -487,7 +838,7 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
     try {
       const { readdir, readFile, unlink, mkdir } = await import('fs/promises')
       const { join } = await import('path')
-      const home = process.env.HOME || process.env.USERPROFILE || '~'
+      const home = process.env.HOME || process.env.USERPROFILE || '.'
       const dataDir = process.env.HONE_DATA_DIR || join(home, '.hone')
       const pairDir = join(dataDir, 'pairings')
       await mkdir(pairDir, { recursive: true })
@@ -522,7 +873,7 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
       }
 
       // Reuse patternTimer? No — use its own; piggyback on state for cleanup.
-      ;(state as any).pairingPollTimer = setInterval(tick, PAIRING_POLL_MS)
+      state.pairingPollTimer = setInterval(tick, PAIRING_POLL_MS)
     } catch (err) {
       log(config, `Pairing poll init error: ${err}`)
     }
@@ -531,6 +882,93 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
 
   await connectToRelay(state, tools)
 
+  // ── Local WebSocket server ──────────────────────────────────────────────
+  // Lets the trusted desktop app connect directly when the relay is
+  // unavailable. Binding to loopback is not enough: browsers can still try to
+  // reach localhost, so every connection must complete a capability handshake
+  // before it can submit a gateway message.
+  const localPort = parseInt(process.env.HONE_GATEWAY_PORT || '18789', 10)
+  const localAuthToken = config.localAuthToken
+  try {
+    const { WebSocketServer } = await import('ws')
+    const wss = new WebSocketServer({
+      port: localPort,
+      host: '127.0.0.1',
+      maxPayload: MAX_GATEWAY_MESSAGE_BYTES,
+    })
+    state.localServer = wss
+    console.error(`[Gateway] 本地 WS 服务监听 127.0.0.1:${localPort}`)
+    wss.on('connection', (ws: WebSocket, request: { headers?: Record<string, string | string[] | undefined> }) => {
+      const originValue = request.headers?.origin
+      const origin = Array.isArray(originValue) ? originValue[0] : originValue
+      if (!isAllowedLocalOrigin(origin)) {
+        ws.close(4003, 'Untrusted local origin')
+        return
+      }
+
+      let authenticated = false
+      let desktopClientId = ''
+      const handshakeTimer = setTimeout(() => {
+        if (!authenticated) ws.close(4003, 'Local authentication timed out')
+      }, LOCAL_HANDSHAKE_TIMEOUT_MS)
+
+      ws.on('message', async (data: Buffer) => {
+        try {
+          if (data.length > MAX_GATEWAY_MESSAGE_BYTES) {
+            ws.close(4009, 'Message too large')
+            return
+          }
+          const msg = JSON.parse(data.toString())
+          if (!authenticated) {
+            if (
+              msg?.type !== 'register'
+              || msg?.role !== 'desktop'
+              || !hasMatchingToken(localAuthToken, msg?.token)
+            ) {
+              ws.close(4003, 'Local authentication failed')
+              return
+            }
+            authenticated = true
+            desktopClientId = typeof msg.clientId === 'string' && msg.clientId
+              ? msg.clientId
+              : `desktop_${randomUUID()}`
+            clearTimeout(handshakeTimer)
+            state.localClients.add(ws)
+            sendJSON(ws, {
+              type: 'registered',
+              clientId: desktopClientId,
+              machineId: config.machineId,
+              machineName: config.machineName,
+              local: true,
+            })
+            console.error('[Gateway] 已认证本地桌面客户端')
+            return
+          }
+          // 为每条消息创建独立的 state 视图（ws 指向当前本地客户端），
+          // 避免 async 交错时 state.ws 被其他消息篡改导致回复发错 socket。
+          // 浅拷贝共享 Maps/Sets（schedules、clients 等），仅 ws 不同。
+          const msgState: GatewayState = { ...state, ws }
+          msg.from = 'desktop'
+          msg.clientId = desktopClientId
+          await handleMessage(msgState, msg, tools)
+        } catch (err) {
+          log(config, `本地消息解析错误: ${err}`)
+        }
+      })
+      ws.on('close', () => {
+        clearTimeout(handshakeTimer)
+        state.localClients.delete(ws)
+        if (authenticated) console.error('[Gateway] 本地桌面客户端已断开')
+      })
+      ws.on('error', () => { /* swallow */ })
+    })
+    wss.on('error', (err: Error) => {
+      console.error(`[Gateway] 本地 WS 服务错误: ${err.message}`)
+    })
+  } catch (err) {
+    console.error(`[Gateway] 本地 WS 服务启动失败: ${err}`)
+  }
+
   return state
 }
 
@@ -538,10 +976,16 @@ async function connectToRelay(state: GatewayState, tools: any[]): Promise<void> 
   if (!state.running) return
   const { config } = state
 
+  // 安全警告：连接公网 relay 但未配置 authToken 时提示（任何人可注册）
+  const isPublicRelay = config.relayUrl && !/localhost|127\.0\.0\.1/i.test(config.relayUrl)
+  if (isPublicRelay && !config.authToken) {
+    console.error('[Gateway] ⚠ 警告：连接公网 relay 但未配置 authToken，任何人可注册！请设置 HONE_AUTH_TOKEN 环境变量。')
+  }
+
   log(config, `Connecting to relay: ${config.relayUrl}`)
 
   try {
-    const ws = new WebSocket(config.relayUrl)
+    const ws = await createRelayWebSocket(config.relayUrl)
     state.ws = ws
 
     ws.onopen = () => {
@@ -558,6 +1002,9 @@ async function connectToRelay(state: GatewayState, tools: any[]): Promise<void> 
         repo: config.repo || '',
         branch: config.branch || '',
         token: config.authToken || '',
+        pairingId: config.pairingId || '',
+        pairingCode: config.pairingCode || '',
+        protocolVersion: 3,
       })
 
       // Start heartbeat
@@ -593,9 +1040,17 @@ async function connectToRelay(state: GatewayState, tools: any[]): Promise<void> 
         state.reconnectAttempts++
         const delay = RECONNECT_DELAY_MS * Math.min(state.reconnectAttempts, 5)
         log(config, `Reconnecting in ${delay}ms (attempt ${state.reconnectAttempts})`)
-        setTimeout(() => connectToRelay(state, tools), delay)
+        state.reconnectTimer = setTimeout(() => connectToRelay(state, tools), delay)
       } else if (state.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        console.error(`[Gateway] ❌ 重连次数超限，已停止`)
+        // Don't exit the daemon just because the relay is unreachable.
+        // The relay might be temporarily down, the user's network might be
+        // behind a proxy that blocks wss://, etc. Keep the daemon alive and
+        // keep retrying at a slow cadence (every 30s) so it can recover
+        // automatically when connectivity returns. Exiting here made the
+        // whole gateway unusable whenever the relay had a bad day.
+        console.error(`[Gateway] ⚠ Relay unreachable after ${MAX_RECONNECT_ATTEMPTS} attempts — daemon stays alive, will keep retrying every 30s`)
+        state.reconnectAttempts = 0 // reset so the slow-retry loop below keeps working
+        state.reconnectTimer = setTimeout(() => connectToRelay(state, tools), 30_000)
       }
     }
 
@@ -604,10 +1059,17 @@ async function connectToRelay(state: GatewayState, tools: any[]): Promise<void> 
     }
   } catch (err) {
     log(config, `Connection failed: ${err}`)
-    if (state.running && state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+    if (state.running) {
       state.reconnectAttempts++
-      const delay = RECONNECT_DELAY_MS * Math.min(state.reconnectAttempts, 5)
-      setTimeout(() => connectToRelay(state, tools), delay)
+      // After the fast-retry budget is exhausted, fall back to a slow 30s
+      // cadence instead of giving up (see the matching note in onclose).
+      const delay = state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS
+        ? RECONNECT_DELAY_MS * Math.min(state.reconnectAttempts, 5)
+        : 30_000
+      if (state.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        state.reconnectAttempts = 0 // reset for the next slow-retry cycle
+      }
+      state.reconnectTimer = setTimeout(() => connectToRelay(state, tools), delay)
     }
   }
 }
@@ -626,31 +1088,43 @@ async function handleMessage(
     }
 
     case 'pairing_request': {
-      // Auto-approve in God Mode, otherwise wait for /gateway approve via file decision
-      const autoApprove = !!process.env.HONE_GOD_MODE
+      // 路径遍历防护：clientId 仅允许字母、数字、下划线、短横线
+      const clientId = String(msg.clientId || '')
+      if (!/^[a-zA-Z0-9_-]+$/.test(clientId)) {
+        log(config, `Rejected pairing request with invalid clientId: ${clientId}`)
+        break
+      }
+      // A request with the active pairing challenge has already proven
+      // possession of the one-time QR code at the Relay. Treat scanning that
+      // code as the user's approval so the normal mobile onboarding flow does
+      // not require a hidden CLI command. Other requests still use the
+      // explicit approval path unless God Mode is enabled.
+      const godMode = String(process.env.HONE_GOD_MODE || '').toLowerCase()
+      const qrChallengeApproved = typeof msg.pairingId === 'string'
+        && msg.pairingId === config.pairingId
+      const autoApprove = qrChallengeApproved || godMode === '1' || godMode === 'true' || godMode === 'yes'
       if (autoApprove) {
         sendJSON(state.ws!, {
           type: 'pairing_response',
-          clientId: msg.clientId,
+          clientId: clientId,
           approved: true,
         })
-        log(config, `Auto-approved pairing: ${msg.clientId}`)
+        log(config, `Approved pairing: ${clientId} (${qrChallengeApproved ? 'QR challenge' : 'God Mode'})`)
       } else {
-        log(config, `Pairing request from ${msg.clientId}, code: ${msg.pairingCode}`)
-        console.error(`[Gateway] ⚠️ 新设备配对请求: ${msg.clientId} | 码: ${msg.pairingCode}`)
-        console.error(`[Gateway] 输入 hone gateway approve ${msg.clientId} 批准`)
+        log(config, `Pairing request from ${clientId}, code: ${msg.pairingCode}`)
+        console.error(`[Gateway] ⚠️ 新设备配对请求: ${clientId} | 码: ${msg.pairingCode}`)
+        console.error(`[Gateway] 输入 hone gateway approve ${clientId} 批准`)
         // Persist a pending marker so /gateway pairings can list it
         try {
           const { writeFile, mkdir } = await import('fs/promises')
           const { join } = await import('path')
-          const home = process.env.HOME || process.env.USERPROFILE || '~'
-          const dataDir = process.env.HONE_DATA_DIR || join(home, '.hone')
+          const dataDir = process.env.HONE_DATA_DIR || join(os.homedir(), '.hone')
           const pairDir = join(dataDir, 'pairings')
           await mkdir(pairDir, { recursive: true })
           await writeFile(
-            join(pairDir, `${msg.clientId}.pending.json`),
+            join(pairDir, `${clientId}.pending.json`),
             JSON.stringify({
-              clientId: msg.clientId,
+              clientId: clientId,
               pairingCode: msg.pairingCode,
               ts: new Date().toISOString(),
             }),
@@ -722,7 +1196,24 @@ async function handleMessage(
 
       try {
         broadcastBuddyEvent(state, 'thinking', '正在思考意图...')
-        const intent = await gatewayLLM(text)
+        const intent = await gatewayLLM(text, gatewayProviderTools)
+
+        // 记录 token 用量并检查预算
+        if (intent.usage) {
+          try {
+            const { budgetExceeded } = recordUsage({
+              inputTokens: intent.usage.inputTokens || 0,
+              outputTokens: intent.usage.outputTokens || 0,
+            })
+            if (budgetExceeded) {
+              broadcast(state, {
+                type: 'budget_warning',
+                usage: getUsageStats(),
+                ts: new Date().toISOString(),
+              })
+            }
+          } catch (e) { log(config, `recordUsage error: ${e}`) }
+        }
 
         // Persist the incoming message with its classified intent for memory & history.
         recordMessage({
@@ -736,6 +1227,18 @@ async function handleMessage(
 
         switch (intent.action) {
           case 'reply': {
+            // 如果 LLM 调用了 memory_save 等工具，执行它
+            if (intent.toolCall) {
+              const tool = tools.find(t => t.name === intent.toolCall!.name)
+              if (tool) {
+                try {
+                  await tool.execute(intent.toolCall.input)
+                  log(config, `Tool executed: ${intent.toolCall.name}`)
+                } catch (e) {
+                  log(config, `Tool execution failed: ${e}`)
+                }
+              }
+            }
             broadcastBuddyEvent(state, 'idle')
             const reply = intent.reply || '已收到'
             sendJSON(state.ws!, {
@@ -751,37 +1254,65 @@ async function handleMessage(
             break
           }
           case 'dispatch': {
-            // Buddy event handled inside gatewayCtx.dispatchTask
-            const gatewayCtx = createGatewayContext(state)
-            const result = await gatewayCtx.dispatchTask(intent.task || text)
-
-            sendJSON(state.ws!, {
-              type: 'task_complete',
-              result,
-              ts: new Date().toISOString(),
+            // Relay clients always require a confirmation before execution.
+            // The queued executor emits the targeted lifecycle events, so do
+            // not emit a second task_complete from this message handler.
+            const gatewayCtx = createGatewayContext(state, {
+              clientId: replyClientId || undefined,
+              requireConfirmation: msg.from === 'client',
             })
+            const result = await gatewayCtx.dispatchTask(intent.task || text)
             recordMessage({
               ts: Date.now(),
               direction: 'out',
-              text: typeof result === 'string' ? result : JSON.stringify(result),
-              result_text: typeof result === 'string' ? result : JSON.stringify(result),
+              text: result.result,
+              result_text: result.result,
               client_id: replyClientId || undefined,
             })
             break
           }
           case 'schedule': {
-            broadcastBuddyEvent(state, 'success', '日程已创建')
-            const reply = intent.reply || '日程已创建'
-            sendJSON(state.ws!, {
-              type: 'message',
-              target: 'client',
-              clientId: replyClientId,
-              payload: { text: reply },
-              ts: new Date().toISOString(),
-            })
-            recordMessage({
-              ts: Date.now(), direction: 'out', text: reply, client_id: replyClientId || undefined,
-            })
+            // 如果 LLM 返回了结构化日程数据，真正创建日程
+            if (intent.scheduleData) {
+              const sd = intent.scheduleData
+              const id = `sched_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+              const scheduleEntry: ScheduleEntry = {
+                id,
+                text: sd.text,
+                trigger: { type: 'cron', cron: sd.trigger },
+                task: sd.task,
+                delivery: (sd.delivery as any) || 'both',
+                enabled: true,
+                createdAt: Date.now(),
+              }
+              state.schedules.set(id, scheduleEntry)
+              saveSchedules(state.schedules)
+              broadcastBuddyEvent(state, 'success', `日程已创建: ${sd.text}`)
+              const reply = intent.reply || `日程已创建: ${sd.text} (触发: ${sd.trigger})`
+              sendJSON(state.ws!, {
+                type: 'message',
+                target: 'client',
+                clientId: replyClientId,
+                payload: { text: reply },
+                ts: new Date().toISOString(),
+              })
+              recordMessage({
+                ts: Date.now(), direction: 'out', text: reply, client_id: replyClientId || undefined,
+              })
+            } else {
+              broadcastBuddyEvent(state, 'success', '日程已创建')
+              const reply = intent.reply || '日程已创建'
+              sendJSON(state.ws!, {
+                type: 'message',
+                target: 'client',
+                clientId: replyClientId,
+                payload: { text: reply },
+                ts: new Date().toISOString(),
+              })
+              recordMessage({
+                ts: Date.now(), direction: 'out', text: reply, client_id: replyClientId || undefined,
+              })
+            }
             break
           }
           case 'browser': {
@@ -796,28 +1327,32 @@ async function handleMessage(
               })
               break
             }
-            // Buddy event handled inside executeTask (or similar)
-            sendJSON(state.ws!, {
+            const browserTask = intent.task || text
+            const browserTaskId = `browser_${randomUUID()}`
+            state.browserTaskOwners.set(browserTaskId, replyClientId || undefined)
+            sendToClient(state, replyClientId || undefined, {
               type: 'browser_task_started',
-              task: intent.task || text,
+              taskId: browserTaskId,
+              task: browserTask,
               ts: new Date().toISOString(),
             })
 
             // Execute browser task (non-blocking — result sent via relay)
-            const browserTask = intent.task || text
             broadcastBuddyEvent(state, 'working', `网页任务: ${browserTask}`)
             state.browserAgent.executeTask({
-              id: `browser_${Date.now()}`,
+              id: browserTaskId,
               profileName: 'default',
               task: browserTask,
-              riskLevel: 'low',
+              // Remote browser actions are confirmed per click/type. A local
+              // desktop request retains the normal browser task flow.
+              riskLevel: msg.from === 'client' ? 'high' : 'low',
             }).then(result => {
-              logActivity('web_task', `${result.status}: ${browserTask.slice(0, 80)}`)
+              void logActivity('web_task', `${result.status}: ${browserTask.slice(0, 80)}`)
               if (result.status === 'success') broadcastBuddyEvent(state, 'success', '网页任务完成')
               else if (result.status === 'failed') broadcastBuddyEvent(state, 'error', `网页任务失败: ${result.error}`)
               else broadcastBuddyEvent(state, 'idle')
 
-              sendJSON(state.ws!, {
+              sendToClient(state, replyClientId || undefined, {
                 type: 'browser_task_result',
                 taskId: result.taskId,
                 status: result.status,
@@ -837,7 +1372,7 @@ async function handleMessage(
               })
             }).catch(err => {
               broadcastBuddyEvent(state, 'error', `执行错误: ${err.message}`)
-              sendJSON(state.ws!, {
+              sendToClient(state, replyClientId || undefined, {
                 type: 'browser_task_result',
                 status: 'failed',
                 error: err.message || String(err),
@@ -848,6 +1383,8 @@ async function handleMessage(
                 text: `网页任务执行错误: ${err.message || err}`,
                 client_id: replyClientId || undefined,
               })
+            }).finally(() => {
+              state.browserTaskOwners.delete(browserTaskId)
             })
             break
           }
@@ -869,24 +1406,49 @@ async function handleMessage(
       break
     }
 
+    case 'task_cancel': {
+      const taskId = typeof msg.taskId === 'string' ? msg.taskId : ''
+      const clientId = typeof msg.clientId === 'string' ? msg.clientId : undefined
+      const cancelled = taskId ? cancelGatewayTask(state, taskId, clientId) : false
+      sendToClient(state, clientId, {
+        type: cancelled ? 'task_cancelled' : 'error',
+        taskId,
+        message: cancelled ? 'Cancellation requested.' : 'Task was not found or cannot be cancelled.',
+        ts: new Date().toISOString(),
+      })
+      break
+    }
+
     case 'schedule_create': {
       // Mobile client wants to create a schedule
       const payload = msg.payload || {}
+      // 校验 cron 表达式（如果使用 cron 触发器）
+      if (payload.trigger === 'cron' && payload.cron) {
+        const cronParts = String(payload.cron).trim().split(/\s+/)
+        if (cronParts.length !== 5 || !cronParts.every(p => /^[0-9*,/\-]+$/.test(p))) {
+          replyToMessage(state, msg, {
+            type: 'error',
+            message: `无效的 cron 表达式: "${payload.cron}"。请使用 5 段标准格式。`,
+            ts: new Date().toISOString(),
+          })
+          break
+        }
+      }
       const id = `sched_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
       const entry: import('./tools.js').ScheduleEntry = {
         id,
-        text: payload.text || 'Untitled',
+        text: String(payload.text || 'Untitled').slice(0, 500),
         trigger: payload.trigger === 'cron' && payload.cron
           ? { type: 'cron', cron: payload.cron }
           : { type: 'interval', ms: 3600_000 },
-        task: payload.task || payload.text || '',
+        task: String(payload.task || payload.text || '').slice(0, 2000),
         delivery: 'both',
         enabled: true,
         createdAt: Date.now(),
       }
       state.schedules.set(id, entry)
       saveSchedules(state.schedules)
-      sendJSON(state.ws!, {
+      replyToMessage(state, msg, {
         type: 'schedule_created',
         scheduleId: id,
         description: entry.text,
@@ -904,7 +1466,7 @@ async function handleMessage(
         on: e.enabled,
         trigger: e.trigger,
       }))
-      sendJSON(state.ws!, {
+      replyToMessage(state, msg, {
         type: 'schedule_list',
         schedules: list,
         ts: new Date().toISOString(),
@@ -936,7 +1498,7 @@ async function handleMessage(
       if (!scheduleId) break
       const runs = getScheduleRuns(scheduleId, limit)
       const agentInfo = getAgentScheduleInfo(scheduleId)
-      sendJSON(state.ws!, {
+      replyToMessage(state, msg, {
         type: 'schedule_runs_response',
         scheduleId,
         runs,
@@ -951,8 +1513,31 @@ async function handleMessage(
       // Open non-headless, wait for them to close, then session is persisted.
       const profile = String(msg.profile || 'default')
       const startUrl = msg.url ? String(msg.url) : undefined
+      // URL 协议校验：仅允许 http/https
+      if (startUrl) {
+        try {
+          const parsed = new URL(startUrl)
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            replyToMessage(state, msg, {
+              type: 'browser_login_done',
+              profile, status: 'error',
+              error: `不支持的 URL 协议: ${parsed.protocol}，仅允许 http/https`,
+              ts: new Date().toISOString(),
+            })
+            break
+          }
+        } catch {
+          replyToMessage(state, msg, {
+            type: 'browser_login_done',
+            profile, status: 'error',
+            error: `无效的 URL: ${startUrl}`,
+            ts: new Date().toISOString(),
+          })
+          break
+        }
+      }
       if (!state.browserAgent) {
-        sendJSON(state.ws!, {
+        replyToMessage(state, msg, {
           type: 'browser_login_done',
           profile, status: 'error',
           error: '浏览器代理未启用 (HONE_BROWSER_ENABLED=true)',
@@ -964,7 +1549,7 @@ async function handleMessage(
         const runner = await import('./browser/playwright-runner.js')
         const cfg = (state.browserAgent as any).config
         broadcastBuddyEvent(state, 'working', `打开浏览器登录 ${profile}…`)
-        sendJSON(state.ws!, {
+        replyToMessage(state, msg, {
           type: 'browser_login_started',
           profile, url: startUrl,
           ts: new Date().toISOString(),
@@ -973,7 +1558,7 @@ async function handleMessage(
         runner.openProfileForLogin(cfg, profile, startUrl)
           .then(() => {
             broadcastBuddyEvent(state, 'success', `${profile} 登录会话已保存`)
-            sendJSON(state.ws!, {
+            replyToMessage(state, msg, {
               type: 'browser_login_done',
               profile, status: 'ok',
               ts: new Date().toISOString(),
@@ -981,7 +1566,7 @@ async function handleMessage(
           })
           .catch(err => {
             broadcastBuddyEvent(state, 'error', `登录失败: ${err.message || err}`)
-            sendJSON(state.ws!, {
+            replyToMessage(state, msg, {
               type: 'browser_login_done',
               profile, status: 'error',
               error: String(err.message || err),
@@ -989,7 +1574,7 @@ async function handleMessage(
             })
           })
       } catch (err) {
-        sendJSON(state.ws!, {
+        replyToMessage(state, msg, {
           type: 'browser_login_done',
           profile, status: 'error',
           error: String(err),
@@ -1002,7 +1587,7 @@ async function handleMessage(
     case 'messages_list_request': {
       const limit = Math.max(1, Math.min(500, Number(msg.limit) || 100))
       const messages = getRecentMessages(limit)
-      sendJSON(state.ws!, {
+      replyToMessage(state, msg, {
         type: 'messages_list_response',
         messages,
         ts: new Date().toISOString(),
@@ -1019,7 +1604,7 @@ async function handleMessage(
         latest_observation: (getObservations(item.id, 1)[0]) || null,
         stats: getRecommendationStats(item.id),
       }))
-      sendJSON(state.ws!, {
+      replyToMessage(state, msg, {
         type: 'tracked_items_list_response',
         items: enriched,
         ts: new Date().toISOString(),
@@ -1033,7 +1618,7 @@ async function handleMessage(
       const item = getTrackedItem(itemId)
       const observations = item ? getObservations(itemId, 100) : []
       const recommendations = item ? getRecommendations(itemId, 50) : []
-      sendJSON(state.ws!, {
+      replyToMessage(state, msg, {
         type: 'tracked_item_detail_response',
         itemId,
         item,
@@ -1053,7 +1638,7 @@ async function handleMessage(
         saveSchedules(state.schedules)
       }
       removeTrackedItem(itemId)
-      sendJSON(state.ws!, {
+      replyToMessage(state, msg, {
         type: 'tracked_items_changed',
         items: [],
         removedId: itemId,
@@ -1064,20 +1649,20 @@ async function handleMessage(
 
     case 'browser_profiles_list': {
       if (!state.browserAgent) {
-        sendJSON(state.ws!, { type: 'browser_profiles_response', profiles: [], ts: new Date().toISOString() })
+        replyToMessage(state, msg, { type: 'browser_profiles_response', profiles: [], ts: new Date().toISOString() })
         break
       }
       try {
         const runner = await import('./browser/playwright-runner.js')
         const cfg = (state.browserAgent as any).config
         const profiles = await runner.listProfiles(cfg)
-        sendJSON(state.ws!, {
+        replyToMessage(state, msg, {
           type: 'browser_profiles_response',
           profiles,
           ts: new Date().toISOString(),
         })
       } catch (err) {
-        sendJSON(state.ws!, {
+        replyToMessage(state, msg, {
           type: 'browser_profiles_response',
           profiles: [],
           error: String(err),
@@ -1090,10 +1675,23 @@ async function handleMessage(
     case 'browser_confirm': {
       // User confirmed/denied a high-risk browser action from the UI
       const pending = state.pendingConfirmations.get(msg.taskId)
-      if (pending) {
+      const clientId = typeof msg.clientId === 'string' ? msg.clientId : undefined
+      if (pending && (!pending.clientId || pending.clientId === clientId)) {
         state.pendingConfirmations.delete(msg.taskId)
         pending.resolve(!!msg.approved)
         log(config, `Browser confirm: ${msg.taskId} approved=${msg.approved}`)
+      }
+      break
+    }
+
+    case 'confirmation_response': {
+      // User confirmed/denied a dispatch/stock-sell confirmation request
+      const pending = state.pendingConfirmations.get(msg.confirmId)
+      const clientId = typeof msg.clientId === 'string' ? msg.clientId : undefined
+      if (pending && (!pending.clientId || pending.clientId === clientId)) {
+        state.pendingConfirmations.delete(msg.confirmId)
+        pending.resolve(!!msg.approved)
+        log(config, `Confirmation response: ${msg.confirmId} approved=${msg.approved}`)
       }
       break
     }
@@ -1102,8 +1700,18 @@ async function handleMessage(
     case 'task_dispatched':
     case 'notification':
     case 'browser_task_started':
-    case 'browser_task_result': {
+    case 'browser_task_result':
+    case 'budget_warning': {
       // Internal messages, already handled
+      break
+    }
+
+    case 'usage_query': {
+      replyToMessage(state, msg, {
+        type: 'usage_stats',
+        stats: getUsageStats(),
+        ts: new Date().toISOString(),
+      })
       break
     }
 
@@ -1121,9 +1729,18 @@ export async function stopGateway(state: GatewayState): Promise<void> {
   if (state.patternTimer) {
     clearInterval(state.patternTimer)
   }
-  const pairingTimer = (state as any).pairingPollTimer
-  if (pairingTimer) {
-    clearInterval(pairingTimer)
+  if (state.patternInitTimer) {
+    clearTimeout(state.patternInitTimer)
+    state.patternInitTimer = null
+  }
+  if (state.memoryConsolidateTimer) {
+    clearInterval(state.memoryConsolidateTimer)
+  }
+  if (state.pairingPollTimer) {
+    clearInterval(state.pairingPollTimer)
+  }
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer)
   }
   if (state.schedulerState) {
     stopScheduler(state.schedulerState)
@@ -1131,8 +1748,33 @@ export async function stopGateway(state: GatewayState): Promise<void> {
   if (state.browserAgent) {
     await state.browserAgent.shutdown()
   }
+  // 清理所有待确认的 Promise（避免永悬）和超时定时器（避免泄漏）
+  for (const timer of state.confirmationTimers) {
+    clearTimeout(timer)
+  }
+  state.confirmationTimers.clear()
+  for (const [, conf] of state.pendingConfirmations) {
+    conf.resolve(false)
+  }
+  state.pendingConfirmations.clear()
+  for (const [, pairing] of state.pendingPairings) {
+    pairing.resolve(false)
+  }
+  state.pendingPairings.clear()
+  // 关闭所有本地客户端连接
+  for (const lc of state.localClients) {
+    try { lc.close() } catch {}
+  }
+  state.localClients.clear()
+  // 关闭本地 WebSocketServer，释放端口（否则重启后 18789 仍被占用）
+  if (state.localServer) {
+    try { state.localServer.close() } catch {}
+    state.localServer = null
+  }
   if (state.ws) {
     state.ws.close()
   }
-  console.error(`[Gateway] Hone Gateway 已停止`)
+  // Close the SQLite database to checkpoint WAL and release file handles.
+  closeDb()
+  console.error(`[Gateway] Hone 已停止`)
 }

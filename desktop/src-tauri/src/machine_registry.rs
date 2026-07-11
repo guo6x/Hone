@@ -33,6 +33,7 @@ pub enum MachineStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineInfo {
+    #[serde(default)]
     pub id: String,
     pub name: String,
     pub host: String,
@@ -60,6 +61,7 @@ pub struct MachineStats {
 pub enum RegistryError {
     #[error("Machine not found: {0}")]
     NotFound(String),
+    #[allow(dead_code)]
     #[error("Machine already exists: {0}")]
     AlreadyExists(String),
 }
@@ -129,10 +131,12 @@ impl MachineRegistry {
         self.machines.values().collect()
     }
 
+    #[allow(dead_code)]
     pub fn get(&self, id: &str) -> Option<&MachineInfo> {
         self.machines.get(id)
     }
 
+    #[allow(dead_code)]
     pub fn get_mut(&mut self, id: &str) -> Option<&mut MachineInfo> {
         self.machines.get_mut(id)
     }
@@ -145,10 +149,12 @@ impl MachineRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub fn update_stats(&mut self, id: &str, stats: MachineStats) {
         self.stats.insert(id.to_string(), stats);
     }
 
+    #[allow(dead_code)]
     pub fn get_stats(&self, id: &str) -> Option<&MachineStats> {
         self.stats.get(id)
     }
@@ -164,9 +170,19 @@ impl MachineRegistry {
         if let Some(parent) = self.storage_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&self.storage_path, json)
+        // Atomic write: tmp + rename, so a crash mid-write can't corrupt the
+        // existing registry file (which would lose all known machines).
+        let tmp = self.storage_path.with_extension("json.tmp");
+        fs::write(&tmp, &json)?;
+        fs::rename(&tmp, &self.storage_path).map_err(|e| {
+            // Best-effort cleanup of the temp file on rename failure so we
+            // don't leave stale .tmp files behind.
+            let _ = fs::remove_file(&tmp);
+            e
+        })
     }
 
+    #[allow(dead_code)]
     pub fn load(storage_path: PathBuf) -> Result<Self, std::io::Error> {
         let data = fs::read_to_string(&storage_path)?;
         let snapshot: RegistrySnapshot = serde_json::from_str(&data)?;

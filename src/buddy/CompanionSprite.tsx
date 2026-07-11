@@ -13,6 +13,7 @@ import type { Theme } from '../utils/theme.js';
 import { getCompanion } from './companion.js';
 import { renderFace, renderSprite, spriteFrameCount } from './sprites.js';
 import { RARITY_COLORS } from './types.js';
+import type { ScrollBoxHandle } from '../ink/components/ScrollBox.js';
 const TICK_MS = 500;
 const BUBBLE_SHOW = 20; // ticks ->~10s at 500ms
 const FADE_WINDOW = 6; // last ~3s the bubble dims so you know it's about to go
@@ -173,7 +174,11 @@ export function companionReservedColumns(terminalColumns: number, speaking: bool
   const bubble = speaking && !isFullscreenActive() ? BUBBLE_WIDTH : 0;
   return spriteColWidth(nameWidth) + SPRITE_PADDING_X + bubble;
 }
-export function CompanionSprite(): React.ReactNode {
+export function CompanionSprite({
+  scrollRef
+}: {
+  scrollRef?: React.RefObject<ScrollBoxHandle | null>;
+} = {}): React.ReactNode {
   const reaction = useAppState(s => s.companionReaction);
   const petAt = useAppState(s => s.companionPetAt);
   const focused = useAppState(s => s.footerSelection === 'companion');
@@ -198,10 +203,17 @@ export function CompanionSprite(): React.ReactNode {
       forPetAt: petAt
     });
   }
+  const isFullscreen = isFullscreenActive();
+  const petAge = petAt ? tick - petStartTick : Infinity;
+  const petAgeMs = petAt ? Date.now() - petAt : Infinity;
+  const petting = petAgeMs < PET_BURST_MS;
+  const shouldAnimate = columns >= MIN_COLS_FOR_FULL_SPRITE || Boolean(reaction) || petting;
+
   useEffect(() => {
-    const timer = setInterval(setT => setT((t: number) => t + 1), TICK_MS, setTick);
+    if (!shouldAnimate) return;
+    const timer = setInterval(() => setTick((t: number) => t + 1), TICK_MS);
     return () => clearInterval(timer);
-  }, []);
+  }, [shouldAnimate]);
   useEffect(() => {
     if (!reaction) return;
     lastSpokeTick.current = tick;
@@ -212,6 +224,16 @@ export function CompanionSprite(): React.ReactNode {
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- tick intentionally captured at reaction-change, not tracked
   }, [reaction, setAppState]);
+  useEffect(() => {
+    if (!petAt) return;
+    const elapsed = Date.now() - petAt;
+    const remaining = PET_BURST_MS - elapsed;
+    if (remaining <= 0) return;
+    const timer = setTimeout(() => {
+      setTick((t: number) => t + 1);
+    }, remaining);
+    return () => clearTimeout(timer);
+  }, [petAt]);
   if (!true) return null;
   const companion = getCompanion();
   if (!companion || getGlobalConfig().companionMuted) return null;
@@ -219,8 +241,6 @@ export function CompanionSprite(): React.ReactNode {
   const colWidth = spriteColWidth(stringWidth(companion.name));
   const bubbleAge = reaction ? tick - lastSpokeTick.current : 0;
   const fading = reaction !== undefined && bubbleAge >= BUBBLE_SHOW - FADE_WINDOW;
-  const petAge = petAt ? tick - petStartTick : Infinity;
-  const petting = petAge * TICK_MS < PET_BURST_MS;
 
   // Narrow terminals: collapse to one-line face. When speaking, the quip
   // replaces the name beside the face (no room for a bubble).
@@ -243,7 +263,9 @@ export function CompanionSprite(): React.ReactNode {
   const heartFrame = petting ? PET_HEARTS[petAge % PET_HEARTS.length] : null;
   let spriteFrame: number;
   let blink = false;
-  if (reaction || petting) {
+  if (!shouldAnimate) {
+    spriteFrame = 0;
+  } else if (reaction || petting) {
     // Excited: cycle all fidget frames fast
     spriteFrame = tick % frameCount;
   } else {

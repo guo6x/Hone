@@ -10,7 +10,7 @@
 
 import * as fs from 'fs'
 import * as path from 'path'
-import type { Tool } from '../types.js'
+import type { Tool } from '../Tool.js'
 
 // ── Types ──
 
@@ -47,8 +47,11 @@ export function readMemories(): Map<string, MemoryEntry> {
     for (const file of fs.readdirSync(dir)) {
       if (!file.endsWith('.md') || file === 'MEMORY.md') continue
       try {
-        const content = fs.readFileSync(path.join(dir, file), 'utf-8')
-        const entry = parseMemoryFile(file, content)
+        const filepath = path.join(dir, file)
+        const content = fs.readFileSync(filepath, 'utf-8')
+        // 用文件 mtime 作为 savedAt，使 consolidation.ts 的过期清理能正常工作
+        const mtimeMs = fs.statSync(filepath).mtimeMs
+        const entry = parseMemoryFile(file, content, mtimeMs)
         if (entry) map.set(entry.name, entry)
       } catch {
         // skip corrupted files
@@ -60,9 +63,9 @@ export function readMemories(): Map<string, MemoryEntry> {
   return map
 }
 
-function parseMemoryFile(filename: string, content: string): MemoryEntry | null {
+function parseMemoryFile(filename: string, content: string, mtimeMs?: number): MemoryEntry | null {
   // Parse YAML-like frontmatter
-  const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/)
+  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/)
   if (!fmMatch) return null
 
   const frontmatter = fmMatch[1]
@@ -77,7 +80,7 @@ function parseMemoryFile(filename: string, content: string): MemoryEntry | null 
     description,
     type,
     content: body,
-    savedAt: Date.now(),
+    savedAt: mtimeMs || Date.now(),
   }
 }
 

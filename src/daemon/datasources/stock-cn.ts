@@ -22,17 +22,29 @@ export interface StockQuote {
   ts: number
 }
 
-/** 判断市场前缀：6 开头 = 上证 (sh)，其他 = 深证 (sz)。 */
-function detectMarket(code: string): 'sh' | 'sz' {
-  const clean = code.replace(/^(sh|sz)/i, '')
+/** fetch 包装：10 秒超时，防止行情 API 挂起阻塞调度器。 */
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 10_000)
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 判断市场前缀：6/5/9 开头 = 上证 (sh)，8/4 开头 = 北交所 (bj)，其他 = 深证 (sz)。 */
+function detectMarket(code: string): 'sh' | 'sz' | 'bj' {
+  const clean = code.replace(/^(sh|sz|bj)/i, '')
   if (clean.startsWith('6') || clean.startsWith('5') || clean.startsWith('9')) return 'sh'
+  if (clean.startsWith('8') || clean.startsWith('4')) return 'bj'
   return 'sz'
 }
 
-function normalizeSymbol(symbol: string): { market: 'sh' | 'sz'; code: string; full: string } {
+function normalizeSymbol(symbol: string): { market: 'sh' | 'sz' | 'bj'; code: string; full: string } {
   const lower = symbol.toLowerCase()
-  if (lower.startsWith('sh') || lower.startsWith('sz')) {
-    const market = lower.slice(0, 2) as 'sh' | 'sz'
+  if (lower.startsWith('sh') || lower.startsWith('sz') || lower.startsWith('bj')) {
+    const market = lower.slice(0, 2) as 'sh' | 'sz' | 'bj'
     const code = lower.slice(2)
     return { market, code, full: `${market}${code}` }
   }
@@ -40,7 +52,7 @@ function normalizeSymbol(symbol: string): { market: 'sh' | 'sz'; code: string; f
   return { market, code: symbol, full: `${market}${symbol}` }
 }
 
-/** 东方财富的 secid 编码：1=上证, 0=深证 */
+/** 东方财富的 secid 编码：1=上证, 0=深证/北交所（北交所 secid 前缀待验证，先按 0 处理） */
 function eastmoneySecid(symbol: string): string {
   const { market, code } = normalizeSymbol(symbol)
   return `${market === 'sh' ? 1 : 0}.${code}`
@@ -66,7 +78,7 @@ export async function fetchEastmoney(symbols: string[]): Promise<StockQuote[]> {
   const secids = symbols.map(eastmoneySecid).join(',')
   const url = `https://push2.eastmoney.com/api/qt/clist/get?secids=${secids}&fields=f2,f3,f4,f5,f6,f12,f14,f15,f16,f17,f18&fltt=2&fid=&pn=1&pz=50`
 
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       'Referer': 'https://quote.eastmoney.com/',
@@ -111,7 +123,7 @@ export async function fetchSina(symbols: string[]): Promise<StockQuote[]> {
   const list = symbols.map(s => normalizeSymbol(s).full).join(',')
   const url = `https://hq.sinajs.cn/list=${list}`
 
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       'Referer': 'https://finance.sina.com.cn/',
@@ -160,6 +172,11 @@ export async function fetchSina(symbols: string[]): Promise<StockQuote[]> {
 /** Try eastmoney first, fall back to sina. */
 export async function fetchStockQuotes(symbols: string[]): Promise<StockQuote[]> {
   if (symbols.length === 0) return []
+  // 非交易时段不查询实时行情，避免无效 API 调用（休市时无实时数据）
+  if (!isMarketOpen()) {
+    console.log('[stock-cn] 市场休市，跳过实时行情查询')
+    return []
+  }
   try {
     const q = await fetchEastmoney(symbols)
     if (q.length > 0) return q

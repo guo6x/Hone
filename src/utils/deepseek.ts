@@ -120,7 +120,7 @@ export function translateAnthropicToDeepSeek(anthropicBody: any): any {
     }
 
     return {
-        model: process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro', // DeepSeek V4 Pro is the new standard
+        model: process.env.DEEPSEEK_MODEL || 'deepseek-chat', // DeepSeek Chat is the new standard
         messages: deepseekMessages,
         max_tokens: max_tokens || 4096,
         stream: stream || false,
@@ -192,7 +192,7 @@ export async function* translateDeepSeekStreamToAnthropic(response: Response): A
             id: messageId,
             type: 'message',
             role: 'assistant',
-            model: process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro',
+            model: process.env.DEEPSEEK_MODEL || 'deepseek-chat',
             content: [],
             stop_reason: null,
             stop_sequence: null,

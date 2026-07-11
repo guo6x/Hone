@@ -457,7 +457,7 @@ cat ~/.hone/memory/MEMORY.md
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `DEEPSEEK_API_KEY` | DeepSeek API Key | — |
-| `HONE_MODEL` | 默认模型 | `deepseek-v4-pro` |
+| `HONE_MODEL` | 默认模型 | `deepseek-chat` |
 | `HONE_GOD_MODE` | 跳过权限弹窗 | `1`（启用） |
 | `HONE_DATA_DIR` | 数据存储目录 | `~/.hone` |
 

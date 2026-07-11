@@ -11,6 +11,8 @@
   --hone-accentHover: #E0B963;
   --hone-accentMuted: #24201A;
   --hone-codeBg: #0F131A;
+  --hone-primary: #6366F1;
+  --hone-primaryMuted: #1E2030;
   --hone-success: #2ECC80;
   --hone-successMuted: #162720;
   --hone-warning: #D4A853;
@@ -78,7 +80,7 @@ html, body, #root {
 body {
   background: var(--hone-bg);
   color: var(--hone-text);
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Noto Sans SC', sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', 'Inter', sans-serif;
   font-size: 13px;
   line-height: 1.55;
 }

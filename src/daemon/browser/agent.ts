@@ -19,9 +19,11 @@ import type {
   BrowserAgent as BrowserAgentInterface,
 } from './types.js'
 import * as playwright from './playwright-runner.js'
+import { validateUrl } from './playwright-runner.js'
 import { queryGUIModel, NoVisionModelError, type VisionModelConfig } from './gui-model.js'
 import { extractPage } from './playwright-runner.js'
 import { buildFallbackPrompt, parseFallbackResponse } from './dom-fallback.js'
+import * as os from 'os'
 
 /** Callback to request user confirmation for high-risk actions. */
 export type ConfirmCallback = (taskId: string, description: string) => Promise<boolean>
@@ -62,6 +64,7 @@ export class BrowserAgent implements BrowserAgentInterface {
     try {
       // Navigate to start URL if provided
       if (task.startUrl) {
+        validateUrl(task.startUrl)
         await playwright.navigate(this.config, task.profileName, task.startUrl)
       }
 
@@ -178,6 +181,7 @@ export class BrowserAgent implements BrowserAgentInterface {
   }
 
   async navigate(profileName: string, url: string): Promise<import('./types.js').BrowserState> {
+    validateUrl(url)
     return playwright.navigate(this.config, profileName, url)
   }
 
@@ -185,14 +189,28 @@ export class BrowserAgent implements BrowserAgentInterface {
     return playwright.screenshot(this.config, profileName)
   }
 
-  async extract(profileName: string, _selector: string): Promise<string> {
-    const page = await extractPage(this.config, profileName)
+  async extract(profileName: string, selector: string): Promise<string> {
+    const page = await extractPage(this.config, profileName, selector)
     return page.text
   }
 
-  listProfiles(): string[] {
-    // Sync wrapper — profiles are listed via filesystem in listProfiles
-    return []
+  async listProfiles(): Promise<string[]> {
+    const fs = await import('fs/promises')
+    const path = await import('path')
+    const profilesDir = path.join(this.config.dataDir, 'profiles')
+    try {
+      const entries = await fs.readdir(profilesDir)
+      const dirs: string[] = []
+      for (const entry of entries) {
+        try {
+          const stat = await fs.stat(path.join(profilesDir, entry))
+          if (stat.isDirectory()) dirs.push(entry)
+        } catch {}
+      }
+      return dirs
+    } catch {
+      return []
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -209,7 +227,7 @@ export function createBrowserAgent(
   const enabled = process.env.HONE_BROWSER_ENABLED === 'true' || process.env.HONE_BROWSER_ENABLED === '1'
   if (!enabled) return null
 
-  const dataDir = process.env.HONE_DATA_DIR || `${process.env.HOME || '~'}/.hone`
+  const dataDir = process.env.HONE_DATA_DIR || `${os.homedir()}/.hone`
   const guiModelUrl = process.env.HONE_GUI_MODEL_URL || ''
 
   const config: BrowserConfig = {

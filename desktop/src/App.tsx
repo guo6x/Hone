@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { LANG, type Lang } from './i18n/translations';
 import { useTheme, type ThemeName } from './hooks/useTheme';
 import Sidebar from './components/Sidebar';
@@ -12,7 +12,7 @@ import { SettingsPage } from './components/SettingsPage';
 import StatusBar from './components/StatusBar';
 import HoneBuddy, { BuddyState } from './components/HoneBuddy';
 import { DevicePairingModal } from './components/DevicePairingModal';
-import { useMachines, useDiscovery, useSchedules, isTauri, useTauriConfig, useGateway, useHonePath } from './tauri/useTauri';
+import { useMachines, useDiscovery, useSchedules, isTauri, useTauriConfig, useGatewayConnectionInfo, useHonePath } from './tauri/useTauri';
 import { useGatewayConnection } from './hooks/useGatewayConnection';
 import type { DiscoveredGateway } from './tauri/types';
 import {
@@ -22,20 +22,28 @@ import {
   type AiSuggestion,
   type SettingsData,
   type StatusBarData,
+  type GatewayMessage,
+  type ChatSession,
+  type ProviderProfile,
 } from './data/mock';
 
 type ViewName = 'dashboard' | 'gateway' | 'workspace' | 'watch' | 'schedule' | 'canvas' | 'settings';
 type PageState = 'loaded' | 'loading' | 'error';
 
 export default function App() {
-  const [lang, setLang] = useState<Lang>('zh');
+  const [lang, setLangState] = useState<Lang>(() => {
+    try { return (localStorage.getItem('hone-lang') as Lang) || 'zh' } catch { return 'zh' }
+  });
+  const setLang = useCallback((l: Lang) => {
+    setLangState(l);
+    try { localStorage.setItem('hone-lang', l) } catch {}
+  }, []);
   const { theme, setTheme, cycleTheme } = useTheme();
   const t = LANG[lang];
 
   // Tauri IPC hooks (falls back to mock when not in Tauri)
   const { machines, addMachine, removeMachine } = useMachines();
   const { gateways: discoveredGateways, scanning, scan } = useDiscovery();
-  const { start: ipcGatewayStart } = useGateway();
   const { honePath: detectedHonePath } = useHonePath();
 
   // ── Auto-discovered local CLI instances (same-machine, no pairing needed) ─
@@ -61,7 +69,7 @@ export default function App() {
           const folder = cwdParts[cwdParts.length - 1] || inst.cwd;
           return {
             id: `local-cli-${inst.pid}`,
-            name: inst.mode === 'gateway' ? `${inst.machine_name} · Gateway`
+            name: inst.mode === 'gateway' ? inst.machine_name
                 : inst.mode === 'pair' ? `${inst.machine_name} · Pair`
                 : `${inst.machine_name} · ${folder}`,
             host: '127.0.0.1',
@@ -80,13 +88,25 @@ export default function App() {
   }, []);
 
   // Combined: persistently added machines + auto-discovered local CLI processes
-  const allMachines = [...machines, ...localCliMachines];
+  const allMachines = useMemo(() => [...machines, ...localCliMachines], [machines, localCliMachines]);
+  // Ref mirror so the gateway subscribe callback (which should NOT re-subscribe
+  // on every allMachines change — happens every 5s due to CLI polling) always
+  // reads the latest machine list without triggering a re-subscribe.
+  const allMachinesRef = useRef(allMachines);
+  allMachinesRef.current = allMachines;
 
   // Dashboard state
   const [activeMachine, setActiveMachine] = useState<string | null>(null);
+  // Ref mirror so the gateway subscribe callback (which should NOT re-subscribe
+  // on every activeMachine change) always reads the latest value.
+  const activeMachineRef = useRef(activeMachine);
+  activeMachineRef.current = activeMachine;
   useEffect(() => {
     if (allMachines.length > 0 && !activeMachine) {
       setActiveMachine(allMachines[0].id);
+    } else if (activeMachine && !allMachines.some(m => m.id === activeMachine)) {
+      // activeMachine 指向的机器已失效（被删除/下线），清理并选第一个
+      setActiveMachine(allMachines[0]?.id || null);
     }
   }, [allMachines, activeMachine]);
   const [filter, setFilter] = useState('all');
@@ -137,12 +157,32 @@ export default function App() {
   // Settings — Tauri backend is authoritative for GatewayConfig fields.
   // localStorage only stores non-GatewayConfig fields (provider, apiKey, model, etc.)
   const GATEWAY_DEFAULTS = {
-    relayUrl: 'wss://hone-relay.marsailleippi79.workers.dev/connect/default',
+    relayUrl: 'wss://hone-relay.marsailleippi79.workers.dev/connect',
     localPort: '18789',
     gatewayAutoStart: true,
   } as const;
 
   const { config: tauriConfig, save: saveTauriConfig } = useTauriConfig();
+  const {
+    info: gatewayConnectionInfo,
+    refresh: refreshGatewayConnectionInfo,
+    rotatePairing: rotateMobilePairing,
+  } = useGatewayConnectionInfo();
+
+  const toTauriProviders = useCallback((providers: ProviderProfile[] = []) => (
+    providers.map(provider => ({
+      id: provider.id,
+      name: provider.name,
+      kind: provider.kind,
+      api_key: provider.apiKey,
+      base_url: provider.baseUrl,
+      model: provider.model,
+      temperature: provider.temperature || 0,
+      max_tokens: provider.maxTokens || 0,
+      enabled: provider.enabled,
+      is_default: provider.isDefault,
+    }))
+  ), []);
 
   const [settings, setSettings] = useState<SettingsData>(() => {
     const defaults: SettingsData = {
@@ -161,22 +201,26 @@ export default function App() {
       browserHeadless: true,
       browserMaxSteps: '15',
     };
-    // Load extra fields from localStorage (never GatewayConfig fields)
-    try {
-      const saved = localStorage.getItem('hone-settings-extra');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        const keys: (keyof SettingsData)[] = [
-          'provider', 'apiKey', 'model', 'baseUrl', 'customProviderName',
-          'temperature', 'maxTokens', 'workspaceDir', 'logRetention',
-          'browserEnabled', 'guiModelUrl', 'browserHeadless', 'browserMaxSteps',
-          'buddySpecies',
-        ];
-        for (const k of keys) {
-          if (parsed[k] !== undefined) (defaults as any)[k] = parsed[k];
+    // Browser previews do not have the native credential store. The desktop
+    // build always hydrates API credentials through Tauri instead of retaining
+    // them in WebView localStorage.
+    if (!isTauri()) {
+      try {
+        const saved = localStorage.getItem('hone-settings-extra');
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          const keys: (keyof SettingsData)[] = [
+            'provider', 'apiKey', 'model', 'baseUrl', 'customProviderName',
+            'temperature', 'maxTokens', 'workspaceDir', 'logRetention',
+            'browserEnabled', 'guiModelUrl', 'browserHeadless', 'browserMaxSteps',
+            'buddySpecies', 'providers',
+          ];
+          for (const k of keys) {
+            if (parsed[k] !== undefined) (defaults as any)[k] = parsed[k];
+          }
         }
-      }
-    } catch {}
+      } catch {}
+    }
     return defaults;
   });
 
@@ -189,52 +233,70 @@ export default function App() {
         relayUrl: tauriConfig.relay_url || GATEWAY_DEFAULTS.relayUrl,
         localPort: String(tauriConfig.local_port || GATEWAY_DEFAULTS.localPort),
         gatewayAutoStart: tauriConfig.auto_start ?? GATEWAY_DEFAULTS.gatewayAutoStart,
+        provider: tauriConfig.provider || 'deepseek',
+        apiKey: tauriConfig.api_key || '',
+        model: tauriConfig.model || 'deepseek-chat',
+        baseUrl: tauriConfig.base_url || '',
+        customProviderName: tauriConfig.custom_name || '',
+        temperature: tauriConfig.temperature ? String(tauriConfig.temperature) : '',
+        maxTokens: tauriConfig.max_tokens ? String(tauriConfig.max_tokens) : '',
+        browserEnabled: tauriConfig.browser_enabled ?? false,
+        guiModelUrl: tauriConfig.gui_model_url || '',
+        guiModelName: tauriConfig.gui_model_name || '',
+        guiModelKey: tauriConfig.gui_model_key || '',
+        browserHeadless: tauriConfig.browser_headless ?? true,
+        browserMaxSteps: String(tauriConfig.browser_max_steps || 15),
+        providers: (tauriConfig.providers || []).map(provider => ({
+          id: provider.id,
+          name: provider.name,
+          kind: provider.kind as ProviderProfile['kind'],
+          apiKey: provider.api_key || '',
+          baseUrl: provider.base_url || '',
+          model: provider.model || '',
+          temperature: provider.temperature || 0,
+          maxTokens: provider.max_tokens || 0,
+          enabled: provider.enabled,
+          isDefault: provider.is_default,
+        })),
         // workspaceDir is where dist/cli.js lives. Prefer the user's saved value,
-        // otherwise fall back to the auto-detected hone project path.
-        workspaceDir: prev.workspaceDir || detectedHonePath || '',
+        // otherwise fall back to the auto-detected Hone source directory.
+        workspaceDir: tauriConfig.workspace_dir || prev.workspaceDir || detectedHonePath || '',
       }));
     }
   }, [tauriConfig, detectedHonePath]);
 
-  // Auto-start Gateway daemon after config and hone path resolve
-  useEffect(() => {
-    if (!tauriConfig) return;
-    if (!isTauri()) return;
-
-    const autoStart = tauriConfig.auto_start ?? true;
-    if (!autoStart) return;
-
-    const honePath = settings.workspaceDir || detectedHonePath || '';
-    if (!honePath) return;
-
-    const relayUrl = tauriConfig.relay_url || 'wss://hone-relay.marsailleippi79.workers.dev/connect/default';
-    ipcGatewayStart(honePath, relayUrl).catch(e => {
-      console.error("Auto-start gateway failed:", e);
-    });
-  }, [tauriConfig, detectedHonePath, settings.workspaceDir]);
-
   // Persist: all settings → Tauri (authoritative), localStorage as fallback
   const persistSettings = useCallback((next: SettingsData) => {
-    // localStorage fallback for browser-only mode
+    // localStorage is a browser-only fallback. In the desktop app, all
+    // provider credentials are held by the OS credential manager via Tauri.
     try {
-      localStorage.setItem('hone-settings-extra', JSON.stringify({
-        provider: next.provider,
-        apiKey: next.apiKey,
-        model: next.model,
-        baseUrl: next.baseUrl,
-        customProviderName: next.customProviderName,
-        temperature: next.temperature,
-        maxTokens: next.maxTokens,
-        workspaceDir: next.workspaceDir,
-        logRetention: next.logRetention,
-        browserEnabled: next.browserEnabled,
-        guiModelUrl: next.guiModelUrl,
-        guiModelName: (next as any).guiModelName || '',
-        guiModelKey: (next as any).guiModelKey || '',
-        browserHeadless: next.browserHeadless,
-        browserMaxSteps: next.browserMaxSteps,
-        buddySpecies: next.buddySpecies,
-      }));
+      if (isTauri()) {
+        // Replace any older payload that contained API keys with a safe subset.
+        localStorage.setItem('hone-settings-extra', JSON.stringify({
+          logRetention: next.logRetention,
+          buddySpecies: next.buddySpecies,
+        }));
+      } else {
+        localStorage.setItem('hone-settings-extra', JSON.stringify({
+          provider: next.provider,
+          apiKey: next.apiKey,
+          model: next.model,
+          baseUrl: next.baseUrl,
+          customProviderName: next.customProviderName,
+          temperature: next.temperature,
+          maxTokens: next.maxTokens,
+          workspaceDir: next.workspaceDir,
+          logRetention: next.logRetention,
+          browserEnabled: next.browserEnabled,
+          guiModelUrl: next.guiModelUrl,
+          guiModelName: (next as any).guiModelName || '',
+          guiModelKey: (next as any).guiModelKey || '',
+          browserHeadless: next.browserHeadless,
+          browserMaxSteps: next.browserMaxSteps,
+          buddySpecies: next.buddySpecies,
+          providers: next.providers,
+        }));
+      }
     } catch {}
     // Tauri (all fields including provider settings)
     if (isTauri()) {
@@ -243,6 +305,7 @@ export default function App() {
         local_port: parseInt(next.localPort, 10) || 18789,
         auto_start: next.gatewayAutoStart,
         machine_name: (tauriConfig?.machine_name) || '',
+        workspace_dir: next.workspaceDir || '',
         provider: next.provider,
         api_key: next.apiKey,
         model: next.model,
@@ -256,14 +319,16 @@ export default function App() {
         gui_model_key: (next as any).guiModelKey || '',
         browser_headless: next.browserHeadless,
         browser_max_steps: parseInt(next.browserMaxSteps, 10) || 15,
-      } as any, next.workspaceDir || '');
+        providers: toTauriProviders(next.providers),
+      }, detectedHonePath || '');
     }
-  }, [saveTauriConfig, tauriConfig]);
+  }, [saveTauriConfig, tauriConfig, toTauriProviders]);
 
   const updateSettings = useCallback((next: SettingsData) => {
     setSettings(next);
     persistSettings(next);
-  }, [persistSettings]);
+    void refreshGatewayConnectionInfo();
+  }, [persistSettings, refreshGatewayConnectionInfo]);
 
   // Pairing modal
   const [pairingModal, setPairingModal] = useState(false);
@@ -291,26 +356,204 @@ export default function App() {
   }, []);
 
   const handleSaveSchedule = useCallback((data: Partial<ScheduleInfo>) => {
-    if (scheduleModal.editing) {
-      const next = schedules.map(s => s.id === scheduleModal.editing!.id ? { ...s, ...data } : s);
+    const editingId = scheduleModal.editing?.id;
+    if (editingId && schedules.some(s => s.id === editingId)) {
+      const next = schedules.map(s => s.id === editingId ? { ...s, ...data } : s);
       saveSchedules(next);
     } else {
       const newId = 'sc' + Date.now();
       const next = [...schedules, { ...data, id: newId, enabled: true, lastStatus: null, lastRun: null } as ScheduleInfo];
       saveSchedules(next);
     }
-  }, [scheduleModal.editing]);
+  }, [scheduleModal.editing, schedules, saveSchedules]);
 
-  // ── Global gateway WebSocket connection (shared across all tabs) ────────
+  // ── Global gateway WebSocket connection (shared across all tabs) ──────────
+  // The relay connection is only meaningful when the gateway daemon is
+  // actually running on this machine. Without this gate, the WebSocket
+  // client retries the relay for minutes (10 attempts w/ exponential
+  // backoff ≈ 3.5 min) even though no daemon will ever answer — which is
+  // what made the UI feel stuck on "reconnecting" forever.
+  const [daemonOnline, setDaemonOnline] = useState(false);
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    async function poll() {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const status = await invoke('gateway_status');
+        if (!cancelled) {
+          setDaemonOnline(status === 'Running');
+        }
+      } catch {
+        if (!cancelled) setDaemonOnline(false);
+      }
+    }
+    poll();
+    // Poll every 1s (not 3s) so daemonOnline flips to true quickly once the
+    // daemon reports Running. This directly gates useGatewayConnection's
+    // `enabled` flag — a slower poll means up to 3s of dead time where the WS
+    // client isn't even allowed to try connecting after the daemon is ready.
+    const id = setInterval(poll, 1000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
   const connection = useGatewayConnection({
-    relayUrl: settings.relayUrl,
-    enabled: !!settings.relayUrl,
+    relayUrl: gatewayConnectionInfo?.relay_url,
+    enabled: !!gatewayConnectionInfo?.local_auth_token && daemonOnline,
+    localPort: gatewayConnectionInfo?.local_port,
+    localToken: gatewayConnectionInfo?.local_auth_token,
   });
 
   // ── Active sessions derived from task events ────────────────────────────
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   // ── StatusBar tokensToday: increments with each task complete ──────────
   const [tokensToday, setTokensToday] = useState<number>(0);
+
+  // ── Chat sessions (lifted to App level so switching tabs doesn't wipe them) ──
+  // Multiple sessions are stored in localStorage. Each session has its own
+  // message history and title, similar to ChatGPT/Claude sidebar behaviour.
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>(() => {
+    try {
+      // Migrate from old flat message list (single session) if present.
+      const legacy = localStorage.getItem('hone-chat-messages');
+      if (legacy) {
+        const parsed = JSON.parse(legacy);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const migrated: ChatSession = {
+            id: `cs_legacy_${Date.now()}`,
+            title: parsed.find((m: GatewayMessage) => m.from === 'user')?.text?.slice(0, 30) || '历史对话',
+            messages: parsed,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+          };
+          localStorage.removeItem('hone-chat-messages');
+          return [migrated];
+        }
+      }
+    } catch {}
+    try {
+      const raw = localStorage.getItem('hone-chat-sessions');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {}
+    return [];
+  });
+  const [activeChatSessionId, setActiveChatSessionId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('hone-active-chat-session');
+    } catch { return null; }
+  });
+  // Ref mirror of activeChatSessionId so appendChatMessage (a useCallback with
+  // [activeChatSessionId] dep) doesn't capture a stale value when multiple
+  // messages arrive in the same tick (e.g. user sends → daemon replies before
+  // React commits the setActiveChatSessionId from onCreateSession). Without
+  // this, each appendChatMessage call sees activeChatSessionId=null and creates
+  // a brand-new session, so a single conversation fragments into N sessions.
+  const activeChatSessionIdRef = useRef<string | null>(activeChatSessionId);
+  useEffect(() => { activeChatSessionIdRef.current = activeChatSessionId; }, [activeChatSessionId]);
+  const chatMsgIdCounterRef = useRef(0);
+  const chatNextId = useCallback((prefix: string) => `${prefix}${Date.now()}_${chatMsgIdCounterRef.current++}`, []);
+
+  const activeChatSession = useMemo(() =>
+    chatSessions.find(s => s.id === activeChatSessionId) || chatSessions[0] || null,
+    [chatSessions, activeChatSessionId]
+  );
+
+  const createChatSession = useCallback((title = '新对话') => {
+    const id = `cs_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const session: ChatSession = {
+      id,
+      title,
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    setChatSessions(prev => [session, ...prev].slice(0, 100));
+    setActiveChatSessionId(id);
+    activeChatSessionIdRef.current = id; // sync ref immediately
+    return id;
+  }, []);
+
+  const setActiveChatSession = useCallback((id: string) => {
+    setActiveChatSessionId(id);
+    activeChatSessionIdRef.current = id; // sync ref immediately
+  }, []);
+
+  const appendChatMessage = useCallback((msg: GatewayMessage) => {
+    setChatSessions(prev => {
+      // Read the latest active session id from the ref, not the closure.
+      // This ensures consecutive appends in the same tick (user send → daemon
+      // reply) land in the same session instead of each creating a new one.
+      let targetId = activeChatSessionIdRef.current;
+      if (!targetId || !prev.find(s => s.id === targetId)) {
+        // Auto-create a session if none is active
+        targetId = `cs_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        activeChatSessionIdRef.current = targetId; // sync ref so subsequent appends land here
+        // Also schedule the React state update so the UI highlights the new session.
+        // Using setTimeout(…,0) defers it past the current render commit safely.
+        setTimeout(() => setActiveChatSessionId(targetId!), 0);
+      }
+      const now = Date.now();
+      let updated = false;
+      const next = prev.map(s => {
+        if (s.id !== targetId) return s;
+        updated = true;
+        // 消息去重：若 id 已存在则跳过（防止 gateway 重发导致重复显示）
+        if (msg.id && s.messages.some(m => m.id === msg.id)) return s;
+        const messages = [...s.messages, msg].slice(-500);
+        // Update title from first user message if still default
+        let title = s.title;
+        if (title === '新对话' || title === 'New chat') {
+          const firstUser = messages.find(m => m.from === 'user');
+          if (firstUser?.text) {
+            title = firstUser.text.slice(0, 30);
+          }
+        }
+        return { ...s, messages, title, updatedAt: now };
+      });
+      if (!updated) {
+        next.unshift({
+          id: targetId,
+          title: msg.from === 'user' ? msg.text?.slice(0, 30) || '新对话' : '新对话',
+          messages: [msg],
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+      return next.slice(0, 100);
+    });
+  }, []);
+
+  const clearChatSession = useCallback((id?: string) => {
+    const target = id || activeChatSessionIdRef.current;
+    if (!target) return;
+    setChatSessions(prev => {
+      const filtered = prev.filter(s => s.id !== target);
+      // 删除当前会话后自动选中剩余的第一个
+      if (activeChatSessionIdRef.current === target) {
+        const next = filtered[0]?.id || null;
+        setActiveChatSessionId(next);
+        activeChatSessionIdRef.current = next;
+      }
+      return filtered;
+    });
+  }, []);
+
+  const renameChatSession = useCallback((id: string, title: string) => {
+    setChatSessions(prev => prev.map(s => s.id === id ? { ...s, title } : s));
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('hone-chat-sessions', JSON.stringify(chatSessions));
+      if (activeChatSessionId) {
+        localStorage.setItem('hone-active-chat-session', activeChatSessionId);
+      } else {
+        localStorage.removeItem('hone-active-chat-session');
+      }
+    } catch {}
+  }, [chatSessions, activeChatSessionId]);
 
   // Subscribe to gateway events to maintain sessions / suggestions
   useEffect(() => {
@@ -345,8 +588,8 @@ export default function App() {
           setSessions(prev => {
             if (prev.find(s => s.id === id)) return prev;
             const target = msgMachineId
-              ? allMachines.find(m => m.id === msgMachineId)
-              : (activeMachine ? allMachines.find(m => m.id === activeMachine) : undefined);
+              ? allMachinesRef.current.find(m => m.id === msgMachineId)
+              : (activeMachineRef.current ? allMachinesRef.current.find(m => m.id === activeMachineRef.current) : undefined);
             const machineId = target?.id || msgMachineId || activeMachine || 'gateway';
             const machineName = target?.name || (msgMachineId ? `Machine ${msgMachineId.slice(0, 8)}` : 'Gateway');
             const next: SessionInfo = {
@@ -370,13 +613,18 @@ export default function App() {
             if (!id && s.status !== 'live') return s;
             return { ...s, status: 'done' as const };
           }));
-          // Rough cumulative token estimate: result length / 4 chars per token.
-          const result = (msg as any).result;
-          const resultLen = typeof result === 'string'
-            ? result.length
-            : (result ? JSON.stringify(result).length : 0);
-          if (resultLen > 0) {
-            setTokensToday(prev => prev + Math.ceil(resultLen / 4));
+          // Use real token usage from Gateway if available; fall back to estimate
+          const usage = (msg as any).usage;
+          if (usage && (usage.inputTokens || usage.outputTokens)) {
+            setTokensToday(prev => prev + (usage.inputTokens || 0) + (usage.outputTokens || 0));
+          } else {
+            const result = (msg as any).result;
+            const resultLen = typeof result === 'string'
+              ? result.length
+              : (result ? JSON.stringify(result).length : 0);
+            if (resultLen > 0) {
+              setTokensToday(prev => prev + Math.ceil(resultLen / 4));
+            }
           }
           break;
         }
@@ -387,8 +635,8 @@ export default function App() {
           // any explicit machineId in the message for future remote-gateway scenarios.
           const msgMachineId = String((msg as any).machineId || '');
           const target = msgMachineId
-            ? allMachines.find(m => m.id === msgMachineId)
-            : (activeMachine ? allMachines.find(m => m.id === activeMachine) : undefined);
+            ? allMachinesRef.current.find(m => m.id === msgMachineId)
+            : (activeMachine ? allMachinesRef.current.find(m => m.id === activeMachine) : undefined);
           const machineId = target?.id || msgMachineId || activeMachine || 'gateway';
           const machineName = target?.name || (msgMachineId ? `Machine ${msgMachineId.slice(0, 8)}` : 'Gateway');
           const next: SessionInfo = {
@@ -422,8 +670,8 @@ export default function App() {
           // active machine; sentinel last. No silent attribution to allMachines[0].
           const msgMachineId = String((msg as any).machineId || '');
           const target = msgMachineId
-            ? allMachines.find(m => m.id === msgMachineId)
-            : (activeMachine ? allMachines.find(m => m.id === activeMachine) : undefined);
+            ? allMachinesRef.current.find(m => m.id === msgMachineId)
+            : (activeMachine ? allMachinesRef.current.find(m => m.id === activeMachine) : undefined);
           const machineId = target?.id || msgMachineId || activeMachine || 'gateway';
           const machineName = target?.name || (msgMachineId ? `Machine ${msgMachineId.slice(0, 8)}` : 'Gateway');
           const next: SessionInfo = {
@@ -516,7 +764,7 @@ export default function App() {
       }
     });
     return unsub;
-  }, [connection, allMachines]);
+  }, [connection, lang]);
 
   // ── StatusBar live data ─────────────────────────────────────────────────
   const [gatewayUptimeSec, setGatewayUptimeSec] = useState<number | null>(null);
@@ -585,14 +833,18 @@ export default function App() {
         setBuddyState('idle');
         break;
       case 'message':
-        // Reaction to gateway messages
-        if (buddyState === 'idle') {
-          setBuddyState('thinking');
-          setTimeout(() => setBuddyState('idle'), 1000);
-        }
+        // Reaction to gateway messages — use functional update to avoid
+        // depending on buddyState (keeps this callback's identity stable).
+        setBuddyState(prev => {
+          if (prev === 'idle') {
+            setTimeout(() => setBuddyState('idle'), 1000);
+            return 'thinking';
+          }
+          return prev;
+        });
         break;
     }
-  }, [buddyState]);
+  }, []);
 
   return (
     <div style={styles.appShell}>
@@ -683,6 +935,8 @@ export default function App() {
                 search={search}
                 setSearch={setSearch}
                 onOpenWorkspace={openWorkspace}
+                activeMachine={activeMachine}
+                onSelectMachine={setActiveMachine}
               />
             ) : (
               <Dashboard.Empty lang={lang} onAddMachine={() => setPairingModal(true)} />
@@ -699,6 +953,15 @@ export default function App() {
               onBuddyEvent={handleBuddyEvent}
               apiKeyConfigured={!!settings.apiKey?.trim()}
               onGoToSettings={() => setActiveView('settings')}
+              sessions={chatSessions}
+              activeSessionId={activeChatSession?.id || null}
+              activeSession={activeChatSession}
+              onCreateSession={createChatSession}
+              onSelectSession={setActiveChatSession}
+              onRenameSession={renameChatSession}
+              onDeleteSession={clearChatSession}
+              appendMessage={appendChatMessage}
+              nextId={chatNextId}
             />
           )}
 
@@ -729,6 +992,8 @@ export default function App() {
               theme={theme}
               setTheme={setTheme}
               hydrated={!!tauriConfig}
+              mobileConnection={gatewayConnectionInfo}
+              onRotateMobilePairing={rotateMobilePairing}
             />
           )}
 
@@ -797,6 +1062,7 @@ export default function App() {
               onClose={() => setScheduleModal({ open: false, editing: null })}
               onSave={handleSaveSchedule}
               lang={lang}
+              connection={connection}
             />
           )}
 
@@ -854,11 +1120,13 @@ const styles: Record<string, any> = {
   },
   main: {
     flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden',
+    position: 'relative',
   },
   viewTabs: {
     display: 'flex', gap: 0, padding: '0 16px',
     background: 'var(--hone-surface)', flexShrink: 0,
     borderBottom: '1px solid var(--hone-border)',
+    position: 'sticky', top: 0, zIndex: 10,
   },
   viewTab: (active: boolean): React.CSSProperties => ({
     background: 'transparent', border: 'none',

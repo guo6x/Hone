@@ -43,6 +43,7 @@ const ccrAutoConnect = false
 /* eslint-enable @typescript-eslint/no-require-imports */
 import type { ImageDimensions } from './imageResizer.js'
 import type { ModelOption } from './model/modelOptions.js'
+import { normalizeApiKeyForConfig } from './authPortable.js'
 import { jsonParse, jsonStringify } from './slowOperations.js'
 
 // Re-entrancy guard: prevents getConfig ->logEvent ->getGlobalConfig ->getConfig
@@ -1104,13 +1105,10 @@ export function getRemoteControlAtStartup(): boolean {
 export function getCustomApiKeyStatus(
   truncatedApiKey: string,
 ): 'approved' | 'rejected' | 'new' {
-  const config = getGlobalConfig()
-  if (config.customApiKeyResponses?.approved?.includes(truncatedApiKey)) {
-    return 'approved'
-  }
-  if (config.customApiKeyResponses?.rejected?.includes(truncatedApiKey)) {
-    return 'rejected'
-  }
+  const normalizedKey = normalizeApiKeyForConfig(truncatedApiKey)
+  const responses = getGlobalConfig().customApiKeyResponses
+  if (responses?.approved?.includes(normalizedKey)) return 'approved'
+  if (responses?.rejected?.includes(normalizedKey)) return 'rejected'
   return 'new'
 }
 

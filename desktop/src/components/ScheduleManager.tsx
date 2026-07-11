@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { LANG, type Lang } from '../i18n/translations';
 import { type ScheduleInfo, type AiSuggestion } from '../data/mock';
 
@@ -24,6 +24,7 @@ interface ScheduleManagerProps {
   connection?: {
     send: (msg: Record<string, unknown>) => boolean;
     subscribe: (cb: (msg: any) => void) => () => void;
+    clientId: string;
   };
 }
 
@@ -32,23 +33,143 @@ interface ModalProps {
   onClose: () => void;
   onSave: (data: Partial<ScheduleInfo>) => void;
   lang: Lang;
+  /** Gateway connection for testing schedules. */
+  connection?: {
+    send: (msg: Record<string, unknown>) => boolean;
+    subscribe: (cb: (msg: any) => void) => () => void;
+    clientId: string;
+  };
 }
 
 type NLResult = { cron: string; label: string } | null;
+
+const loopTemplates = [
+  {
+    id: 'daily-health-loop',
+    titleZh: '每日健康闭环',
+    titleEn: 'Daily health loop',
+    cron: '0 9 * * *',
+    label: '0 9 * * *',
+    descZh: '运行项目健康检查，修复可安全自动修复的问题，最后汇报验证结果和剩余风险。',
+    descEn: 'Run project health checks, fix safe issues, then report verification results and remaining risks.',
+  },
+  {
+    id: 'test-reliability-loop',
+    titleZh: '测试稳定性闭环',
+    titleEn: 'Test reliability loop',
+    cron: '0 10 * * 1-5',
+    label: '0 10 * * 1-5',
+    descZh: '执行测试套件；若失败，定位最小根因并修复；重复验证直到通过或给出明确阻塞原因。',
+    descEn: 'Run the test suite; if it fails, find the smallest root cause and fix it; repeat until green or clearly blocked.',
+  },
+  {
+    id: 'mobile-pairing-loop',
+    titleZh: '移动端连通性闭环',
+    titleEn: 'Mobile pairing loop',
+    cron: '*/30 * * * *',
+    label: '*/30 * * * *',
+    descZh: '检查桌面端 Gateway、Relay、局域网配对和移动端连接状态；失败时修复配置或输出可执行诊断。',
+    descEn: 'Check desktop Gateway, Relay, LAN pairing, and mobile connectivity; fix config issues or produce actionable diagnostics.',
+  },
+];
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
 /* ------------------------------------------------------------------ */
 
 function parseNL(text: string): NLResult {
-  const lower = text.toLowerCase();
-  if (/早上|morning|9\s*点|9am/i.test(lower)) return { cron: '0 9 * * *', label: '0 9 * * *' };
-  if (/每小时|every\s*hour/i.test(lower)) return { cron: '0 * * * *', label: '0 * * * *' };
-  if (/周五|friday|fri/i.test(lower)) return { cron: '0 17 * * 5', label: '0 17 * * 5' };
-  if (/周一|monday|mon/i.test(lower)) return { cron: '0 8 * * 1', label: '0 8 * * 1' };
-  if (/晚上|night|凌晨/i.test(lower)) return { cron: '0 2 * * *', label: '0 2 * * *' };
-  if (/30\s*分|30\s*min/i.test(lower)) return { cron: '*/30 * * * *', label: '*/30 * * * *' };
-  if (/merge|pr|合并/i.test(lower)) return { cron: '0 9 * * 1-5', label: '0 9 * * 1-5' };
+  const lower = text.toLowerCase().trim();
+  if (!lower) return null;
+
+  // ── Interval patterns ──────────────────────────────────────────────
+  // "每30分钟", "每2小时", "every 30 min", "every 2 hours"
+  let m = lower.match(/每\s*(\d+)\s*分钟|every\s*(\d+)\s*(?:min|minute)/);
+  if (m) return { cron: `*/${m[1] || m[2]} * * * *`, label: `*/${m[1] || m[2]} * * * *` };
+  m = lower.match(/每\s*(\d+)\s*小时|every\s*(\d+)\s*hour/);
+  if (m) return { cron: `0 */${m[1] || m[2]} * * *`, label: `0 */${m[1] || m[2]} * * *` };
+  m = lower.match(/每\s*(\d+)\s*天|every\s*(\d+)\s*day/);
+  if (m) return { cron: `0 0 */${m[1] || m[2]} * *`, label: `0 0 */${m[1] || m[2]} * *` };
+
+  // Shorthand intervals
+  if (/每小时|every\s*hour/.test(lower)) return { cron: '0 * * * *', label: '0 * * * *' };
+  if (/每天|every\s*day|每日/.test(lower) && !/点|:|at\s+\d/i.test(lower)) return { cron: '0 0 * * *', label: '0 0 * * *' };
+  if (/30\s*分|30\s*min|每半小时/.test(lower)) return { cron: '*/30 * * * *', label: '*/30 * * * *' };
+  if (/15\s*分|15\s*min|每刻/.test(lower)) return { cron: '*/15 * * * *', label: '*/15 * * * *' };
+
+  // ── Day-of-week patterns ───────────────────────────────────────────
+  const dayMap: Record<string, number> = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '日': 0, '天': 0 };
+  const dayEnMap: Record<string, number> = { 'mon': 1, 'tue': 2, 'wed': 3, 'thu': 4, 'fri': 5, 'sat': 6, 'sun': 0 };
+
+  // "每周一", "每周五下午5点", "every Monday at 9am"
+  m = lower.match(/每周[一二三四五六日天]|every\s+(?:mon|tue|wed|thu|fri|sat|sun)/);
+  if (m) {
+    let dow: number | null = null;
+    for (const [k, v] of Object.entries(dayMap)) {
+      if (m[0].includes(k)) { dow = v; break; }
+    }
+    if (dow === null) {
+      for (const [k, v] of Object.entries(dayEnMap)) {
+        if (m[0].includes(k)) { dow = v; break; }
+      }
+    }
+    if (dow !== null) {
+      const timeMatch = lower.match(/(\d+)\s*[点:：]\s*(\d+)?|at\s+(\d+)(?::(\d+))?\s*(am|pm)?/);
+      let hour = 9, minute = 0;
+      if (timeMatch) {
+        hour = parseInt(timeMatch[1] || timeMatch[3], 10);
+        minute = parseInt(timeMatch[2] || timeMatch[4] || '0', 10);
+        const ampm = timeMatch[5];
+        if (ampm === 'pm' && hour < 12) hour += 12;
+        if (ampm === 'am' && hour === 12) hour = 0;
+      }
+      return { cron: `${minute} ${hour} * * ${dow}`, label: `${minute} ${hour} * * ${dow}` };
+    }
+  }
+
+  // ── Weekday patterns ───────────────────────────────────────────────
+  if (/工作日|weekday|周一到周五/.test(lower)) {
+    const timeMatch = lower.match(/(\d+)\s*[点:：]\s*(\d+)?|at\s+(\d+)(?::(\d+))?\s*(am|pm)?/);
+    let hour = 9, minute = 0;
+    if (timeMatch) {
+      hour = parseInt(timeMatch[1] || timeMatch[3], 10);
+      minute = parseInt(timeMatch[2] || timeMatch[4] || '0', 10);
+      const ampm = timeMatch[5];
+      if (ampm === 'pm' && hour < 12) hour += 12;
+      if (ampm === 'am' && hour === 12) hour = 0;
+    }
+    return { cron: `${minute} ${hour} * * 1-5`, label: `${minute} ${hour} * * 1-5` };
+  }
+
+  // ── Time-of-day patterns ───────────────────────────────────────────
+  // "早上8点", "下午3点半", "每天9:30", "at 9:30am"
+  m = lower.match(/(\d+)\s*[点:：]\s*(\d+)?\s*(半)?|(?:at\s+)?(\d+)(?::(\d+))?\s*(am|pm)/);
+  if (m) {
+    let hour = parseInt(m[1] || m[4], 10);
+    let minute = m[3] ? 30 : parseInt(m[2] || m[5] || '0', 10);
+    const ampm = m[6];
+    // Chinese time-of-day context
+    if (/下午|傍晚/.test(lower) && hour < 12) hour += 12;
+    if (/晚上|夜里/.test(lower) && hour < 12) hour += 12;
+    if (/凌晨|深夜/.test(lower) && hour > 12) hour -= 12;
+    if (ampm === 'pm' && hour < 12) hour += 12;
+    if (ampm === 'am' && hour === 12) hour = 0;
+
+    // Check for "every day" context
+    const isDaily = /每天|每日|every\s*day|每天早上|每天下午/.test(lower);
+    if (isDaily || /早上|上午|下午|晚上|凌晨|morning|night/.test(lower)) {
+      return { cron: `${minute} ${hour} * * *`, label: `${minute} ${hour} * * *` };
+    }
+    return { cron: `${minute} ${hour} * * *`, label: `${minute} ${hour} * * *` };
+  }
+
+  // ── Preset patterns ────────────────────────────────────────────────
+  if (/早上|morning|9\s*am/.test(lower)) return { cron: '0 9 * * *', label: '0 9 * * *' };
+  if (/中午|noon/.test(lower)) return { cron: '0 12 * * *', label: '0 12 * * *' };
+  if (/下午|afternoon/.test(lower)) return { cron: '0 14 * * *', label: '0 14 * * *' };
+  if (/晚上|night|傍晚/.test(lower)) return { cron: '0 19 * * *', label: '0 19 * * *' };
+  if (/凌晨|midnight|深夜/.test(lower)) return { cron: '0 0 * * *', label: '0 0 * * *' };
+  if (/merge|pr|合并/.test(lower)) return { cron: '0 9 * * 1-5', label: '0 9 * * 1-5' };
+
   return null;
 }
 
@@ -91,7 +212,7 @@ function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: () =>
 /*  Modal (static)                                                    */
 /* ------------------------------------------------------------------ */
 
-function Modal({ modal, onClose, onSave, lang }: ModalProps) {
+function Modal({ modal, onClose, onSave, lang, connection }: ModalProps) {
   const t = LANG[lang];
   const editing = modal.editing;
 
@@ -101,20 +222,134 @@ function Modal({ modal, onClose, onSave, lang }: ModalProps) {
   const [cron, setCron] = useState(editing?.cron || '');
   const [desc, setDesc] = useState(editing?.desc || '');
   const [delivery, setDelivery] = useState<ScheduleInfo['delivery']>(editing?.delivery || 'desktop');
-  const [testStatus, setTestStatus] = useState<'running' | 'done' | null>(null);
+  const [testStatus, setTestStatus] = useState<'running' | 'done' | 'fail' | null>(null);
+  const [testResult, setTestResult] = useState<string | null>(null);
+  // Track the in-flight test subscription + timeout so we can tear them down
+  // when the user clicks Test again or closes the modal. Without this, rapid
+  // clicks pile up subscriptions and timers that all fire setState on an
+  // unmounted component.
+  const testUnsubRef = useRef<(() => void) | null>(null);
+  const testTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Cleanup on unmount.
+  useEffect(() => {
+    return () => {
+      if (testUnsubRef.current) { try { testUnsubRef.current(); } catch {} testUnsubRef.current = null; }
+      if (testTimerRef.current) { clearTimeout(testTimerRef.current); testTimerRef.current = null; }
+    };
+  }, []);
+
+  // Re-sync all internal state when switching to a different schedule.
+  // Without this, the parent's `{modal.open && <Modal/>}` reuse keeps stale
+  // fields from the previously-edited schedule when the user clicks edit on
+  // another row without closing the modal in between.
+  const editingId = editing?.id;
+  useEffect(() => {
+    setNlText(editing?.desc || '');
+    setNlResult(null);
+    setTrigger(editing?.trigger || 'cron');
+    setCron(editing?.cron || '');
+    setDesc(editing?.desc || '');
+    setDelivery(editing?.delivery || 'desktop');
+    setTestStatus(null);
+    setTestResult(null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingId]);
 
   useEffect(() => {
     setNlResult(parseNL(nlText));
   }, [nlText]);
 
-  function handleTest() {
-    if (testStatus) return;
+  async function handleTest() {
+    if (testStatus === 'running') return;
+    if (!desc.trim()) {
+      setTestStatus('fail');
+      setTestResult(lang === 'zh' ? '请先填写日程描述' : 'Please enter a schedule description first');
+      return;
+    }
+    if (!connection) {
+      setTestStatus('fail');
+      setTestResult(lang === 'zh' ? 'Gateway 未连接，无法测试' : 'Gateway not connected');
+      return;
+    }
+
+    // Tear down any previous test subscription/timer so rapid re-clicks
+    // don't stack up multiple listeners.
+    if (testUnsubRef.current) { try { testUnsubRef.current(); } catch {} testUnsubRef.current = null; }
+    if (testTimerRef.current) { clearTimeout(testTimerRef.current); testTimerRef.current = null; }
+
     setTestStatus('running');
-    setTimeout(() => setTestStatus('done'), 1200);
-    setTimeout(() => setTestStatus(null), 2200);
+    setTestResult(null);
+
+    // Send a test dispatch through the Gateway connection
+    // 必须带 target + clientId，否则 gateway 不处理（与 sendChat 一致）
+    const sent = connection.send({
+      type: 'message',
+      target: 'gateway',
+      clientId: connection.clientId,
+      payload: { text: `[测试] ${desc}` },
+    });
+
+    if (!sent) {
+      setTestStatus('fail');
+      setTestResult(lang === 'zh' ? '发送失败 — 连接未就绪' : 'Send failed — connection not ready');
+      return;
+    }
+
+    // Listen for a response with a timeout
+    const timeoutMs = 15000;
+    let resolved = false;
+    const unsub = connection.subscribe((msg: any) => {
+      if (resolved) return;
+      if (msg.type === 'message' || msg.type === 'reply' || msg.type === 'error') {
+        resolved = true;
+        if (testUnsubRef.current) { try { testUnsubRef.current(); } catch {} testUnsubRef.current = null; }
+        const text = msg.payload?.text || msg.text || msg.error || '';
+        if (msg.type === 'error' || msg.error) {
+          setTestStatus('fail');
+          setTestResult(String(text).slice(0, 200));
+        } else {
+          setTestStatus('done');
+          setTestResult(String(text).slice(0, 200) || (lang === 'zh' ? '测试完成' : 'Test completed'));
+        }
+      }
+    });
+    testUnsubRef.current = unsub;
+
+    testTimerRef.current = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        if (testUnsubRef.current) { try { testUnsubRef.current(); } catch {} testUnsubRef.current = null; }
+        testTimerRef.current = null;
+        setTestStatus('fail');
+        setTestResult(lang === 'zh' ? '请求已发送，但 15 秒内没有收到 Gateway 响应' : 'Request sent, but no Gateway response arrived within 15 seconds');
+      }
+    }, timeoutMs);
   }
 
   function handleSave() {
+    // Validate: cron trigger requires a non-empty cron expression, otherwise
+    // the scheduler silently creates a schedule that never fires.
+    if (trigger === 'cron') {
+      if (!cron.trim()) {
+        setTestStatus('fail');
+        setTestResult(lang === 'zh' ? '请填写 Cron 表达式（或用自然语言生成）' : 'Please fill in the Cron expression (or generate one from natural language)');
+        return;
+      }
+      // 校验 cron 格式：5 段，每段为 * / 数字 / */n / 范围 / 逗号列表
+      const parts = cron.trim().split(/\s+/);
+      if (parts.length !== 5) {
+        setTestStatus('fail');
+        setTestResult(lang === 'zh' ? 'Cron 表达式无效：需要 5 段（分 时 日 月 周），如 "0 9 * * *"' : 'Invalid cron: need 5 fields (min hour day month weekday)');
+        return;
+      }
+      const validPart = /^(\*|\*\/\d+|\d+(-\d+)?(,\d+(-\d+)?)*|\d+\/\d+)$/;
+      if (!parts.every(p => validPart.test(p))) {
+        setTestStatus('fail');
+        setTestResult(lang === 'zh' ? 'Cron 表达式无效：每段仅支持 * / 数字 / */n / 范围 / 逗号列表' : 'Invalid cron format');
+        return;
+      }
+    }
     onSave({
       title: desc.split(/[。\n.!?]/)[0].slice(0, 40) || '新日程',
       desc,
@@ -171,14 +406,42 @@ function Modal({ modal, onClose, onSave, lang }: ModalProps) {
             ))}
           </div>
 
-          {/* Time/Cron */}
-          <label style={modalStyles.label}>{t.modalTimeLabel}</label>
-          <input
-            style={modalStyles.input}
-            placeholder={t.modalTimePlaceholder}
-            value={cron}
-            onChange={e => setCron(e.target.value)}
-          />
+          {/* Time/Cron — 根据 trigger 类型显示不同输入字段 */}
+          {trigger === 'cron' && (
+            <>
+              <label style={modalStyles.label}>{t.modalTimeLabel}</label>
+              <input
+                style={modalStyles.input}
+                placeholder={t.modalTimePlaceholder}
+                value={cron}
+                onChange={e => setCron(e.target.value)}
+              />
+            </>
+          )}
+          {trigger === 'interval' && (
+            <>
+              <label style={modalStyles.label}>{lang === 'zh' ? '间隔（分钟）' : 'Interval (minutes)'}</label>
+              <input
+                style={modalStyles.input}
+                type="number"
+                min="1"
+                placeholder="30"
+                value={cron}
+                onChange={e => setCron(e.target.value)}
+              />
+            </>
+          )}
+          {trigger === 'once' && (
+            <>
+              <label style={modalStyles.label}>{lang === 'zh' ? '执行时间' : 'Run at'}</label>
+              <input
+                style={modalStyles.input}
+                type="datetime-local"
+                value={cron}
+                onChange={e => setCron(e.target.value)}
+              />
+            </>
+          )}
 
           {/* Description */}
           <label style={modalStyles.label}>{t.modalDescLabel}</label>
@@ -213,10 +476,20 @@ function Modal({ modal, onClose, onSave, lang }: ModalProps) {
           <button onClick={onClose} style={modalStyles.btnSecondary}>{t.modalCancel}</button>
           <div style={{ flex: 1 }} />
           <button onClick={handleTest} style={modalStyles.btnTest(testStatus)}>
-            {testStatus === 'running' ? '运行中…' : testStatus === 'done' ? '✓ 完成' : t.modalTest}
+            {testStatus === 'running' ? '运行中…' : testStatus === 'done' ? '✓ 完成' : testStatus === 'fail' ? '✗ 失败' : t.modalTest}
           </button>
           <button onClick={handleSave} style={modalStyles.btnPrimary}>{t.modalSave}</button>
         </div>
+        {testResult && (
+          <div style={{
+            marginTop: 8, padding: '8px 12px', borderRadius: 6, fontSize: 12,
+            background: testStatus === 'fail' ? 'var(--hone-dangerMuted)' : 'var(--hone-successMuted)',
+            color: testStatus === 'fail' ? 'var(--hone-danger)' : 'var(--hone-success)',
+            lineHeight: 1.5, wordBreak: 'break-word',
+          }}>
+            {testResult}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -296,7 +569,7 @@ const modalStyles: Record<string, any> = {
     background: status === 'running' ? 'var(--hone-accentMuted)' : 'transparent',
     border: '1px solid var(--hone-accent)',
     borderRadius: 6,
-    color: status === 'done' ? 'var(--hone-success)' : 'var(--hone-accent)',
+    color: status === 'done' ? 'var(--hone-success)' : status === 'fail' ? 'var(--hone-danger)' : 'var(--hone-accent)',
     fontSize: 12, padding: '7px 12px', cursor: status ? 'default' : 'pointer',
     transition: 'color 0.2s',
   }),
@@ -379,16 +652,20 @@ function HistoryModal({
       setErr(lang === 'zh' ? 'Gateway 未连接，无法读取历史' : 'Gateway not connected');
       return;
     }
+    let resolved = false;
     const unsub = connection.subscribe((msg: any) => {
       if (msg.type === 'schedule_runs_response' && msg.scheduleId === scheduleId) {
+        resolved = true;
         setRuns(msg.runs || []);
         setAgentInfo(msg.agentInfo || null);
       }
     });
     const sent = connection.send({ type: 'schedule_runs_request', scheduleId, limit: 50 });
     if (!sent) setErr(lang === 'zh' ? 'Gateway 离线' : 'Gateway offline');
+    // Use a local flag instead of reading `runs` (which is stale in this
+    // closure) to determine whether the response arrived in time.
     const timer = setTimeout(() => {
-      if (!runs) setErr(prev => prev || (lang === 'zh' ? '请求超时' : 'Request timed out'));
+      if (!resolved) setErr(prev => prev || (lang === 'zh' ? '请求超时' : 'Request timed out'));
     }, 5000);
     return () => { unsub(); clearTimeout(timer); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -515,6 +792,23 @@ export default function ScheduleManager(props: ScheduleManagerProps) {
 
   const filtered = applyFilter(schedules, filter, search);
 
+  function openLoopTemplate(template: typeof loopTemplates[number]) {
+    const desc = lang === 'zh' ? template.descZh : template.descEn;
+    onEdit({
+      id: `loop-template-${template.id}`,
+      title: lang === 'zh' ? template.titleZh : template.titleEn,
+      desc: `[Loop] ${desc}`,
+      trigger: 'cron',
+      cron: template.cron,
+      triggerLabel: template.label,
+      nextRun: '—',
+      enabled: true,
+      lastRun: null,
+      lastStatus: null,
+      delivery: 'cli',
+    });
+  }
+
   return (
     <div style={styles.wrap}>
       {/* Toolbar */}
@@ -536,6 +830,27 @@ export default function ScheduleManager(props: ScheduleManagerProps) {
           value={search}
           onChange={e => setSearch(e.target.value)}
         />
+      </div>
+
+      <div style={styles.loopSection}>
+        <div style={styles.loopTitle}>
+          {lang === 'zh' ? 'Loop 模板' : 'Loop templates'}
+        </div>
+        <div style={styles.loopGrid}>
+          {loopTemplates.map(template => (
+            <button
+              key={template.id}
+              type="button"
+              style={styles.loopCard}
+              onClick={() => openLoopTemplate(template)}
+            >
+              <span style={styles.loopCardTitle}>
+                {lang === 'zh' ? template.titleZh : template.titleEn}
+              </span>
+              <span style={styles.loopCardMeta}>{template.label}</span>
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* AI Suggestions */}
@@ -665,6 +980,39 @@ const styles: Record<string, any> = {
   },
 
   /* AI Suggestions */
+  loopSection: {
+    marginBottom: 14, flexShrink: 0,
+  },
+  loopTitle: {
+    fontSize: 12, fontWeight: 600, color: 'var(--hone-text)',
+    marginBottom: 8,
+  },
+  loopGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+    gap: 8,
+  },
+  loopCard: {
+    border: '1px solid var(--hone-border)',
+    background: 'var(--hone-surface)',
+    borderRadius: 8,
+    padding: '10px 12px',
+    cursor: 'pointer',
+    textAlign: 'left',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 4,
+  },
+  loopCardTitle: {
+    color: 'var(--hone-text)',
+    fontSize: 12,
+    fontWeight: 600,
+  },
+  loopCardMeta: {
+    color: 'var(--hone-muted)',
+    fontSize: 11,
+    fontFamily: 'monospace',
+  },
   aiSection: {
     marginBottom: 16, flexShrink: 0,
   },

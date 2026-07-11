@@ -5,10 +5,18 @@ export interface MachineInfo {
   id: string;
   name: string;
   host: string;
+  /** SSH port (defaults to 22). Present for SSH-connected machines. */
+  port?: number;
+  /** Connection method: 'direct' | 'ssh' | 'tunnel'. */
+  method?: string;
   status: 'online' | 'busy' | 'offline';
   sessions: number;
   os: string;
   cpu: string;
+  /** ISO timestamp of last successful contact, or null if never seen. */
+  lastSeen?: string | null;
+  /** ISO timestamp of when the machine was added to the registry. */
+  addedAt?: string;
 }
 
 export interface SessionInfo {
@@ -74,6 +82,9 @@ export interface SettingsData {
   browserHeadless: boolean;
   browserMaxSteps: string;
   buddySpecies?: string;
+  guiModelName?: string;
+  guiModelKey?: string;
+  providers?: ProviderProfile[];
 }
 
 export interface GatewayMessage {
@@ -82,6 +93,14 @@ export interface GatewayMessage {
   textKey?: string;
   text?: string;
   time: string;
+}
+
+export interface ChatSession {
+  id: string;
+  title: string;
+  messages: GatewayMessage[];
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface GatewayStatus {
@@ -115,6 +134,51 @@ export interface McpInfo {
   config: string;
 }
 
+// ── 2026 modernized types ──
+
+export interface ProviderProfile {
+  id: string;
+  name: string;
+  kind: 'deepseek' | 'openai' | 'openrouter' | 'custom';
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  temperature?: number;
+  maxTokens?: number;
+  enabled: boolean;
+  isDefault: boolean;
+  fetchedModels?: string[];
+  lastFetchError?: string;
+}
+
+export interface SkillConfig {
+  id: string;
+  name: string;
+  description: string;
+  license?: string;
+  compatibility?: string;
+  metadata?: { author?: string; version?: string };
+  allowedTools?: string[];
+  instructions: string;
+  enabled: boolean;
+  trigger?: string;
+}
+
+export interface McpServer {
+  id: string;
+  name: string;
+  transport: 'stdio' | 'sse' | 'streamable-http';
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  enabled: boolean;
+  status: 'connected' | 'disconnected' | 'error';
+  tools?: number;
+  error?: string;
+}
+
 // ── Empty defaults (no mock data) ──
 
 export const machines: MachineInfo[] = [];
@@ -123,6 +187,7 @@ export const schedulesData: ScheduleInfo[] = [];
 export const aiSuggestions: AiSuggestion[] = [];
 export const canvasSessions: CanvasSession[] = [];
 export const gatewayMessages: GatewayMessage[] = [];
+export const chatSessions: ChatSession[] = [];
 export const skillsMock: SkillInfo[] = [];
 export const mcpMock: McpInfo[] = [];
 

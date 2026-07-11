@@ -1,13 +1,18 @@
 use crate::windows_git_bash;
+use crate::windows_proxy;
+use crate::secret_store;
 use chrono::{DateTime, Utc};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::io::{BufRead, BufReader};
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 use thiserror::Error;
+use uuid::Uuid;
 
 // ── GatewayStatus ────────────────────────────────────────────────────────
 
@@ -46,6 +51,7 @@ pub enum GatewayError {
     #[error("Failed to spawn gateway process: {0}")]
     SpawnFailed(String),
 
+    #[allow(dead_code)]
     #[error("Operation timed out")]
     Timeout,
 
@@ -62,6 +68,33 @@ pub struct GatewayConfig {
     #[serde(default = "default_relay_url")]
     pub relay_url: String,
 
+    /// Per-install Relay room. This is public routing metadata, not a credential.
+    #[serde(default = "default_relay_room")]
+    pub relay_room: String,
+
+    /// Stable identifier for the OS credential-store record.
+    #[serde(default = "default_secret_id")]
+    pub secret_id: String,
+
+    /// One-time pairing challenge ID advertised to the mobile client.
+    #[serde(default = "default_pairing_id")]
+    pub pairing_id: String,
+
+    /// Relay gateway credential. Stored in the OS credential store and never
+    /// serialized through Tauri IPC or gateway-config.json.
+    #[serde(default, skip_serializing)]
+    pub relay_gateway_token: String,
+
+    /// Capability used by the desktop WebView to authenticate to the local
+    /// Gateway WebSocket. Stored in the OS credential store.
+    #[serde(default, skip_serializing)]
+    pub local_auth_token: String,
+
+    /// Six-digit one-time mobile pairing code. Stored in the OS credential
+    /// store; the relay only receives a derived proof during registration.
+    #[serde(default, skip_serializing)]
+    pub pairing_code: String,
+
     /// Local port the Gateway listens on.
     #[serde(default = "default_local_port")]
     pub local_port: u16,
@@ -73,6 +106,10 @@ pub struct GatewayConfig {
     /// Directory for shared data between desktop and daemon (schedules, logs).
     #[serde(default)]
     pub data_dir: Option<String>,
+
+    /// Explicit user project directory used for Gateway task execution.
+    #[serde(default)]
+    pub workspace_dir: String,
 
     /// Human-readable machine name sent to the relay.
     #[serde(default)]
@@ -129,26 +166,75 @@ pub struct GatewayConfig {
     /// Max browser agent steps per task
     #[serde(default = "default_max_steps")]
     pub browser_max_steps: u32,
+
+    /// Multi-provider profiles (2026 format). Empty = use legacy single-provider fields.
+    #[serde(default)]
+    pub providers: Vec<ProviderProfile>,
+}
+
+/// A single AI provider configuration (OpenAI-compatible).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderProfile {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub temperature: f32,
+    #[serde(default)]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 fn default_true() -> bool { true }
 fn default_max_steps() -> u32 { 15 }
 
 fn default_relay_url() -> String {
-    "wss://hone-relay.marsailleippi79.workers.dev/connect/default".to_string()
+    "wss://hone-relay.marsailleippi79.workers.dev/connect".to_string()
 }
 
 fn default_local_port() -> u16 {
     18789
 }
 
+fn random_token() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+fn default_relay_room() -> String { random_token() }
+fn default_secret_id() -> String { Uuid::new_v4().to_string() }
+fn default_pairing_id() -> String { Uuid::new_v4().to_string() }
+
+fn default_pairing_code() -> String {
+    let value = (Uuid::new_v4().as_u128() % 900_000) as u32 + 100_000;
+    value.to_string()
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             relay_url: default_relay_url(),
+            relay_room: default_relay_room(),
+            secret_id: default_secret_id(),
+            pairing_id: default_pairing_id(),
+            relay_gateway_token: random_token(),
+            local_auth_token: random_token(),
+            pairing_code: default_pairing_code(),
             local_port: default_local_port(),
             auto_start: true,
             data_dir: None,
+            workspace_dir: String::new(),
             machine_name: hostname(),
             provider: String::new(),
             api_key: String::new(),
@@ -163,8 +249,22 @@ impl Default for GatewayConfig {
             gui_model_key: String::new(),
             browser_headless: true,
             browser_max_steps: 15,
+            providers: Vec::new(),
         }
     }
+}
+
+/// Values needed by the trusted desktop shell to connect to its own local
+/// Gateway. The Relay gateway credential is intentionally not included.
+#[derive(Debug, Clone, Serialize)]
+pub struct GatewayConnectionInfo {
+    pub local_port: u16,
+    pub local_auth_token: String,
+    pub relay_url: String,
+    pub relay_room: String,
+    pub pairing_id: String,
+    pub pairing_code: String,
+    pub machine_name: String,
 }
 
 /// Best-effort hostname for the current machine.
@@ -190,9 +290,13 @@ pub struct GatewayManager {
     pub status: GatewayStatus,
     pub process: Option<Child>,
     pub uptime: Option<DateTime<Utc>>,
+    #[allow(dead_code)]
     pub version: String,
     config: GatewayConfig,
     config_path: Option<PathBuf>,
+    /// 持续累积 daemon stderr 输出（保留最后 ~2000 字符），供 check_alive 在进程退出时报告原因。
+    /// 同时由后台线程持续消费管道，防止 daemon 输出超 64KB 后管道满导致 write 阻塞、进程挂起。
+    daemon_stderr: Arc<Mutex<String>>,
 }
 
 impl GatewayManager {
@@ -204,6 +308,7 @@ impl GatewayManager {
             version: env!("CARGO_PKG_VERSION").to_string(),
             config: GatewayConfig::default(),
             config_path: None,
+            daemon_stderr: Arc::new(Mutex::new(String::new())),
         }
     }
 
@@ -218,7 +323,91 @@ impl GatewayManager {
                 warn!("Failed to parse {}, keeping defaults", path.display());
             }
         }
+        self.normalize_internal_config();
+        self.hydrate_secrets();
         self.config_path = Some(path);
+    }
+
+    fn normalize_internal_config(&mut self) {
+        if self.config.relay_url.trim().is_empty() {
+            self.config.relay_url = default_relay_url();
+        }
+        // Migrate the historic globally shared room without changing a custom
+        // Relay hostname. The room itself is now stored separately.
+        if self.config.relay_url.trim_end_matches('/').ends_with("/connect/default") {
+            self.config.relay_url = self
+                .config
+                .relay_url
+                .trim_end_matches('/')
+                .trim_end_matches("default")
+                .trim_end_matches('/')
+                .to_string();
+        }
+        if self.config.relay_room.len() < 32 {
+            self.config.relay_room = default_relay_room();
+        }
+        if self.config.secret_id.is_empty() {
+            self.config.secret_id = default_secret_id();
+        }
+        if self.config.pairing_id.is_empty() {
+            self.config.pairing_id = default_pairing_id();
+        }
+        if self.config.relay_gateway_token.len() < 32 {
+            self.config.relay_gateway_token = random_token();
+        }
+        if self.config.local_auth_token.len() < 32 {
+            self.config.local_auth_token = random_token();
+        }
+        if self.config.pairing_code.len() != 6 || !self.config.pairing_code.chars().all(|c| c.is_ascii_digit()) {
+            self.config.pairing_code = default_pairing_code();
+        }
+    }
+
+    fn hydrate_secrets(&mut self) {
+        let legacy_or_new = secret_store::extract(&self.config);
+        match secret_store::load(&self.config.secret_id) {
+            Ok(secrets) => {
+                secret_store::apply(&mut self.config, &secrets);
+            }
+            Err(error) => {
+                // First launch and migration from the old plaintext JSON share
+                // this path. The current in-memory data is retained if the OS
+                // vault is unavailable so a user is never silently locked out.
+                if let Err(save_error) = secret_store::save(&self.config.secret_id, &legacy_or_new) {
+                    warn!(
+                        "Could not migrate Hone secrets to the OS credential store: {} (source: {})",
+                        save_error, error
+                    );
+                } else {
+                    info!("Migrated Hone secrets to the OS credential store");
+                }
+            }
+        }
+    }
+
+    fn preserve_internal_security_material(&self, config: &mut GatewayConfig) {
+        config.relay_room = self.config.relay_room.clone();
+        config.secret_id = self.config.secret_id.clone();
+        config.pairing_id = self.config.pairing_id.clone();
+        config.relay_gateway_token = self.config.relay_gateway_token.clone();
+        config.local_auth_token = self.config.local_auth_token.clone();
+        config.pairing_code = self.config.pairing_code.clone();
+    }
+
+    fn relay_connect_url(&self, requested_url: &str) -> String {
+        let mut base = if requested_url.trim().is_empty() {
+            self.config.relay_url.trim().to_string()
+        } else {
+            requested_url.trim().to_string()
+        };
+        base = base.trim_end_matches('/').to_string();
+        if base.ends_with("/connect/default") {
+            base = base
+                .trim_end_matches("default")
+                .trim_end_matches('/')
+                .to_string();
+        }
+        format!("{}/{}", base, self.config.relay_room)
     }
 
     fn persist(&self) {
@@ -226,7 +415,17 @@ impl GatewayManager {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match serde_json::to_vec_pretty(&self.config) {
+            let secrets = secret_store::extract(&self.config);
+            let mut persisted = self.config.clone();
+            if let Err(error) = secret_store::save(&persisted.secret_id, &secrets) {
+                warn!(
+                    "Could not write Hone secrets to the OS credential store; config file will not be updated: {}",
+                    error
+                );
+                return;
+            }
+            secret_store::redact(&mut persisted);
+            match serde_json::to_vec_pretty(&persisted) {
                 Ok(bytes) => {
                     let mut tmp_path = p.clone();
                     let mut filename = tmp_path.file_name().unwrap_or_default().to_os_string();
@@ -255,7 +454,7 @@ impl GatewayManager {
 
     /// Spawn the Gateway daemon.
     ///
-    /// Executes `node <hone_path>/dist/cli.js daemon start` and sets the
+    /// Executes `node <hone_path>/dist/cli.js gateway start` and sets the
     /// environment variables `HONE_RELAY_URL`, `HONE_GATEWAY_PORT`, and
     /// the platform-appropriate machine-name variable.
     pub fn start(&mut self, node_path: &str, hone_path: &str, relay_url: &str) -> Result<(), GatewayError> {
@@ -266,24 +465,46 @@ impl GatewayManager {
             return Err(GatewayError::AlreadyRunning);
         }
 
+        self.normalize_internal_config();
+        let relay_connect_url = self.relay_connect_url(relay_url);
         self.status = GatewayStatus::Starting;
-        info!("Starting Hone Gateway (relay: {})", relay_url);
+        info!("Starting Hone Gateway (relay room: {})", self.config.relay_room);
 
         let mut cmd = Command::new(node_path);
         cmd.arg(format!("{}/dist/cli.js", hone_path))
             .arg("gateway")
             .arg("start")
-            .env("HONE_RELAY_URL", relay_url)
-            .env("HONE_GOD_MODE", "1")
+            .env("HONE_RELAY_URL", &relay_connect_url)
+            .env("HONE_AUTH_TOKEN", &self.config.relay_gateway_token)
+            .env("HONE_LOCAL_AUTH_TOKEN", &self.config.local_auth_token)
+            .env("HONE_PAIRING_ID", &self.config.pairing_id)
+            .env("HONE_PAIRING_CODE", &self.config.pairing_code)
+            .env("HONE_WORKSPACE_DIR", &self.config.workspace_dir)
+            .env("HONE_GOD_MODE", "0")
             .env("HONE_GATEWAY_PORT", self.config.local_port.to_string())
             .env(
                 "HONE_DATA_DIR",
-                dirs::data_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("hone-desktop")
-                    .to_string_lossy()
-                    .to_string(),
+                self.config
+                    .data_dir
+                    .clone()
+                    .unwrap_or_else(|| {
+                        dirs::data_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                            .join("hone-desktop")
+                            .to_string_lossy()
+                            .to_string()
+                    }),
             );
+
+        // 2026 multi-provider: use the default profile to override legacy fields
+        if let Some(default_p) = self.config.providers.iter().find(|p| p.is_default && p.enabled) {
+            if !default_p.kind.is_empty() { self.config.provider = default_p.kind.clone(); }
+            if !default_p.api_key.is_empty() { self.config.api_key = default_p.api_key.clone(); }
+            if !default_p.base_url.is_empty() { self.config.base_url = default_p.base_url.clone(); }
+            if !default_p.model.is_empty() { self.config.model = default_p.model.clone(); }
+            if default_p.temperature > 0.0 { self.config.temperature = default_p.temperature; }
+            if default_p.max_tokens > 0 { self.config.max_tokens = default_p.max_tokens; }
+        }
 
         // Pass provider settings as env vars for the CLI daemon
         // The CLI provider system reads HONE_PROVIDER to select the provider,
@@ -358,16 +579,29 @@ impl GatewayManager {
             self.config.browser_max_steps.to_string(),
         );
         windows_git_bash::apply_to_command(&mut cmd);
+        windows_proxy::apply_to_command(&mut cmd);
 
         // Set the platform machine-name env var.
         #[cfg(windows)]
         {
             cmd.env("COMPUTERNAME", &self.config.machine_name);
+            // Hide the console window on Windows — without this, spawning node.exe
+            // pops up a cmd.exe window for the gateway daemon (and every child
+            // process it later spawns), which is alarming on app startup.
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
         #[cfg(not(windows))]
         {
             cmd.env("HOSTNAME", &self.config.machine_name);
         }
+
+        // Pipe stdout/stderr so we can surface the real error message when
+        // the daemon fails to start (default `Inherit` under CREATE_NO_WINDOW
+        // just discards all output, leaving the user with "exited with status 1"
+        // and no clue why).
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
         let mut child = cmd.spawn().map_err(|e| {
             self.status = GatewayStatus::Error(e.to_string());
@@ -375,18 +609,67 @@ impl GatewayManager {
             GatewayError::SpawnFailed(e.to_string())
         })?;
 
-        // Give the Node.js runtime a moment to bootstrap, then check
-        // whether the process died immediately (startup failure).
-        std::thread::sleep(Duration::from_millis(800));
+        // Give the Node.js runtime a brief moment to bootstrap, then check
+        // whether the process died immediately (startup failure — e.g. wrong
+        // node path, missing cli.js, syntax error). 250ms is enough to catch
+        // an immediate exit without artificially slowing down every start by
+        // 800ms; the daemon's actual readiness is reflected later via
+        // gateway_status polling on the frontend.
+        std::thread::sleep(Duration::from_millis(250));
 
         match child.try_wait() {
             Ok(Some(exit)) => {
-                let msg = format!("Gateway exited immediately with status: {}", exit);
+                // Daemon died immediately — read stderr to give the user a
+                // real error (missing module, syntax error, bad API key, etc.)
+                // instead of a useless "exited with status 1".
+                let mut err = String::new();
+                if let Some(stderr) = child.stderr.as_mut() {
+                    use std::io::Read;
+                    let _ = stderr.read_to_string(&mut err);
+                }
+                let err = err.trim();
+                let msg = if err.is_empty() {
+                    format!("Gateway exited immediately with status: {}", exit)
+                } else {
+                    // Keep last ~500 chars to avoid huge blobs
+                    let start = err.len().saturating_sub(500);
+                    format!("Gateway failed to start: {}", &err[start..])
+                };
                 self.status = GatewayStatus::Error(msg.clone());
                 warn!("{}", msg);
                 Err(GatewayError::ProcessError(msg))
             }
             Ok(None) => {
+                // 持续消费 stdout/stderr 管道，防止 daemon 输出超 64KB 后管道满
+                // 导致 write 阻塞、进程挂起。stderr 同时累积到 daemon_stderr 供
+                // check_alive 在进程退出时报告原因。
+                if let Some(stderr) = child.stderr.take() {
+                    let buf = self.daemon_stderr.clone();
+                    // 清空上次的 stderr 缓冲
+                    if let Ok(mut g) = buf.lock() { g.clear(); }
+                    std::thread::spawn(move || {
+                        let reader = BufReader::new(stderr);
+                        for line in reader.lines().map_while(|l| l.ok()) {
+                            if let Ok(mut g) = buf.lock() {
+                                g.push_str(&line);
+                                g.push('\n');
+                                // 保留最后 ~2000 字符，避免无限增长
+                                if g.len() > 4000 {
+                                    let start = g.len() - 2000;
+                                    let drained = g.split_off(start);
+                                    *g = drained;
+                                }
+                            }
+                        }
+                    });
+                }
+                if let Some(stdout) = child.stdout.take() {
+                    // stdout 仅消费（丢弃），防止管道满
+                    std::thread::spawn(move || {
+                        let reader = BufReader::new(stdout);
+                        for _ in reader.lines().map_while(|l| l.ok()) {}
+                    });
+                }
                 self.process = Some(child);
                 self.uptime = Some(Utc::now());
                 self.status = GatewayStatus::Running;
@@ -431,6 +714,45 @@ impl GatewayManager {
         &self.status
     }
 
+    /// Reap the child process if it has exited and update `status`
+    /// accordingly. Without this, the status field stays `Running` forever
+    /// even after the daemon crashes — which makes the frontend think the
+    /// gateway is healthy and waste time trying to reach a dead relay peer.
+    /// Must be called with &mut self (e.g. from `gateway_status` command).
+    pub fn check_alive(&mut self) {
+        if self.status != GatewayStatus::Running {
+            return;
+        }
+        let exited = match self.process.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(_exit)) => true,
+                Ok(None) => false, // still running
+                Err(_) => true,    // couldn't query — treat as dead
+            },
+            None => true, // no process handle but status==Running → inconsistent
+        };
+        if exited {
+            // 从后台线程累积的 stderr 缓冲中读取（管道已被持续消费，child.stderr 已 None）
+            let msg = {
+                let err = self.daemon_stderr.lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                if err.trim().is_empty() {
+                    "Gateway daemon process exited unexpectedly".to_string()
+                } else {
+                    // Keep only the last ~500 chars to avoid huge error blobs
+                    let trimmed = err.trim_end();
+                    let start = trimmed.len().saturating_sub(500);
+                    format!("Gateway daemon exited: {}", &trimmed[start..])
+                }
+            };
+            warn!("Gateway died: {}", msg);
+            self.status = GatewayStatus::Error(msg);
+            self.process = None;
+            self.uptime = None;
+        }
+    }
+
     /// How long the Gateway has been running, if it is currently up.
     pub fn uptime(&self) -> Option<Duration> {
         self.uptime.map(|started| {
@@ -440,6 +762,7 @@ impl GatewayManager {
     }
 
     /// Stop (if running) and restart the Gateway daemon.
+    #[allow(dead_code)]
     pub fn restart(&mut self, node_path: &str, hone_path: &str, relay_url: &str) -> Result<(), GatewayError> {
         info!("Restarting Hone Gateway");
         if self.is_running() {
@@ -458,19 +781,52 @@ impl GatewayManager {
         self.config.clone()
     }
 
+    pub fn connection_info(&self) -> GatewayConnectionInfo {
+        GatewayConnectionInfo {
+            local_port: self.config.local_port,
+            local_auth_token: self.config.local_auth_token.clone(),
+            relay_url: self.relay_connect_url(&self.config.relay_url),
+            relay_room: self.config.relay_room.clone(),
+            pairing_id: self.config.pairing_id.clone(),
+            pairing_code: self.config.pairing_code.clone(),
+            machine_name: self.config.machine_name.clone(),
+        }
+    }
+
+    pub fn rotate_pairing_challenge(
+        &mut self,
+        node_path: &str,
+        hone_path: &str,
+    ) -> Result<GatewayConnectionInfo, GatewayError> {
+        let was_running = self.is_running();
+        if was_running {
+            self.stop()?;
+        }
+        self.config.pairing_id = default_pairing_id();
+        self.config.pairing_code = default_pairing_code();
+        self.persist();
+        if was_running {
+            let relay = self.config.relay_url.clone();
+            self.start(node_path, hone_path, &relay)?;
+        }
+        Ok(self.connection_info())
+    }
+
     /// Apply a new config. If the Gateway is running, restart it with the new settings.
     /// Also persists to disk so config survives app restarts.
     pub fn apply_config(
         &mut self,
         node_path: &str,
-        config: GatewayConfig,
+        mut config: GatewayConfig,
         hone_path: &str,
     ) -> Result<(), GatewayError> {
         let was_running = self.is_running();
         if was_running {
             self.stop()?;
         }
+        self.preserve_internal_security_material(&mut config);
         self.config = config;
+        self.normalize_internal_config();
         self.persist();
         if was_running {
             let relay = self.config.relay_url.clone();
@@ -481,8 +837,10 @@ impl GatewayManager {
 
     /// Update config in-place without restarting. Use before first start.
     /// Also persists to disk.
-    pub fn set_config(&mut self, config: GatewayConfig) {
+    pub fn set_config(&mut self, mut config: GatewayConfig) {
+        self.preserve_internal_security_material(&mut config);
         self.config = config;
+        self.normalize_internal_config();
         self.persist();
     }
 
@@ -535,6 +893,14 @@ fn kill_child(child: &mut Child) {
 
 #[cfg(windows)]
 fn kill_child(child: &mut Child) {
-    let _ = child.kill();
+    // 用 taskkill /T 递归终止进程树，给 daemon 及其子进程（CLI 任务等）清理机会。
+    // 直接 TerminateProcess（child.kill）相当于 SIGKILL，会导致 daemon 正在写的
+    // 文件（schedules.json 等）损坏，且子进程变孤儿。
+    let pid = child.id();
+    use std::os::windows::process::CommandExt;
+    let _ = Command::new("taskkill")
+        .args(["/T", "/PID", &pid.to_string()])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output();
     let _ = child.wait();
 }

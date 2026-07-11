@@ -10,7 +10,9 @@ type SshAuthMode = 'agent' | 'password' | 'key';
 export function DevicePairingModal({ lang, onClose, onPaired, useTauri, discoveredGateways, onScan, scanning }: {
   lang: Lang;
   onClose: () => void;
-  onPaired: (machine: any) => void;
+  /** Called after a successful connection. Return a Promise that rejects to
+   *  surface a post-connect error (e.g. machine registry failure) in the modal. */
+  onPaired: (machine: any) => void | Promise<void>;
   useTauri?: boolean;
   discoveredGateways?: any[];
   onScan?: () => void;
@@ -19,7 +21,7 @@ export function DevicePairingModal({ lang, onClose, onPaired, useTauri, discover
   const [method, setMethod] = useState<Method>('local');
   const [code, setCode] = useState('');
   const [host, setHost] = useState('');
-  const [port, setPort] = useState('22');
+  const [port, setPort] = useState('18789');
   const [username, setUsername] = useState('');
   const [sshAuthMode, setSshAuthMode] = useState<SshAuthMode>('agent');
   const [sshPassword, setSshPassword] = useState('');
@@ -90,7 +92,10 @@ export function DevicePairingModal({ lang, onClose, onPaired, useTauri, discover
     setError(null);
     setConnecting(true);
 
-    try {
+    // Build the machine info object for the current method, performing the
+    // actual network/SSH connection first. Returns null if a pre-flight check
+    // or the connection itself fails (error already set via throw).
+    const buildPairedInfo = async (): Promise<any> => {
       if (method === 'ssh' && isTauri()) {
         const sshTarget = parseSshTarget();
         if (!sshTarget.host) throw new Error(lang === 'zh' ? '请输入 SSH 主机地址' : 'Enter an SSH host');
@@ -104,20 +109,15 @@ export function DevicePairingModal({ lang, onClose, onPaired, useTauri, discover
           username: sshTarget.username,
           auth: getSshAuth(),
         });
-        setConnecting(false);
-        setConnected(true);
-        setTimeout(() => {
-          onPaired({
-            name: `${sshTarget.username}@${sshTarget.host}`,
-            method: 'ssh',
-            host: sshTarget.host,
-            username: sshTarget.username,
-            port: parseInt(port, 10) || 22,
-            code: '',
-            pairedAt: Date.now(),
-          });
-          onClose();
-        }, 600);
+        return {
+          name: `${sshTarget.username}@${sshTarget.host}`,
+          method: 'ssh',
+          host: sshTarget.host,
+          username: sshTarget.username,
+          port: parseInt(port, 10) || 22,
+          code: '',
+          pairedAt: Date.now(),
+        };
       } else if (method === 'local' && isTauri()) {
         // Local network: POST /pair to the CLI's `hone pair` server.
         const targetHost = (host.trim() || '127.0.0.1');
@@ -130,35 +130,43 @@ export function DevicePairingModal({ lang, onClose, onPaired, useTauri, discover
           throw new Error(r.error || (lang === 'zh' ? '配对失败' : 'Pairing failed'));
         }
         const machineName = r.machine_name || `CLI-${code}`;
-        setConnecting(false);
-        setConnected(true);
-        setTimeout(() => {
-          onPaired({
-            name: machineName,
-            method: 'local',
-            host: targetHost,
-            port: targetPort,
-            code: code.trim(),
-            pairedAt: Date.now(),
-          });
-          onClose();
-        }, 400);
+        return {
+          name: machineName,
+          method: 'local',
+          host: targetHost,
+          port: targetPort,
+          code: code.trim(),
+          pairedAt: Date.now(),
+        };
       } else {
         // Tunnel or non-Tauri: save the machine info directly
         const machineName = host.trim() || `CLI-${code || 'tunnel'}`;
-        setConnecting(false);
-        setConnected(true);
-        setTimeout(() => {
-          onPaired({
-            name: machineName,
-            method,
-            host: host.trim(),
-            port: parseInt(port, 10) || (method === 'ssh' ? 22 : 18789),
-            code: code.trim(),
-            pairedAt: Date.now(),
-          });
-          onClose();
-        }, 400);
+        return {
+          name: machineName,
+          method,
+          host: host.trim(),
+          port: parseInt(port, 10) || (method === 'ssh' ? 22 : 18789),
+          code: code.trim(),
+          pairedAt: Date.now(),
+        };
+      }
+    };
+
+    try {
+      const info = await buildPairedInfo();
+      setConnecting(false);
+      setConnected(true);
+      // Brief success indication, then forward to parent. If onPaired rejects
+      // (e.g. machine registry failure), surface the error instead of closing.
+      await new Promise(resolve => setTimeout(resolve, method === 'ssh' ? 600 : 400));
+      try {
+        await onPaired(info);
+        onClose();
+      } catch (e: any) {
+        // Post-connect failure (e.g. addMachine failed). Reset so the user
+        // can see the error and retry without reopening the modal.
+        setConnected(false);
+        setError(e?.message || e?.toString() || t('pairFailed'));
       }
     } catch (e: any) {
       setConnecting(false);
@@ -178,7 +186,13 @@ export function DevicePairingModal({ lang, onClose, onPaired, useTauri, discover
         background: method === m ? 'var(--hone-accentMuted)' : 'transparent',
         color: method === m ? 'var(--hone-accent)' : 'var(--hone-muted)',
       }}
-      onClick={() => { setMethod(m); setError(null); }}
+      onClick={() => {
+        setMethod(m);
+        setError(null);
+        // Reset port to method-appropriate default when switching methods
+        if (m === 'ssh') setPort('22');
+        else setPort('18789');
+      }}
     >
       {label}
     </button>
@@ -256,7 +270,7 @@ export function DevicePairingModal({ lang, onClose, onPaired, useTauri, discover
                 <input
                   type="text"
                   inputMode="numeric"
-                  value={port === '22' ? '18789' : port}
+                  value={port}
                   onChange={(e) => {
                     const v = e.target.value.replace(/\D/g, '');
                     setPort(v);

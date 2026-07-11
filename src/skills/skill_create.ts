@@ -7,7 +7,7 @@
 
 import * as fs from 'fs'
 import * as path from 'path'
-import type { Tool } from '../types.js'
+import type { Tool } from '../Tool.js'
 
 export interface SkillDefinition {
   name: string

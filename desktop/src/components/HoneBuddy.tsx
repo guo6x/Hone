@@ -82,6 +82,9 @@ const HoneBuddy: React.FC<Props> = ({ state, text, species = 'robot', onAction, 
     }
   }, [text]);
 
+  // Clear any pending bubble timer on unmount so it can't fire after teardown.
+  useEffect(() => () => { if (bubbleTimerRef.current) clearTimeout(bubbleTimerRef.current); }, []);
+
   // -- Drag handlers --
   const handlePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
