@@ -73,6 +73,13 @@ export function createOpenAIProvider(config?: { apiKey?: string; baseUrl?: strin
       const choice = data.choices?.[0]
       const message = choice?.message
 
+      const stopReasonMap: Record<string, string> = {
+        stop: 'end_turn',
+        tool_calls: 'tool_use',
+        length: 'max_tokens',
+        content_filter: 'end_turn',
+      }
+
       // 处理 tool_calls
       if (message?.tool_calls?.length) {
         const content: any[] = []
@@ -83,8 +90,8 @@ export function createOpenAIProvider(config?: { apiKey?: string; baseUrl?: strin
           content.push({
             type: 'tool_use',
             toolCallId: tc.id,
-            toolName: tc.function.name,
-            toolInput: safeJsonParse(tc.function.arguments),
+            name: tc.function.name,
+            input: safeJsonParse(tc.function.arguments),
           })
         }
         return {
@@ -95,13 +102,6 @@ export function createOpenAIProvider(config?: { apiKey?: string; baseUrl?: strin
             : undefined,
           stopReason: stopReasonMap['tool_calls'],
         }
-      }
-
-      const stopReasonMap: Record<string, string> = {
-        stop: 'end_turn',
-        tool_calls: 'tool_use',
-        length: 'max_tokens',
-        content_filter: 'end_turn',
       }
       return {
         content: message?.content || '',
@@ -192,8 +192,8 @@ export function createOpenAIProvider(config?: { apiKey?: string; baseUrl?: strin
                   yield {
                     type: 'tool_use',
                     toolCallId: tc.id,
-                    toolName: tc.function?.name || '',
-                    toolInput: {},
+                    name: tc.function?.name || '',
+                    input: {},
                   }
                 }
                 if (tc.function?.arguments) {

@@ -34,9 +34,9 @@ export function MobileAccessSection({ connection, lang, onRotate }: Props) {
       return () => { cancelled = true; };
     }
     QRCode.toDataURL(link, {
-      width: 220,
-      margin: 1,
-      errorCorrectionLevel: 'M',
+      width: 280,
+      margin: 2,
+      errorCorrectionLevel: 'H',
       color: { dark: '#101419', light: '#FFFFFF' },
     }).then(dataUrl => {
       if (!cancelled) setQr(dataUrl);

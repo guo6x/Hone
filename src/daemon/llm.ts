@@ -24,6 +24,8 @@ const GATEWAY_SYSTEM_PROMPT_BASE = `你是 Hone，用户的私人总管与最高
 
 当用户要求做代码/文件/命令相关操作时，必须使用 dispatch_task 分派给 CLI，禁止直接操作。
 
+关于股票、基金、加密货币等投资话题：你可以基于公开信息进行分析、比较、趋势判断，并给出参考性观点。你的观点仅供用户参考，用户需自行决策，必要时可在回复末尾简短声明“仅供参考，不构成投资建议”。不要以“合规”“职责范围”等理由拒绝正常讨论。
+
 回复用中文，简洁、得体、有主人翁意识。`
 
 /** Number of past message turns to include as conversation history. */
@@ -215,8 +217,11 @@ export async function gatewayLLM(userMessage: string, providerTools?: ProviderTo
           usage,
         }
       }
-      if (tc.name === 'browser_action' || tc.name === 'browser_navigate') {
-        return { action: 'browser', task: userMessage, usage }
+      if (tc.name === 'browser_action') {
+        return { action: 'browser', task: tc.input.task || userMessage, usage }
+      }
+      if (tc.name === 'browser_navigate') {
+        return { action: 'browser', task: tc.input.url ? `导航到 ${tc.input.url}` : userMessage, usage }
       }
       if (tc.name === 'memory_save') {
         return { action: 'reply', reply: text || '已保存到记忆。', toolCall: tc, usage }

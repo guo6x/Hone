@@ -465,6 +465,9 @@ impl GatewayManager {
             return Err(GatewayError::AlreadyRunning);
         }
 
+        // 启动前清理可能残留的孤儿 Gateway 进程（桌面端崩溃后端口可能被旧进程占用）
+        self.kill_orphan_gateway();
+
         self.normalize_internal_config();
         let relay_connect_url = self.relay_connect_url(relay_url);
         self.status = GatewayStatus::Starting;
@@ -774,6 +777,70 @@ impl GatewayManager {
     /// Whether the Gateway is currently in the `Running` state.
     pub fn is_running(&self) -> bool {
         self.status == GatewayStatus::Running
+    }
+
+    /// 清理可能残留的孤儿 Gateway 进程。
+    /// 桌面端崩溃或非正常退出后，Gateway 子进程可能仍在运行并占用端口，
+    /// 导致新启动的 Gateway 无法绑定端口（EADDRINUSE）。
+    fn kill_orphan_gateway(&self) {
+        let port = self.config.local_port;
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // 用 netstat 查找占用端口的 PID，然后 taskkill 杀掉
+            if let Ok(output) = Command::new("cmd")
+                .args(["/C", &format!("netstat -ano | findstr :{}", port)])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .output()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    // 只处理 LISTENING 状态的行
+                    if !line.contains("LISTENING") {
+                        continue;
+                    }
+                    // netstat 行格式: Proto LocalAddress ForeignAddress State PID
+                    // 取最后一列作为 PID
+                    if let Some(pid_str) = line.split_whitespace().last() {
+                        if let Ok(pid) = pid_str.parse::<u32>() {
+                            // 不杀自己（当前进程）
+                            if pid == std::process::id() {
+                                continue;
+                            }
+                            log::info!("Killing orphan process on port {}: PID {}", port, pid);
+                            let _ = Command::new("taskkill")
+                                .args(["/T", "/F", "/PID", &pid.to_string()])
+                                .creation_flags(0x08000000)
+                                .output();
+                            // 给系统一点时间释放端口
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            // Unix: 用 lsof 查找占用端口的进程
+            if let Ok(output) = Command::new("lsof")
+                .args(["-t", "-i", &format!("TCP:{}", port)])
+                .output()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for pid_str in stdout.lines() {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        if pid == std::process::id() {
+                            continue;
+                        }
+                        log::info!("Killing orphan process on port {}: PID {}", port, pid);
+                        let _ = Command::new("kill")
+                            .args(["-9", &pid.to_string()])
+                            .output();
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            }
+        }
     }
 
     /// Return a clone of the current config.

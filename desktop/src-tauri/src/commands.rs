@@ -655,8 +655,9 @@ pub async fn local_cli_instances_list() -> Result<Vec<LocalCliInstance>, String>
         if !dir.exists() {
             return Ok(Vec::new());
         }
-        // 批量获取所有存活 PID，避免逐个 spawn tasklist（N 个实例 = N 次进程 spawn）
-        let alive_pids = get_alive_pids();
+        // 批量获取所有存活 PID 及其父进程 PID，避免逐个 spawn tasklist
+        let pid_parents = get_alive_pid_parents();
+        let current_pid = std::process::id();
         let mut alive: Vec<LocalCliInstance> = Vec::new();
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -679,9 +680,38 @@ pub async fn local_cli_instances_list() -> Result<Vec<LocalCliInstance>, String>
                 Some(p) => p as u32,
                 None => continue,
             };
-            if !alive_pids.contains(&pid) {
+            let mode = parsed.get("mode").and_then(|v| v.as_str()).unwrap_or("interactive").to_string();
+            let ppid = pid_parents.get(&pid).copied();
+            if !pid_parents.contains_key(&pid) {
                 let _ = std::fs::remove_file(&path);
                 continue;
+            }
+            // Gateway 子进程是后台启动的；如果父进程（桌面端）已不存在，说明是孤儿进程，应该清理
+            // 注意：ppid=0 表示 tasklist fallback 无法获取父进程，跳过孤儿检测避免误杀
+            if mode == "gateway" {
+                if let Some(ppid) = ppid {
+                    if ppid == 0 {
+                        // ppid 未知，跳过孤儿检测
+                    } else if ppid != current_pid && !pid_parents.contains_key(&ppid) {
+                        log::info!("Cleaning orphan gateway process pid={} ppid={}", pid, ppid);
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::process::CommandExt;
+                            let _ = std::process::Command::new("taskkill")
+                                .args(["/T", "/F", "/PID", &pid.to_string()])
+                                .creation_flags(0x08000000)
+                                .output();
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let _ = std::process::Command::new("kill")
+                                .args(["-9", &pid.to_string()])
+                                .output();
+                        }
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                }
             }
             alive.push(LocalCliInstance {
                 pid,
@@ -701,45 +731,87 @@ pub async fn local_cli_instances_list() -> Result<Vec<LocalCliInstance>, String>
     .map_err(|e| format!("spawn_blocking failed: {}", e))?
 }
 
-/// 批量获取所有存活进程 PID。Windows 用单次 tasklist，Unix 用 ps -eo pid。
+/// 批量获取所有存活进程 PID 及其父进程 PID。
+/// Windows 优先用 PowerShell Get-CimInstance（wmic 在 Win11 已弃用），
+/// fallback 到 tasklist（仅返回 PID，无 ppid）。
 #[cfg(windows)]
-fn get_alive_pids() -> std::collections::HashSet<u32> {
+fn get_alive_pid_parents() -> std::collections::HashMap<u32, u32> {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
-    let mut cmd = Command::new("tasklist");
-    cmd.args(["/FO", "CSV", "/NH"]);
-    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    let mut set = std::collections::HashSet::new();
-    if let Ok(out) = cmd.output() {
+    let mut map = std::collections::HashMap::new();
+
+    // 方案1: PowerShell Get-CimInstance（返回 PID 和 ParentProcessId）
+    let ps_out = Command::new("powershell")
+        .args([
+            "-NoProfile", "-NonInteractive", "-Command",
+            "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Csv -NoTypeInformation",
+        ])
+        .creation_flags(0x08000000)
+        .output();
+    if let Ok(out) = ps_out {
         let txt = String::from_utf8_lossy(&out.stdout);
-        // CSV: "Image Name","PID","Session Name","Session#","Mem Usage"
+        // CSV 格式: "ProcessId","ParentProcessId"
+        let lines: Vec<&str> = txt.lines().collect();
+        if lines.len() >= 2 {
+            // 找到列索引
+            let header: Vec<&str> = lines[0].split(',').map(|s| s.trim().trim_matches('"')).collect();
+            let pid_idx = header.iter().position(|h| h.eq_ignore_ascii_case("ProcessId"));
+            let ppid_idx = header.iter().position(|h| h.eq_ignore_ascii_case("ParentProcessId"));
+            if let (Some(pi), Some(ppi)) = (pid_idx, ppid_idx) {
+                for line in &lines[1..] {
+                    let parts: Vec<&str> = line.split(',').map(|s| s.trim().trim_matches('"')).collect();
+                    if parts.len() > pi.max(ppi) {
+                        if let (Ok(pid), Ok(ppid)) = (
+                            parts[pi].parse::<u32>(),
+                            parts[ppi].parse::<u32>(),
+                        ) {
+                            map.insert(pid, ppid);
+                        }
+                    }
+                }
+            }
+        }
+        if !map.is_empty() {
+            return map;
+        }
+    }
+
+    // 方案2: tasklist（仅返回 PID，无 ppid；用于无法运行 PowerShell 的场景）
+    if let Ok(out) = Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .creation_flags(0x08000000)
+        .output()
+    {
+        let txt = String::from_utf8_lossy(&out.stdout);
+        // CSV 每行: "Image Name","PID","Session Name","Session#","Mem Usage"
         for line in txt.lines() {
-            let parts: Vec<&str> = line.split(',').collect();
+            let parts: Vec<&str> = line.split(',').map(|s| s.trim().trim_matches('"')).collect();
             if parts.len() >= 2 {
-                let pid_str = parts[1].trim_matches('"');
-                if let Ok(pid) = pid_str.parse::<u32>() {
-                    set.insert(pid);
+                if let Ok(pid) = parts[1].parse::<u32>() {
+                    map.insert(pid, 0); // ppid 未知，填 0
                 }
             }
         }
     }
-    set
+    map
 }
 
 #[cfg(not(windows))]
-fn get_alive_pids() -> std::collections::HashSet<u32> {
+fn get_alive_pid_parents() -> std::collections::HashMap<u32, u32> {
     use std::process::Command;
-    let mut set = std::collections::HashSet::new();
-    // `ps -eo pid` 在 Linux 和 macOS 上都可用
-    if let Ok(out) = Command::new("ps").args(["-eo", "pid"]).output() {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(out) = Command::new("ps").args(["-eo", "pid,ppid"]).output() {
         let txt = String::from_utf8_lossy(&out.stdout);
         for line in txt.lines().skip(1) {
-            if let Ok(pid) = line.trim().parse::<u32>() {
-                set.insert(pid);
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let (Ok(pid), Ok(ppid)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                    map.insert(pid, ppid);
+                }
             }
         }
     }
-    set
+    map
 }
 
 // ── Local CLI pairing ──

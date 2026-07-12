@@ -82,6 +82,8 @@ export interface GatewayState {
   runningTaskCount: number
   /** Originating device for an in-flight browser task, used for scoped prompts/events. */
   browserTaskOwners: Map<string, string | undefined>
+  /** In-flight image uploads from mobile clients, keyed by imageId. */
+  imageChunks: Map<string, { chunks: (string | null)[]; received: number; total: number }>
 }
 
 interface ClientInfo {
@@ -483,6 +485,7 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
     runningTasks: new Map(),
     runningTaskCount: 0,
     browserTaskOwners: new Map(),
+    imageChunks: new Map(),
   }
 
   // Initialize browser agent (null if HONE_BROWSER_ENABLED !== 'true')
@@ -964,6 +967,11 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
     })
     wss.on('error', (err: Error) => {
       console.error(`[Gateway] 本地 WS 服务错误: ${err.message}`)
+      // EADDRINUSE 说明端口被占用（通常是孤儿 Gateway 进程），直接退出让桌面端重启
+      if (err.message.includes('EADDRINUSE')) {
+        console.error('[Gateway] 端口被占用，退出进程以便桌面端重启')
+        process.exit(1)
+      }
     })
   } catch (err) {
     console.error(`[Gateway] 本地 WS 服务启动失败: ${err}`)
@@ -1228,19 +1236,32 @@ async function handleMessage(
         switch (intent.action) {
           case 'reply': {
             // 如果 LLM 调用了 memory_save 等工具，执行它
+            let toolResultText = ''
             if (intent.toolCall) {
               const tool = tools.find(t => t.name === intent.toolCall!.name)
               if (tool) {
                 try {
-                  await tool.execute(intent.toolCall.input)
+                  const toolResult = await tool.execute(intent.toolCall.input)
                   log(config, `Tool executed: ${intent.toolCall.name}`)
+                  // 提取工具返回的文本内容
+                  if (toolResult?.content?.length) {
+                    toolResultText = toolResult.content
+                      .filter((c: any) => c.type === 'text')
+                      .map((c: any) => c.text)
+                      .join('\n')
+                  }
                 } catch (e) {
                   log(config, `Tool execution failed: ${e}`)
+                  toolResultText = `工具执行失败: ${e}`
                 }
               }
             }
             broadcastBuddyEvent(state, 'idle')
-            const reply = intent.reply || '已收到'
+            // 如果 LLM 没有给出回复文案，但工具执行有结果，用工具结果作为回复
+            let reply = intent.reply || '已收到'
+            if (!intent.reply && toolResultText) {
+              reply = toolResultText
+            }
             sendJSON(state.ws!, {
               type: 'message',
               target: 'client',
@@ -1703,6 +1724,64 @@ async function handleMessage(
     case 'browser_task_result':
     case 'budget_warning': {
       // Internal messages, already handled
+      break
+    }
+
+    case 'image_chunk': {
+      const { imageId, index, total, data } = msg.payload || msg
+      if (!imageId || typeof index !== 'number' || typeof total !== 'number' || typeof data !== 'string') break
+
+      let chunkData = state.imageChunks.get(imageId)
+      if (!chunkData) {
+        chunkData = { chunks: new Array(total).fill(null), received: 0, total }
+        state.imageChunks.set(imageId, chunkData)
+      }
+      if (index < 0 || index >= total || chunkData.chunks[index]) break
+
+      chunkData.chunks[index] = data
+      chunkData.received++
+      break
+    }
+
+    case 'image_complete': {
+      const imageId = typeof msg.imageId === 'string' ? msg.imageId : (msg.payload?.imageId)
+      if (!imageId) break
+
+      const chunkData = state.imageChunks.get(imageId)
+      if (!chunkData || chunkData.received !== chunkData.total) {
+        replyToMessage(state, msg, {
+          type: 'image_received',
+          status: 'failed',
+          error: '图片分片不完整或已过期',
+          ts: new Date().toISOString(),
+        })
+        break
+      }
+
+      try {
+        const base64 = chunkData.chunks.join('')
+        const buffer = Buffer.from(base64, 'base64')
+        const tmpDir = pathJoin(os.tmpdir(), 'hone')
+        await fsMkdir(tmpDir, { recursive: true })
+        const filename = `received_${imageId}.jpg`
+        const filePath = pathJoin(tmpDir, filename)
+        await fsWriteFile(filePath, buffer)
+        state.imageChunks.delete(imageId)
+
+        replyToMessage(state, msg, {
+          type: 'image_received',
+          path: filePath,
+          ts: new Date().toISOString(),
+        })
+        log(config, `Image received and saved: ${filePath}`)
+      } catch (err) {
+        replyToMessage(state, msg, {
+          type: 'image_received',
+          status: 'failed',
+          error: String(err),
+          ts: new Date().toISOString(),
+        })
+      }
       break
     }
 

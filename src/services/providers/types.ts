@@ -42,8 +42,8 @@ export interface StreamChunk {
   text?: string
   thinking?: string
   toolCallId?: string
-  toolName?: string
-  toolInput?: Record<string, unknown>
+  name?: string
+  input?: Record<string, unknown>
 }
 
 export interface AIProvider {

@@ -146,7 +146,7 @@ export class RelayRoom {
         else closeWS(ws, 4000, "Invalid role");
         break;
       case "heartbeat":
-        this._recordGatewayHeartbeat(ws);
+        await this._recordGatewayHeartbeat(ws);
         break;
       case "pairing_response":
         await this._handlePairingResponse(ws, msg);
@@ -256,7 +256,13 @@ export class RelayRoom {
 
     for (const [clientId, client] of this.clients) {
       if (!client.approved) {
-        this._send(ws, { type: "pairing_request", clientId, deviceId: client.deviceId || undefined });
+        const pairingChallenge = await this.ctx.storage.get(STORAGE_PAIRING);
+        this._send(ws, {
+          type: "pairing_request",
+          clientId,
+          deviceId: client.deviceId || undefined,
+          pairingId: pairingChallenge?.id,
+        });
       }
     }
   }
@@ -487,7 +493,7 @@ export class RelayRoom {
     await this.ctx.storage.put(STORAGE_PENDING, this.pendingMessages);
   }
 
-  _recordGatewayHeartbeat(ws) {
+  async _recordGatewayHeartbeat(ws) {
     const gatewayId = this._gatewayIdForSocket(ws);
     if (!gatewayId) return;
     const gateway = this.gateways.get(gatewayId);
@@ -501,6 +507,14 @@ export class RelayRoom {
       branch: gateway.branch,
       lastHeartbeat: gateway.lastHeartbeat,
     });
+    // 刷新配对挑战的过期时间，防止 Gateway 长时间运行后配对码失效
+    const challenge = await this.ctx.storage.get(STORAGE_PAIRING);
+    if (challenge && challenge.expiresAt < Date.now() + PAIRING_TTL_MS / 2) {
+      await this.ctx.storage.put(STORAGE_PAIRING, {
+        ...challenge,
+        expiresAt: Date.now() + PAIRING_TTL_MS,
+      });
+    }
   }
 
   _recordClientPong(ws) {

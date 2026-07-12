@@ -85,8 +85,8 @@ export function createDeepSeekProvider(): AIProvider {
           content.push({
             type: 'tool_use',
             toolCallId: tc.id,
-            toolName: tc.function.name,
-            toolInput: safeJsonParse(tc.function.arguments),
+            name: tc.function.name,
+            input: safeJsonParse(tc.function.arguments),
           })
         }
       }
@@ -192,8 +192,8 @@ export function createDeepSeekProvider(): AIProvider {
                   yield {
                     type: 'tool_use',
                     toolCallId: tc.id,
-                    toolName: tc.function?.name || '',
-                    toolInput: {},
+                    name: tc.function?.name || '',
+                    input: {},
                   }
                 }
                 if (tc.function?.arguments) {
