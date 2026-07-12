@@ -154,7 +154,7 @@ const HoneBuddy: React.FC<Props> = ({ state, text, species = 'robot', onAction, 
 
   const animClass = dragging ? ''
     : state === 'thinking' ? 'buddy-pulse'
-    : state === 'working' ? 'buddy-bounce'
+    : state === 'working' ? 'buddy-breathe'
     : state === 'error' ? 'buddy-shake' : '';
 
   return (
@@ -234,9 +234,9 @@ const HoneBuddy: React.FC<Props> = ({ state, text, species = 'robot', onAction, 
           50% { opacity: 1; transform: scale(1.02); }
           100% { opacity: 0.8; transform: scale(1); }
         }
-        @keyframes buddy-bounce {
-          0%, 100% { transform: translateY(0); }
-          50% { transform: translateY(-2px); }
+        @keyframes buddy-breathe {
+          0%, 100% { opacity: 0.9; transform: scale(1); }
+          50% { opacity: 1; transform: scale(1.02); }
         }
         @keyframes buddy-shake {
           0%, 100% { transform: translateX(0); }
@@ -248,7 +248,7 @@ const HoneBuddy: React.FC<Props> = ({ state, text, species = 'robot', onAction, 
           to { opacity: 1; transform: translateY(0); }
         }
         .buddy-pulse { animation: buddy-pulse 2s infinite; }
-        .buddy-bounce { animation: buddy-bounce 0.4s infinite; }
+        .buddy-breathe { animation: buddy-breathe 2s infinite; }
         .buddy-shake { animation: buddy-shake 0.5s infinite; }
       `}</style>
     </div>

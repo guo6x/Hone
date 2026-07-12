@@ -86,6 +86,8 @@ const GatewayChat: React.FC<Props> = ({
     } catch { return false; }
   });
   const bottomRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const userScrolledUpRef = useRef(false);
 
   useEffect(() => {
     try {
@@ -97,11 +99,28 @@ const GatewayChat: React.FC<Props> = ({
 
   const messages = activeSession?.messages || [];
 
-  const scrollToBottom = useCallback(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    bottomRef.current?.scrollIntoView({ behavior });
   }, []);
 
-  useEffect(() => { scrollToBottom(); }, [messages, scrollToBottom]);
+  // Track whether the user has manually scrolled up; only auto-scroll when
+  // they are already near the bottom so long conversations stay readable.
+  useEffect(() => {
+    const el = messagesRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      userScrolledUpRef.current = !nearBottom;
+    };
+    el.addEventListener('scroll', onScroll);
+    return () => el.removeEventListener('scroll', onScroll);
+  }, []);
+
+  useEffect(() => {
+    if (!userScrolledUpRef.current) {
+      scrollToBottom('smooth');
+    }
+  }, [messages, scrollToBottom]);
 
   // Show a welcome banner the first time we go online (for the active session)
   const announcedOnceRef = useRef(false);
@@ -118,7 +137,10 @@ const GatewayChat: React.FC<Props> = ({
   // Reset announced flag when session changes so new sessions get welcome messages.
   useEffect(() => {
     announcedOnceRef.current = false;
-  }, [activeSessionId]);
+    userScrolledUpRef.current = false;
+    // Brief delay so messages render before scrolling on session switch.
+    setTimeout(() => scrollToBottom('auto'), 0);
+  }, [activeSessionId, scrollToBottom]);
 
   // Subscribe to relay events for chat-relevant messages.
   useEffect(() => {
@@ -308,6 +330,8 @@ const GatewayChat: React.FC<Props> = ({
     // still see the stale null activeSessionId and create ANOTHER session.
     appendMessage({ id: nextId('u'), from: 'user', text, time: now });
     setInput('');
+    userScrolledUpRef.current = false;
+    setTimeout(() => scrollToBottom('smooth'), 50);
 
     if (!sendChat(text)) {
       appendMessage({
@@ -800,7 +824,7 @@ const GatewayChat: React.FC<Props> = ({
           </div>
         )}
 
-        <div style={styles.messagesArea}>
+        <div ref={messagesRef} style={styles.messagesArea}>
           {filteredMessages.length === 0 ? (
             <div style={styles.noResults}>{lang === 'zh' ? '没有匹配的对话' : 'No messages yet'}</div>
           ) : (

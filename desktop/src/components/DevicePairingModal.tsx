@@ -120,8 +120,15 @@ export function DevicePairingModal({ lang, onClose, onPaired, useTauri, discover
         };
       } else if (method === 'local' && isTauri()) {
         // Local network: POST /pair to the CLI's `hone pair` server.
-        const targetHost = (host.trim() || '127.0.0.1');
-        const targetPort = parseInt(port, 10) || 18789;
+        let targetHost = (host.trim() || '127.0.0.1');
+        let targetPort = parseInt(port, 10) || 18789;
+        // Allow users to paste "host:port" into the host field; split it out
+        // so we don't end up with an invalid URL like host:port:port.
+        const hostPortMatch = targetHost.match(/^(.+):(\d+)$/);
+        if (hostPortMatch) {
+          targetHost = hostPortMatch[1].trim();
+          targetPort = parseInt(hostPortMatch[2], 10) || targetPort;
+        }
         if (!code.trim() || code.trim().length !== 6) {
           throw new Error(lang === 'zh' ? '请输入 6 位配对码' : 'Enter the 6-digit code');
         }
