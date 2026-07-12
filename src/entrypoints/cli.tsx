@@ -427,11 +427,15 @@ async function main(): Promise<void> {
   // Hone CLI pairing: `hone pair` — print a 6-digit code and serve a local
   // HTTP endpoint so a desktop Hone client on the same network can connect.
   // The Desktop's "Add Machine → Local Network" panel hits this server.
+  // We also advertise the pairing server over mDNS so the desktop can
+  // auto-discover LAN instances without manual host/port entry.
   if (args[0] === 'pair') {
     const http = await import('http')
     const os = await import('os')
     const crypto = await import('crypto')
     const fs = await import('fs/promises')
+    const bonjourMod: any = await import('bonjour')
+    const bonjour = (bonjourMod.default || bonjourMod)()
 
     const portArg = args.find(a => a.startsWith('--port='))
     const port = portArg
@@ -442,6 +446,7 @@ async function main(): Promise<void> {
     const machineName = process.env.COMPUTERNAME || os.hostname() || 'unknown'
     const machineId = crypto.randomUUID()
     const pairedTokens = new Map<string, { token: string; ts: number }>()
+    let mdnsService: any = null
 
     const isPrivateLanAddress = (addr: string): boolean => {
       const parts = addr.split('.').map(Number)
@@ -584,6 +589,23 @@ async function main(): Promise<void> {
     })
 
     server.listen(port, '0.0.0.0', () => {
+      // Advertise this pairing server via mDNS so desktop clients can
+      // discover it automatically under "Add Machine → Local Network".
+      try {
+        mdnsService = bonjour.publish({
+          name: machineName,
+          type: 'hone-gw',
+          protocol: 'tcp',
+          port,
+          txt: {
+            id: machineId,
+            version: '2.1.88',
+          },
+        })
+      } catch (err: any) {
+        console.warn(`mDNS 服务发布失败: ${err?.message || String(err)}`)
+      }
+
       console.log('')
       console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
       console.log(`  Hone CLI 配对模式`)
@@ -609,7 +631,15 @@ async function main(): Promise<void> {
     process.on('SIGINT', () => {
       console.log('\n配对模式已退出')
       server.close()
-      process.exit(0)
+      if (mdnsService && typeof mdnsService.stop === 'function') {
+        mdnsService.stop(() => {
+          bonjour.destroy()
+          process.exit(0)
+        })
+      } else {
+        bonjour.destroy()
+        process.exit(0)
+      }
     })
     return
   }
