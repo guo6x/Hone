@@ -132,6 +132,13 @@ async function main(): Promise<void> {
     }
   }
 
+  // Load Hone CLI persistent config (API keys, provider, model) from ~/.hone/config.json
+  // and inject into process.env before any subcommand runs. Environment variables still
+  // take precedence, so users can override the file on the fly.
+  const { loadConfig, applyConfigToEnv } = await import('../utils/honeConfig.js');
+  const honeConfig = await loadConfig();
+  applyConfigToEnv(honeConfig);
+
   // For all other paths, load the startup profiler
   const {
     profileCheckpoint
@@ -422,6 +429,61 @@ async function main(): Promise<void> {
   // Redirect common update flag mistakes to the update subcommand
   if (args.length === 1 && (args[0] === '--update' || args[0] === '--upgrade')) {
     process.argv = [process.argv[0]!, process.argv[1]!, 'update'];
+  }
+
+  // Hone CLI config: `hone config [get|set|list]` — persist API keys/provider/model
+  // to ~/.hone/config.json so standalone CLI usage does not require env vars every time.
+  if (args[0] === 'config') {
+    const { loadConfig, saveConfig, applyConfigToEnv, maskKey } = await import('../utils/honeConfig.js');
+    const subcmd = args[1] || 'list';
+    const config = await loadConfig();
+
+    if (subcmd === 'list' || subcmd === 'get') {
+      console.log('当前 Hone CLI 配置 (~/.hone/cli-config.json):');
+      console.log(`  provider:        ${config.provider || '(未设置)'}`);
+      console.log(`  model:           ${config.model || '(未设置)'}`);
+      console.log(`  deepseekApiKey:  ${maskKey(config.deepseekApiKey)}`);
+      console.log(`  deepseekBaseUrl: ${config.deepseekBaseUrl || '(未设置)'}`);
+      console.log(`  openaiApiKey:    ${maskKey(config.openaiApiKey)}`);
+      console.log(`  openaiBaseUrl:   ${config.openaiBaseUrl || '(未设置)'}`);
+      process.exit(0);
+    }
+
+    if (subcmd === 'set') {
+      const key = args[2];
+      const value = args[3];
+      if (!key || value === undefined) {
+        console.log('用法: hone config set <key> <value>');
+        console.log('可设 key: provider, model, deepseekApiKey, deepseekBaseUrl, openaiApiKey, openaiBaseUrl');
+        process.exit(1);
+      }
+      const validKeys = ['provider', 'model', 'deepseekApiKey', 'deepseekBaseUrl', 'openaiApiKey', 'openaiBaseUrl'];
+      if (!validKeys.includes(key)) {
+        console.error(`未知配置项: ${key}`);
+        console.log(`支持: ${validKeys.join(', ')}`);
+        process.exit(1);
+      }
+      (config as any)[key] = value;
+      await saveConfig(config);
+      applyConfigToEnv(config);
+      console.log(`已保存 ${key}。当前生效 provider: ${process.env.HONE_PROVIDER || '(未设置)'}, model: ${process.env.HONE_MODEL || '(未设置)'}`);
+      process.exit(0);
+    }
+
+    if (subcmd === 'unset') {
+      const key = args[2];
+      if (!key) {
+        console.log('用法: hone config unset <key>');
+        process.exit(1);
+      }
+      (config as any)[key] = undefined;
+      await saveConfig(config);
+      console.log(`已删除 ${key}`);
+      process.exit(0);
+    }
+
+    console.log('用法: hone config [list|get|set <key> <value>|unset <key>]');
+    process.exit(1);
   }
 
   // Hone CLI pairing: `hone pair` — print a 6-digit code and serve a local
