@@ -104,12 +104,62 @@ fn parse_field(raw: &str, min: u32, max: u32) -> Option<Vec<u32>> {
     // Step syntax: */5
     if let Some(step_str) = raw.strip_prefix("*/") {
         let step: u32 = step_str.parse().ok()?;
+        // step == 0 会导致 while v <= max 永远成立，死循环卡死调度器 worker 线程
+        if step == 0 {
+            return None;
+        }
+        // step 超过范围上限：步进无意义（只匹配 min 一个值），但不算错误，
+        // 直接返回 [min] 即可。仍加饱和保护防止极端输入。
         let mut v = min;
         while v <= max {
             values.push(v);
-            v += step;
+            // saturating_add 防止 u32 溢出 panic（虽然 cron 字段都 < 60，但防御性编程）
+            v = v.saturating_add(step);
         }
         return Some(values);
+    }
+
+    // 步进 + 范围语法 N-M/S：如 10-20/2
+    if raw.contains('/') {
+        let parts: Vec<&str> = raw.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            let step: u32 = parts[1].parse().ok()?;
+            if step == 0 {
+                return None;
+            }
+            let range_part = parts[0];
+            let (lo, hi) = if range_part == "*" {
+                (min, max)
+            } else if let Some(range_str) = range_part.strip_prefix('*') {
+                // 形如 */-1 之类，已处理
+                let _ = range_str;
+                (min, max)
+            } else if range_part.contains('-') {
+                let range: Vec<&str> = range_part.split('-').collect();
+                if range.len() != 2 {
+                    return None;
+                }
+                let lo: u32 = range[0].parse().ok()?;
+                let hi: u32 = range[1].parse().ok()?;
+                if lo < min || hi > max || lo > hi {
+                    return None;
+                }
+                (lo, hi)
+            } else {
+                // 单值/3 → 等价于 3-MAX/step
+                let v: u32 = range_part.parse().ok()?;
+                if v < min || v > max {
+                    return None;
+                }
+                (v, max)
+            };
+            let mut v = lo;
+            while v <= hi {
+                values.push(v);
+                v = v.saturating_add(step);
+            }
+            return if values.is_empty() { None } else { Some(values) };
+        }
     }
 
     // Comma-separated

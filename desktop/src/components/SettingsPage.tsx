@@ -52,7 +52,7 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
   const [section, setSection] = useState<Section>('provider');
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [apiKeyDraft, setApiKeyDraft] = useState(settings.apiKey ?? '');
-  const [model, setModel] = useState(settings.model ?? 'deepseek-chat');
+  const [model, setModel] = useState(settings.model ?? 'deepseek-v4-pro');
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
   // Normalize legacy capitalized provider names from older configs.
@@ -169,7 +169,7 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
   useEffect(() => {
     if (hydrated && !isLocalHydrated && settings) {
       setApiKeyDraft(settings.apiKey ?? '');
-      setModel(settings.model ?? 'deepseek-chat');
+      setModel(settings.model ?? 'deepseek-v4-pro');
       setProvider(normProvider(settings.provider));
       setBaseUrl(settings.baseUrl ?? '');
       setCustomProviderName(settings.customProviderName ?? '');
@@ -364,8 +364,42 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
     }
   };
 
+  const [clearingData, setClearingData] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
+
   const handleClearData = async () => {
-    // 1. Clear frontend state
+    if (clearingData) return;
+    setClearingData(true);
+    setClearError(null);
+
+    // 事务性清除：先调后端清除 ~/.hone/ 数据，成功后再清前端 localStorage + state。
+    // 如果后端失败，前端 state 不动（保留用户数据可见性），仅显示错误让用户重试。
+    // 这避免了"前端已清空但后端数据残留"的不一致状态。
+    if (isTauri()) {
+      try {
+        await clearUserData();
+        await syncSkills([]);
+        await syncMcps([]);
+        await syncSkillsV2([]);
+        await syncMcpsV2([]);
+      } catch (e: any) {
+        console.warn('Clear data (Tauri):', e);
+        setClearingData(false);
+        setClearError(e?.message || String(e) || 'Backend clear failed');
+        return; // 不清前端，避免半清除状态
+      }
+    }
+
+    // 后端清除成功（或非 Tauri 环境），现在清除前端 state
+    try {
+      localStorage.removeItem('hone-skills');
+      localStorage.removeItem('hone-skills-v2');
+      localStorage.removeItem('hone-mcps');
+      localStorage.removeItem('hone-mcps-v2');
+      localStorage.removeItem('hone-providers');
+      localStorage.removeItem('hone-settings-extra');
+    } catch {}
+
     setSettings({
       provider: 'deepseek',
       apiKey: '',
@@ -409,26 +443,8 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
     setMcps([]);
     setMcpsV2([]);
     setProviderProfiles([]);
-    try { localStorage.removeItem('hone-skills'); } catch {}
-    try { localStorage.removeItem('hone-skills-v2'); } catch {}
-    try { localStorage.removeItem('hone-mcps'); } catch {}
-    try { localStorage.removeItem('hone-mcps-v2'); } catch {}
-    try { localStorage.removeItem('hone-providers'); } catch {}
-    try { localStorage.removeItem('hone-settings-extra'); } catch {}
 
-    // 2. Clear backend data in ~/.hone/
-    if (isTauri()) {
-      try {
-        await clearUserData();
-        await syncSkills([]);
-        await syncMcps([]);
-        await syncSkillsV2([]);
-        await syncMcpsV2([]);
-      } catch (e) {
-        console.warn('Clear data (Tauri):', e);
-      }
-    }
-
+    setClearingData(false);
     setShowDanger(false);
     setConfirmClear(false);
   };
@@ -634,8 +650,16 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
         <p style={{ fontSize: 12, color: 'var(--hone-muted)', margin: '0 0 12px' }}>
           {t('删除所有本地数据，包括对话历史、日志和缓存', 'Delete all local data including conversation history, logs, and cache.')}
         </p>
+        {clearError && (
+          <div style={{ ...s.bannerRed, marginBottom: 8 }}>
+            {t('清除失败: ', 'Clear failed: ')}{clearError}
+          </div>
+        )}
         {!showDanger ? (
-          <button style={{ ...s.btn, color: 'var(--hone-danger)', borderColor: 'var(--hone-danger)' }} onClick={() => setShowDanger(true)}>
+          <button
+            style={{ ...s.btn, color: 'var(--hone-danger)', borderColor: 'var(--hone-danger)' }}
+            onClick={() => { setShowDanger(true); setClearError(null); setConfirmClear(false); }}
+          >
             {t('清除所有数据', 'Clear All Data')}
           </button>
         ) : !confirmClear ? (
@@ -644,14 +668,41 @@ export function SettingsPage({ settings, setSettings, lang, theme, setTheme, hyd
               {t('确定要清除吗？', 'Are you sure you want to clear?')}
             </p>
             <div style={{ display: 'flex', gap: 8 }}>
-              <button style={s.btnDanger} onClick={() => setConfirmClear(true)}>{t('确认清除', 'Confirm Clear')}</button>
-              <button style={s.btn} onClick={() => setShowDanger(false)}>{t('取消', 'Cancel')}</button>
+              <button
+                style={{ ...s.btnDanger, opacity: clearingData ? 0.6 : 1 }}
+                disabled={clearingData}
+                onClick={() => {
+                  setConfirmClear(true);
+                  void handleClearData();
+                }}
+              >
+                {clearingData ? t('清除中...', 'Clearing...') : t('确认清除', 'Confirm Clear')}
+              </button>
+              <button
+                style={{ ...s.btn, opacity: clearingData ? 0.6 : 1 }}
+                disabled={clearingData}
+                onClick={() => { setShowDanger(false); setClearError(null); }}
+              >
+                {t('取消', 'Cancel')}
+              </button>
             </div>
           </div>
         ) : (
           <div>
-            <p style={{ fontSize: 13, margin: '0 0 8px' }}>{t('数据已清除', 'Data cleared.')}</p>
-            <button style={s.btn} onClick={handleClearData}>{t('完成', 'Done')}</button>
+            <p style={{ fontSize: 13, margin: '0 0 8px' }}>
+              {clearingData
+                ? t('正在清除数据...', 'Clearing data...')
+                : clearError
+                  ? t('清除失败，可重试', 'Clear failed, can retry')
+                  : t('数据已清除', 'Data cleared.')}
+            </p>
+            <button
+              style={{ ...s.btn, opacity: clearingData ? 0.6 : 1 }}
+              disabled={clearingData}
+              onClick={clearError ? () => { setClearError(null); void handleClearData(); } : () => { setShowDanger(false); setConfirmClear(false); }}
+            >
+              {clearingData ? t('清除中...', 'Clearing...') : clearError ? t('重试', 'Retry') : t('完成', 'Done')}
+            </button>
           </div>
         )}
       </div>

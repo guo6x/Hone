@@ -104,13 +104,15 @@ export function setShellIfWindows(): void {
  * Find the path where `bash.exe` included with git-bash exists, exiting the process if not found.
  */
 export const findGitBashPath = memoize((): string => {
-  if (process.env.CLAUDE_CODE_GIT_BASH_PATH) {
-    if (checkPathExists(process.env.CLAUDE_CODE_GIT_BASH_PATH)) {
-      return process.env.CLAUDE_CODE_GIT_BASH_PATH
+  // 优先使用 hone 自己的 env var，向后兼容 claude-code 残留的 CLAUDE_CODE_GIT_BASH_PATH
+  const bashPathEnv = process.env.HONE_GIT_BASH_PATH || process.env.CLAUDE_CODE_GIT_BASH_PATH
+  if (bashPathEnv) {
+    if (checkPathExists(bashPathEnv)) {
+      return bashPathEnv
     }
     // biome-ignore lint/suspicious/noConsole:: intentional console output
     console.error(
-      `Hone was unable to find CLAUDE_CODE_GIT_BASH_PATH path "${process.env.CLAUDE_CODE_GIT_BASH_PATH}"`,
+      `Hone was unable to find git-bash path "${bashPathEnv}" (set via HONE_GIT_BASH_PATH or CLAUDE_CODE_GIT_BASH_PATH)`,
     )
     // eslint-disable-next-line custom-rules/no-process-exit
     process.exit(1)
@@ -132,7 +134,7 @@ export const findGitBashPath = memoize((): string => {
 
   // biome-ignore lint/suspicious/noConsole:: intentional console output
   console.error(
-    'Hone on Windows requires git-bash (https://git-scm.com/downloads/win). If installed but not in PATH, set environment variable pointing to your bash.exe, similar to: CLAUDE_CODE_GIT_BASH_PATH=C:\\Program Files\\Git\\bin\\bash.exe',
+    'Hone on Windows requires git-bash (https://git-scm.com/downloads/win). If installed but not in PATH, set environment variable pointing to your bash.exe, similar to: HONE_GIT_BASH_PATH=C:\\Program Files\\Git\\bin\\bash.exe',
   )
   // eslint-disable-next-line custom-rules/no-process-exit
   process.exit(1)

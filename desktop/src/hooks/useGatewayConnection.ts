@@ -133,20 +133,18 @@ export function useGatewayConnection(
     setStatus(prev => (prev === 'online' ? prev : 'starting'));
     setError(null);
 
-    // Prefer a direct local connection to the gateway daemon (ws://localhost:PORT)
+    // Prefer a direct local connection to the gateway daemon (ws://127.0.0.1:PORT)
     // over the relay. The daemon listens on 127.0.0.1:HONE_GATEWAY_PORT and
     // accepts same-machine clients — this bypasses the relay entirely, which is
     // critical when the relay (Cloudflare Workers) is unreachable due to network
     // restrictions or proxy issues.
     //
-    // IMPORTANT: Use `localhost` (not `127.0.0.1`) in the URL. The Tauri CSP
-    // allows `ws://localhost:*` but WebView2 treats `127.0.0.1` and `localhost`
-    // as different origins — a `ws://127.0.0.1:*` connection is silently blocked
-    // by CSP, causing the WS to fail and retry forever ("starting/reconnecting"
-    // loop in the UI). `localhost` resolves to 127.0.0.1 on Windows so the
-    // daemon (bound to 127.0.0.1) still accepts the connection.
+    // 使用 127.0.0.1 而不是 localhost：Node.js WebSocketServer 绑定 localhost
+    // 时可能只监听 ::1（IPv6），而 WebView2 解析 localhost 可能得到 127.0.0.1
+    // （IPv4），导致 "WS error: unknown" 连接失败。Tauri CSP 已允许
+    // ws://127.0.0.1:*，因此固定使用 IPv4 回环地址。
     const port = optsLocalPort || 18789;
-    const targetUrl = `ws://localhost:${port}`;
+    const targetUrl = `ws://127.0.0.1:${port}`;
 
     let ws: WebSocket;
     try {
@@ -317,10 +315,33 @@ export function useGatewayConnection(
     // even though the daemon is now ready.
     reconnectAttemptsRef.current = 0;
     connect();
+
+    // 当窗口从后台切回前台时，如果当前是 offline / reconnecting 状态，
+    // 重置重试计数并立即触发重连。这解决了"达到 MAX_RECONNECT_ATTEMPTS
+    // 后永久 offline、用户切回窗口也不重试"的体验缺陷。
+    // 仅在 visible 且未连接时触发，避免无意义的连接风暴。
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (intentionalStopRef.current) return;
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+      // 已经达到 MAX_RECONNECT_ATTEMPTS 或处于 offline/reconnecting，重置并重试
+      reconnectAttemptsRef.current = 0;
+      intentionalStopRef.current = false;
+      clearReconnect();
+      if (wsRef.current) {
+        try { wsRef.current.close(); } catch {}
+        wsRef.current = null;
+      }
+      connect();
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
       intentionalStopRef.current = true;
       clearReconnect();
       clearPing();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (wsRef.current) {
         try { wsRef.current.close(); } catch {}
         wsRef.current = null;

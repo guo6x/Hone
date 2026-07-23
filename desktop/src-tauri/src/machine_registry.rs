@@ -80,6 +80,10 @@ struct RegistrySnapshot {
 // Registry
 // ---------------------------------------------------------------------------
 
+/// 持久化需要外部 Clone 出来在锁外做磁盘 I/O，避免 commands.rs 中
+/// `state.registry.lock()` 期间调用 `save()` 阻塞其他 registry 读操作
+/// （如 machines_list 高频调用）。
+#[derive(Clone)]
 pub struct MachineRegistry {
     machines: HashMap<String, MachineInfo>,
     stats: HashMap<String, MachineStats>,

@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
+use zeroize::Zeroizing;
 
 use crate::gateway_manager::{GatewayConfig, GatewayConnectionInfo, GatewayManager, GatewayStatus};
 use crate::machine_registry::{MachineInfo, MachineRegistry, MachineStatus};
@@ -336,6 +337,10 @@ pub async fn gateway_stop(state: State<'_, AppState>) -> Result<String, String> 
 pub async fn gateway_status(state: State<'_, AppState>) -> Result<GatewayStatus, String> {
     // Reap a crashed daemon before reporting status, otherwise the frontend
     // sees "Running" forever for a dead process and never recovers.
+    //
+    // check_alive() 内部用 try_wait（非阻塞），正常情况下持锁时间 <1ms。
+    // 即使在 gateway_start 的 block_in_place 期间偶有短暂等锁，也远优于
+    // try_lock 返回 Starting 导致 App.tsx 轮询把 daemonOnline 误置 false。
     let mut gw = state
         .gateway
         .lock()
@@ -372,13 +377,17 @@ pub async fn machines_list(state: State<'_, AppState>) -> Result<Vec<MachineInfo
 pub async fn machine_add(state: State<'_, AppState>, info: MachineInfo) -> Result<String, String> {
     log::info!("machine_add called, name={}", info.name);
 
-    let mut registry = state
-        .registry
-        .lock()
-        .map_err(|e| format!("Failed to acquire registry lock: {}", e))?;
-
-    let id = registry.register(info);
-    let _ = registry.save();
+    // 锁内只做内存修改 + clone，不在锁内做磁盘 I/O（save），
+    // 避免 machines_list 等读操作被阻塞。
+    let (id, registry_clone) = {
+        let mut registry = state
+            .registry
+            .lock()
+            .map_err(|e| format!("Failed to acquire registry lock: {}", e))?;
+        let id = registry.register(info);
+        (id, registry.clone())
+    };
+    let _ = registry_clone.save();
     Ok(id)
 }
 
@@ -386,15 +395,17 @@ pub async fn machine_add(state: State<'_, AppState>, info: MachineInfo) -> Resul
 pub async fn machine_remove(state: State<'_, AppState>, id: String) -> Result<(), String> {
     log::info!("machine_remove called, id={}", id);
 
-    let mut registry = state
-        .registry
-        .lock()
-        .map_err(|e| format!("Failed to acquire registry lock: {}", e))?;
-
-    registry
-        .unregister(&id)
-        .map_err(|e| format!("Failed to remove machine: {}", e))?;
-    let _ = registry.save();
+    let registry_clone = {
+        let mut registry = state
+            .registry
+            .lock()
+            .map_err(|e| format!("Failed to acquire registry lock: {}", e))?;
+        registry
+            .unregister(&id)
+            .map_err(|e| format!("Failed to remove machine: {}", e))?;
+        registry.clone()
+    };
+    let _ = registry_clone.save();
     Ok(())
 }
 
@@ -413,13 +424,15 @@ pub async fn machine_update_status(
         other => return Err(format!("Unknown status: {}", other)),
     };
 
-    let mut registry = state
-        .registry
-        .lock()
-        .map_err(|e| format!("Failed to acquire registry lock: {}", e))?;
-
-    registry.update_status(&id, machine_status);
-    let _ = registry.save();
+    let registry_clone = {
+        let mut registry = state
+            .registry
+            .lock()
+            .map_err(|e| format!("Failed to acquire registry lock: {}", e))?;
+        registry.update_status(&id, machine_status);
+        registry.clone()
+    };
+    let _ = registry_clone.save();
     Ok(())
 }
 
@@ -502,16 +515,64 @@ pub async fn ssh_disconnect(state: State<'_, AppState>) -> Result<(), String> {
 
 /// 检测破坏性命令，防止误操作或恶意前端代码执行。
 /// 返回 true 表示该命令应被拒绝。
+///
+/// 注意：黑名单本质上无法完全防护——攻击者可用 base64 编码、$IFS 分隔、
+/// 变量替换、引号、find -delete 等方式绕过。本函数只是第一道防线，
+/// 真正的防护靠 `requestUserConfirmation` 让用户在执行前确认。
+/// 已知绕过：base64 包装、env 变量、多空格、find / -delete、find / -exec rm 等。
 fn is_dangerous_command(cmd: &str) -> bool {
+    // 归一化：转小写 + 压缩连续空格，缓解"rm  -rf  /"之类多空格绕过
     let lower = cmd.to_lowercase();
-    lower.contains("rm -rf /")
-        || lower.contains("mkfs")
-        || lower.contains("shutdown")
-        || lower.contains("reboot")
-        || lower.contains(":(){:|:&};:")
-        || lower.contains("dd if=")
-        || lower.contains("> /dev/sda")
-        || lower.contains("chmod -R 777 /")
+    let normalized: String = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // 关键词黑名单（归一化后匹配）
+    const DANGER_TOKENS: &[&str] = &[
+        "rm -rf /",
+        "rm -rf /*",
+        "rm -rf ~",
+        "rm -rf $home",
+        "rm -rf $home/",
+        "mkfs",
+        "mkfs.ext",
+        "mkfs.ntfs",
+        "mkfs.vfat",
+        "shutdown",
+        "reboot",
+        "poweroff",
+        "halt",
+        ":(){:|:&};:",
+        "dd if=",
+        "dd of=/dev/sd",
+        "dd of=/dev/nvme",
+        "dd of=/dev/hd",
+        ">/dev/sda",
+        ">/dev/sdb",
+        ">/dev/nvme",
+        "chmod -r 777 /",
+        "chmod 777 /",
+        "chown -r",
+        "find / -delete",
+        "find / -exec rm",
+        "find / -name",
+        "shutdown /s",
+        "shutdown /r",
+        "format c:",
+        "format d:",
+        "diskpart",
+        "reg delete",
+        "reg add",
+        "takeown /f",
+        "icacls",
+        "del /f /s /q c:\\",
+        "rd /s /q c:\\",
+        "rmdir /s /q c:\\",
+    ];
+    for token in DANGER_TOKENS {
+        if normalized.contains(token) {
+            return true;
+        }
+    }
+    false
 }
 
 #[tauri::command]
@@ -548,24 +609,46 @@ pub async fn ssh_execute(state: State<'_, AppState>, command: String) -> Result<
             .lock()
             .map_err(|e| format!("Failed to acquire session lock: {}", e))?;
 
+        // 设置 30 秒超时：防止 tail -f / top -b / cat /dev/zero 等永不退出的
+        // 命令导致 read_to_string 永久阻塞，session 锁无法释放，后续所有
+        // ssh_execute / disconnect / Drop 全部死等。
+        session.set_timeout(30_000);
+
         let mut channel = session
             .channel_session()
-            .map_err(|e| format!("IO error: {}", e))?;
+            .map_err(|e| {
+                session.set_timeout(0);
+                format!("IO error: {}", e)
+            })?;
 
         channel
             .exec(&command)
-            .map_err(|e| format!("IO error: {}", e))?;
+            .map_err(|e| {
+                session.set_timeout(0);
+                format!("IO error: {}", e)
+            })?;
 
         let mut output = String::new();
         use std::io::Read;
-        channel
-            .read_to_string(&mut output)
-            .map_err(|e| format!("IO error: {}", e))?;
+        match channel.read_to_string(&mut output) {
+            Ok(_) => {}
+            Err(e) => {
+                // 超时或读错误：主动关闭 channel 释放服务端资源，重置 session 超时
+                let _ = channel.close();
+                let _ = channel.wait_close();
+                session.set_timeout(0);
+                return Err(format!("IO error: {}", e));
+            }
+        }
 
         channel
             .wait_close()
-            .map_err(|e| format!("IO error: {}", e))?;
+            .map_err(|e| {
+                session.set_timeout(0);
+                format!("IO error: {}", e)
+            })?;
 
+        session.set_timeout(0);
         Ok(output)
     })
     .await
@@ -677,8 +760,10 @@ pub async fn local_cli_instances_list() -> Result<Vec<LocalCliInstance>, String>
                 Err(_) => continue,
             };
             let pid = match parsed.get("pid").and_then(|v| v.as_u64()) {
-                Some(p) => p as u32,
-                None => continue,
+                // u32 范围外的 PID 在 Windows（PID 是 ULONG）和 Unix（pid_t 是 i32）都无效，
+                // 防止 u64 → u32 截断后意外匹配到真实进程。
+                Some(p) if p <= u32::MAX as u64 => p as u32,
+                Some(_) | None => continue,
             };
             let mode = parsed.get("mode").and_then(|v| v.as_str()).unwrap_or("interactive").to_string();
             let ppid = pid_parents.get(&pid).copied();
@@ -693,9 +778,21 @@ pub async fn local_cli_instances_list() -> Result<Vec<LocalCliInstance>, String>
                     if ppid == 0 {
                         // ppid 未知，跳过孤儿检测
                     } else if ppid != current_pid && !pid_parents.contains_key(&ppid) {
-                        log::info!("Cleaning orphan gateway process pid={} ppid={}", pid, ppid);
+                        // 验证进程映像名：marker 文件来自 ~/.hone/instances/*.json，
+                        // 同账号恶意进程可写入 {"pid":3306,"mode":"gateway"} 伪造 marker
+                        // 让桌面端 taskkill /T /F /PID 3306 杀任意进程。此处校验避免该攻击。
                         #[cfg(windows)]
                         {
+                            if !crate::gateway_manager::is_safe_gateway_process_windows(pid) {
+                                log::warn!(
+                                    "Marker file {:?} points to PID {} but process image is not node/hone, skipping kill",
+                                    path,
+                                    pid
+                                );
+                                let _ = std::fs::remove_file(&path);
+                                continue;
+                            }
+                            log::info!("Cleaning orphan gateway process pid={} ppid={}", pid, ppid);
                             use std::os::windows::process::CommandExt;
                             let _ = std::process::Command::new("taskkill")
                                 .args(["/T", "/F", "/PID", &pid.to_string()])
@@ -704,6 +801,16 @@ pub async fn local_cli_instances_list() -> Result<Vec<LocalCliInstance>, String>
                         }
                         #[cfg(not(windows))]
                         {
+                            if !crate::gateway_manager::is_safe_gateway_process_unix(pid) {
+                                log::warn!(
+                                    "Marker file {:?} points to PID {} but process is not node/hone, skipping kill",
+                                    path,
+                                    pid
+                                );
+                                let _ = std::fs::remove_file(&path);
+                                continue;
+                            }
+                            log::info!("Cleaning orphan gateway process pid={} ppid={}", pid, ppid);
                             let _ = std::process::Command::new("kill")
                                 .args(["-9", &pid.to_string()])
                                 .output();
@@ -821,8 +928,10 @@ pub struct LocalPairInput {
     #[serde(default)]
     pub host: String,
     pub port: u16,
+    /// 配对码使用 Zeroizing 包装：drop 时自动擦除内存，避免明文残留。
+    /// 6 位数字配对码短小，但仍是短暂敏感凭据，按需清零是最低成本的安全加固。
     #[serde(default)]
-    pub code: String,
+    pub code: Zeroizing<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -850,7 +959,20 @@ pub async fn pair_with_local_cli(input: LocalPairInput) -> Result<LocalPairResul
         return Err("请输入 CLI 主机地址".to_string());
     }
 
-    let url = format!("http://{}:{}/pair", input.host.trim(), input.port);
+    // 校验 host：拒绝含 @ / : / ? # 等特殊字符的输入，防止 host = "evil.com/steal?code="
+    // 之类注入把配对请求（含 code 和 clientName）发到 evil.com。
+    // 用 url::Url::parse 严格构造 URL，比字符串拼接更安全。
+    let host_trimmed = input.host.trim();
+    if host_trimmed.contains(|c: char| c == '@' || c == '/' || c == '?' || c == '#' || c == '\\') {
+        return Err("CLI 主机地址包含非法字符".to_string());
+    }
+    let url = format!("http://{}:{}/pair", host_trimmed, input.port);
+    // 二次校验：确保解析出来的 host 与输入一致（防止 %-encoding 等绕过）
+    let parsed_url = url::Url::parse(&url)
+        .map_err(|e| format!("URL 解析失败: {}", e))?;
+    if parsed_url.host_str() != Some(host_trimmed) {
+        return Err("CLI 主机地址解析异常".to_string());
+    }
     let client_name = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "Hone Desktop".to_string());
@@ -860,6 +982,9 @@ pub async fn pair_with_local_cli(input: LocalPairInput) -> Result<LocalPairResul
         .build()
         .map_err(|e| format!("HTTP 客户端错误: {}", e))?;
 
+    // 配对码 trim 后直接用于构建请求体；Zeroizing<String> 确保 input.code
+    // 在函数退出时被擦除。&str 在 json! 宏中被 copy 成 Value::String，
+    // 不会延长 input.code 的生命周期。
     let body = serde_json::json!({
         "code": input.code.trim(),
         "clientName": client_name,
@@ -875,14 +1000,16 @@ pub async fn pair_with_local_cli(input: LocalPairInput) -> Result<LocalPairResul
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
 
+    // 错误信息中不直接显示完整 text（防止响应意外包含配对码）。
+    // 截断到 80 字符足以辨识常见错误（如 "code expired" / "invalid code"）。
     let parsed: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("响应解析失败: {} — 收到: {}", e, text.chars().take(120).collect::<String>()))?;
+        .map_err(|e| format!("响应解析失败: {} — 收到: {}", e, text.chars().take(80).collect::<String>()))?;
 
     if !status.is_success() {
         let err = parsed
             .get("error")
             .and_then(|v| v.as_str())
-            .unwrap_or(&text)
+            .unwrap_or("unknown error")
             .to_string();
         return Ok(LocalPairResult {
             ok: false,
@@ -939,7 +1066,7 @@ pub async fn test_provider(input: TestProviderInput) -> Result<String, String> {
 
     let default_model = match input.provider.as_str() {
         "openai" => "gpt-4o-mini",
-        "deepseek" => "deepseek-chat",
+        "deepseek" => "deepseek-v4-pro",
         _ => "gpt-4o-mini",
     };
     let model = if input.model.is_empty() {
@@ -1076,11 +1203,70 @@ pub async fn mobile_pairing_rotate(
         .map_err(|e| format!("Failed to rotate mobile pairing: {}", e))
 }
 
+/// Sync the effective default provider profile into ~/.hone/cli-config.json so
+/// that standalone CLI sessions (including the workbench PTY) use the same API
+/// key and model as the Gateway daemon started by the desktop app.
+fn sync_cli_config(config: &GatewayConfig) -> Result<(), String> {
+    let home = dirs::home_dir().ok_or_else(|| "Cannot determine home directory".to_string())?;
+    let dir = home.join(".hone");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create ~/.hone: {}", e))?;
+    let path = dir.join("cli-config.json");
+
+    let mut effective = config.clone();
+    crate::gateway_manager::apply_default_provider_profile(&mut effective);
+
+    let mut updates = serde_json::Map::new();
+    if !effective.provider.is_empty() {
+        updates.insert("provider".to_string(), serde_json::Value::String(effective.provider.clone()));
+    }
+    if !effective.model.is_empty() {
+        let lower = effective.model.trim().to_ascii_lowercase();
+        let normalized_model = if lower == "deepseek-v4" || lower == "deepseek-chat" || lower == "deepseek-reasoner" {
+            "deepseek-v4-pro".to_string()
+        } else {
+            effective.model.clone()
+        };
+        updates.insert("model".to_string(), serde_json::Value::String(normalized_model));
+    }
+    match effective.provider.as_str() {
+        "openai" => {
+            if !effective.api_key.is_empty() {
+                updates.insert("openaiApiKey".to_string(), serde_json::Value::String(effective.api_key.clone()));
+            }
+            if !effective.base_url.is_empty() {
+                updates.insert("openaiBaseUrl".to_string(), serde_json::Value::String(effective.base_url.clone()));
+            }
+        }
+        _ => {
+            if !effective.api_key.is_empty() {
+                updates.insert("deepseekApiKey".to_string(), serde_json::Value::String(effective.api_key.clone()));
+            }
+            if !effective.base_url.is_empty() {
+                updates.insert("deepseekBaseUrl".to_string(), serde_json::Value::String(effective.base_url.clone()));
+            }
+        }
+    }
+
+    // Merge with existing file so we don't wipe unrelated CLI settings.
+    let mut merged: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    for (k, v) in updates {
+        merged.insert(k, v);
+    }
+
+    let body = serde_json::to_string_pretty(&merged).map_err(|e| format!("Failed to serialize cli-config: {}", e))?;
+    std::fs::write(&path, body).map_err(|e| format!("Failed to write cli-config: {}", e))?;
+    log::info!("Synced provider config to {}", path.display());
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn save_config(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-    config: GatewayConfig,
+    mut config: GatewayConfig,
     hone_path: String,
 ) -> Result<(), String> {
     log::info!("save_config called");
@@ -1106,6 +1292,18 @@ pub async fn save_config(
         .lock()
         .map_err(|e| format!("Failed to acquire gateway lock: {}", e))?;
 
+    // 如果 UI 传下来的 config 没有 API key，先尝试从凭据管理器补回。
+    // 否则 Settings autoSave 会传入空 api_key，导致 Gateway 调用 LLM 401。
+    let current_secret_id = gw.config().secret_id.clone();
+    if config.api_key.trim().is_empty() {
+        if let Ok(secrets) = crate::secret_store::load(&current_secret_id) {
+            if !secrets.api_key.is_empty() {
+                log::info!("save_config: restored api_key from credential store");
+                config.api_key = secrets.api_key;
+            }
+        }
+    }
+
     let node_path = get_node_path(&app);
     let effective_hone_path = state
         .hone_path
@@ -1113,8 +1311,15 @@ pub async fn save_config(
         .map_err(|e| format!("Failed to acquire hone_path lock: {}", e))?
         .clone()
         .unwrap_or(hone_path);
-    gw.apply_config(&node_path, config, &effective_hone_path)
-        .map_err(|e| format!("Failed to save config: {}", e))
+    gw.apply_config(&node_path, config.clone(), &effective_hone_path)
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+
+    // Keep the standalone CLI config in sync so workbench/one-shot CLI tasks
+    // use the same credentials as the gateway daemon.
+    if let Err(e) = sync_cli_config(&config) {
+        log::warn!("Failed to sync cli-config.json: {}", e);
+    }
+    Ok(())
 }
 
 // ── Schedule Commands ──
@@ -2026,6 +2231,30 @@ pub struct McpServerV2 {
 /// Sync MCP servers to claude_desktop_config.json (standard MCP format).
 #[tauri::command]
 pub async fn settings_sync_mcps_v2(mcps: Vec<McpServerV2>) -> Result<String, String> {
+    // 输入校验：限制 MCP 数量（防 DoS）、限制单字段长度（防 JSON 灌爆 / 文件名溢出）。
+    if mcps.len() > 64 {
+        return Err(format!("MCP 数量过多（{}），最多 64 个", mcps.len()));
+    }
+    for mcp in &mcps {
+        if mcp.id.len() > 128 || mcp.name.len() > 128 {
+            return Err("MCP id/name 长度超过 128 字符".to_string());
+        }
+        if let Some(cmd) = &mcp.command {
+            if cmd.len() > 4096 {
+                return Err(format!("MCP command 过长: {}", mcp.id));
+            }
+        }
+        if let Some(url) = &mcp.url {
+            if url.len() > 8192 {
+                return Err(format!("MCP url 过长: {}", mcp.id));
+            }
+            // URL 协议白名单：只允许 http/https，防止 file:// 等协议注入
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(format!("MCP url 必须是 http/https 协议: {}", mcp.id));
+            }
+        }
+    }
+
     let config_dir = if cfg!(target_os = "macos") {
         dirs::home_dir()
             .map(|h| h.join("Library").join("Application Support").join("Claude"))
@@ -2342,6 +2571,11 @@ pub async fn pty_open(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
+    // 前端 terminal 组件挂载时可能短暂传 cols=0/rows=0，此时不应拒绝打开 PTY，
+    // 因为组件随后会通过 resize 校正尺寸。clamp 到最小值 1 防止 portable-pty
+    // 或 libvterm 因零尺寸 panic/除零，同时避免前端因 pty_open 失败卡死。
+    let cols = cols.max(1);
+    let rows = rows.max(1);
     log::info!("pty_open id={} cwd={}", session_id, cwd);
 
     let hone_path = {
@@ -2362,6 +2596,21 @@ pub async fn pty_open(
         ("TERM".to_string(), "xterm-256color".to_string()),
     ];
     env.extend(crate::windows_proxy::env_vars());
+
+    // Inject the same provider env vars used by the Gateway daemon so the
+    // workbench CLI uses the current desktop settings instead of a stale
+    // ~/.hone/cli-config.json.
+    let provider_env = {
+        let gw = state
+            .gateway
+            .lock()
+            .map_err(|e| format!("Failed to acquire gateway lock: {}", e))?;
+        let mut cfg = gw.config().clone();
+        drop(gw);
+        crate::gateway_manager::apply_default_provider_profile(&mut cfg);
+        crate::gateway_manager::provider_env_vars(&cfg)
+    };
+    env.extend(provider_env);
 
     if let Some(git_bash) = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH") {
         if std::path::Path::new(&git_bash).is_file() {
@@ -2391,6 +2640,10 @@ pub async fn pty_resize(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
+    // 同 pty_open：前端可能短暂传零尺寸，不拒绝而是 clamp 到 1，
+    // 组件会在实际渲染后通过另一次 resize 传正确尺寸。
+    let cols = cols.max(1);
+    let rows = rows.max(1);
     state.pty.resize(&session_id, cols, rows)
 }
 

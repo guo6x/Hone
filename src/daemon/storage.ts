@@ -46,7 +46,13 @@ function getTokenPricePerMillion(): { input: number; output: number } {
 }
 
 function todayStr(): string {
-  return new Date().toISOString().slice(0, 10)
+  // 用本地日期而非 UTC，避免 UTC+8 凌晨 0-8 点时 toISOString 返回前一天。
+  // YYYY-MM-DD 格式按本地时区拼接，与用户感知的"今天"一致。
+  const d = new Date()
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
 }
 
 /** Record a single LLM call's token usage. Returns updated daily totals (for budget checks). */
@@ -199,15 +205,78 @@ function scheduleSave(): void {
     _saveTimer = null
     if (!_data) return
     try {
+      // Save 前清理过旧记录，避免文件无限增长。
+      // 注意：基于时间的清理比单纯 cap 更可控（防止低频使用时数据快速消失）。
+      pruneOldRecords(_data)
       // 原子写入：先写临时文件再 rename，防止崩溃时数据文件被截断/损坏
+      // mode 0o600：hone-data.json 含对话历史/持仓等敏感信息，限制为仅 owner 可读写
       const fp = getFilePath()
       const tmp = fp + '.tmp'
-      fs.writeFileSync(tmp, JSON.stringify(_data, null, 2), 'utf-8')
+      fs.writeFileSync(tmp, JSON.stringify(_data, null, 2), { encoding: 'utf-8', mode: 0o600 })
       fs.renameSync(tmp, fp)
+      // 文件大小监控：超过 5MB 时打印警告（数据量异常或清理逻辑失效）
+      try {
+        const stat = fs.statSync(fp)
+        if (stat.size > 5 * 1024 * 1024) {
+          console.warn(`[Storage] 数据文件较大: ${(stat.size / 1024 / 1024).toFixed(2)}MB，考虑手动清理或检查清理逻辑`)
+        }
+      } catch {}
     } catch (e: any) {
       console.error(`[Storage] Save failed: ${e.message}`)
     }
   }, 200)
+}
+
+/** 基于时间的清理：删除超过保留期的旧记录。
+ *  - messages: 保留 30 天
+ *  - schedule_runs: 保留 90 天
+ *  - tracked_item_observations: 保留 90 天
+ *  - agent_recommendations: 保留 180 天（用于长期 review 统计）
+ *  - usage_records: 保留 180 天（半年日数据）
+ *  对 tracked_items 不做时间清理（用户显式 close 才删除）。
+ */
+function pruneOldRecords(d: HoneData): void {
+  const now = Date.now()
+  const DAY = 24 * 60 * 60 * 1000
+  const cutoff30 = now - 30 * DAY
+  const cutoff90 = now - 90 * DAY
+  const cutoff180 = now - 180 * DAY
+
+  const beforeMsg = d.messages.length
+  const beforeRuns = d.schedule_runs.length
+  const beforeObs = d.tracked_item_observations.length
+  const beforeRecs = d.agent_recommendations.length
+  const beforeUsage = d.usage_records.length
+
+  if (d.messages.length > 0) {
+    d.messages = d.messages.filter(m => m.ts >= cutoff30)
+  }
+  if (d.schedule_runs.length > 0) {
+    d.schedule_runs = d.schedule_runs.filter(r => r.started_at >= cutoff90)
+  }
+  if (d.tracked_item_observations.length > 0) {
+    d.tracked_item_observations = d.tracked_item_observations.filter(o => o.ts >= cutoff90)
+  }
+  if (d.agent_recommendations.length > 0) {
+    d.agent_recommendations = d.agent_recommendations.filter(r => r.ts >= cutoff180)
+  }
+  if (d.usage_records.length > 0) {
+    d.usage_records = d.usage_records.filter(r => {
+      // usage_records 的 date 是 YYYY-MM-DD 字符串
+      const ts = Date.parse(r.date)
+      return Number.isFinite(ts) && ts >= cutoff180
+    })
+  }
+
+  // 仅在发生清理时打印（避免日志噪音）
+  const totalPruned = (beforeMsg - d.messages.length)
+    + (beforeRuns - d.schedule_runs.length)
+    + (beforeObs - d.tracked_item_observations.length)
+    + (beforeRecs - d.agent_recommendations.length)
+    + (beforeUsage - d.usage_records.length)
+  if (totalPruned > 0) {
+    console.log(`[Storage] 清理旧记录: messages -${beforeMsg - d.messages.length}, runs -${beforeRuns - d.schedule_runs.length}, obs -${beforeObs - d.tracked_item_observations.length}, recs -${beforeRecs - d.agent_recommendations.length}, usage -${beforeUsage - d.usage_records.length}`)
+  }
 }
 
 /** Flush pending writes immediately (used on shutdown). */
@@ -217,8 +286,12 @@ export function closeDb(): void {
     _saveTimer = null
   }
   if (_data) {
+    // 原子写入：先写 .tmp 再 rename，防止写入过程中崩溃导致数据库文件被截断
     try {
-      fs.writeFileSync(getFilePath(), JSON.stringify(_data, null, 2), 'utf-8')
+      const finalPath = getFilePath()
+      const tmpPath = finalPath + '.tmp'
+      fs.writeFileSync(tmpPath, JSON.stringify(_data, null, 2), { encoding: 'utf-8', mode: 0o600 })
+      fs.renameSync(tmpPath, finalPath)
     } catch {}
   }
   _data = null

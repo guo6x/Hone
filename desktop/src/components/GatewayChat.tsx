@@ -185,6 +185,20 @@ const GatewayChat: React.FC<Props> = ({
         case 'buddy_event':
           onBuddyEventRef.current?.((msg as any).event, (msg as any).payload);
           break;
+        case 'task_dispatched': {
+          const dispatchedTask = String((msg as any).task || '');
+          const label = dispatchedTask.length > 120 ? dispatchedTask.slice(0, 120) + '…' : dispatchedTask;
+          appendMessage({
+            id: nextId('g'),
+            from: 'gateway',
+            text: lang === 'zh'
+              ? `🔄 我去检查一下…${label ? '\n' + label : ''}`
+              : `🔄 Let me check…${label ? '\n' + label : ''}`,
+            time: now,
+          });
+          onBuddyEventRef.current?.('working', msg);
+          break;
+        }
         case 'task_started':
           onBuddyEventRef.current?.('working', msg);
           break;
@@ -382,7 +396,12 @@ const GatewayChat: React.FC<Props> = ({
     setChatSearch('');
     if (status !== 'online') return;
     const now = formatTime();
-    if (!activeSession) onCreateSession();
+    // onCreateSession 返回新会话 id（同步），无 activeSession 时必须先创建会话再 appendMessage。
+    // 旧代码丢弃返回值并在 null session 上 appendMessage，会导致 appendMessage 内部
+    // 再次自动创建会话，最终一条消息产生两个会话。
+    const sessionId = activeSession || onCreateSession();
+    // sessionId 已确认存在，可直接 append（appendMessage 会根据当前 activeSession 路由）
+    void sessionId;
     appendMessage({ id: nextId('u'), from: 'user', text: action, time: now });
     if (!sendChat(action)) {
       appendMessage({

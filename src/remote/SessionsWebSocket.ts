@@ -113,7 +113,16 @@ export class SessionsWebSocket {
     logForDebugging(`[SessionsWebSocket] Connecting to ${url}`)
 
     // Hone: use pairing code for auth, not OAuth headers
-    const pairingCode = this.getAccessToken() || 'hone-god-mode'
+    // 禁止硬编码默认凭据：空 token 直接拒绝连接，避免任何客户端都能用
+    // 众所周知的 'hone-god-mode' 凭据连接到 relay。
+    const pairingCode = this.getAccessToken() || ''
+    if (!pairingCode) {
+      const err = new Error('[SessionsWebSocket] No pairing code available; refusing to connect with empty credentials')
+      logForDebugging(err.message)
+      this.state = 'closed'
+      this.callbacks.onError?.(err)
+      return
+    }
     const headers = {
       'x-hone-client': 'cli',
     }

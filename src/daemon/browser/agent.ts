@@ -20,7 +20,7 @@ import type {
 } from './types.js'
 import * as playwright from './playwright-runner.js'
 import { validateUrl } from './playwright-runner.js'
-import { queryGUIModel, NoVisionModelError, type VisionModelConfig } from './gui-model.js'
+import { queryGUIModel, visionConfigFromEnv, NoVisionModelError, type VisionModelConfig } from './gui-model.js'
 import { extractPage } from './playwright-runner.js'
 import { buildFallbackPrompt, parseFallbackResponse } from './dom-fallback.js'
 import * as os from 'os'
@@ -57,7 +57,12 @@ export class BrowserAgent implements BrowserAgentInterface {
 
   async executeTask(task: GUITask): Promise<GUITaskResult> {
     const startTime = Date.now()
-    const maxSteps = task.maxSteps || this.config.maxSteps
+    // maxSteps 校验：
+    //   - 至少 1（避免 0 步直接退出无法执行任何动作）
+    //   - 至多 100（防止配置错误导致无限循环消耗 token）
+    //   - 优先级：task.maxSteps > config.maxSteps > 默认 15
+    const rawMaxSteps = task.maxSteps || this.config.maxSteps || 15
+    const maxSteps = Math.max(1, Math.min(100, rawMaxSteps))
     const taskTimeoutMs = (task.timeoutMs || this.config.defaultTimeout * 5) // default 5 mins
     const steps: GUIStep[] = []
 
@@ -82,6 +87,10 @@ export class BrowserAgent implements BrowserAgentInterface {
 
         const stepStart = Date.now()
 
+        // 截图前等待 200ms 让页面稳定（避免截到加载中的中间状态）。
+        // 不使用 waitForLoadState('networkidle') 因为很多 SPA 永远不会 idle。
+        await new Promise(resolve => setTimeout(resolve, 200))
+
         // Get current page state
         const screenshotBase64 = await playwright.screenshot(this.config, task.profileName)
         const page = await extractPage(this.config, task.profileName)
@@ -98,6 +107,19 @@ export class BrowserAgent implements BrowserAgentInterface {
             action = parseFallbackResponse(response)
           } else {
             throw err
+          }
+        }
+
+        // 防御性检查：action 必须有 action 字段且为已知类型，
+        // 否则视为 fail，避免无效 action 导致死循环
+        const validActions = ['click', 'type', 'scroll', 'navigate', 'wait', 'done', 'fail']
+        if (!action || !action.action || !validActions.includes(action.action)) {
+          return {
+            taskId: task.id,
+            status: 'failed',
+            steps,
+            error: `Invalid action returned by model: ${JSON.stringify(action).slice(0, 200)}`,
+            durationMs: Date.now() - startTime,
           }
         }
 
@@ -241,18 +263,12 @@ export function createBrowserAgent(
     defaultTimeout: parseInt(process.env.HONE_BROWSER_TIMEOUT || '30000', 10),
   }
 
-  // Vision model is configured via the same env vars as gui-model.ts (visionConfigFromEnv).
-  // Pull the API key explicitly so the model can authenticate with Kimi/GPT-4V/etc.
-  const visionConfig: VisionModelConfig | null = guiModelUrl
-    ? {
-        url: guiModelUrl,
-        model: config.guiModelName,
-        apiKey: process.env.HONE_GUI_MODEL_KEY
-          || process.env.MOONSHOT_API_KEY
-          || process.env.OPENAI_API_KEY
-          || undefined,
-      }
-    : null
+  // 复用 visionConfigFromEnv 统一 API Key 降级链，避免两处降级顺序不一致
+  // （原 agent.ts 缺少 ARK_API_KEY，导致用户配置 ARK_API_KEY 时无法生效）。
+  const visionConfig = visionConfigFromEnv()
+  if (visionConfig) {
+    console.error(`[BrowserAgent] vision model: ${visionConfig.model || '(unnamed)'} @ ${visionConfig.url}`)
+  }
 
   return new BrowserAgent(config, visionConfig, onConfirm, onStep, llmCall)
 }

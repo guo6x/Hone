@@ -10,10 +10,15 @@ const KIND_DEFAULTS: Record<string, string> = {
   custom: '',
 };
 
+// 模型列表 fallback：仅在用户未点「拉取模型」时作为快捷建议。
+// 这些模型名可能过时（厂商推出新版本后），所以：
+//   1. 列表保持精简（每类仅 1-2 个最常见的）
+//   2. 用户应优先点「拉取模型」获取真实可用列表
+//   3. 用户可手动输入任意模型名（datalist 不限制输入）
 const KIND_PRESETS: Record<string, string[]> = {
-  deepseek: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v3'],
-  openai: ['gpt-4o', 'gpt-4o-mini', 'o3-mini'],
-  openrouter: ['anthropic/claude-sonnet-4', 'openai/gpt-4o', 'google/gemini-2.5-pro'],
+  deepseek: ['deepseek-chat', 'deepseek-reasoner'],
+  openai: ['gpt-4o-mini'],
+  openrouter: ['anthropic/claude-sonnet-4'],
   custom: [],
 };
 
@@ -195,26 +200,27 @@ export function ProviderSection({ providers, onChange, lang }: Props) {
 
                 <div>
                   <label style={{ fontSize: 13, fontWeight: 500, marginBottom: 4, display: 'block' }}>{t('模型', 'Model', lang)}</label>
-                  {models.length > 0 ? (
-                    <div>
-                      <input list={`models-${p.id}`} style={inputStyle} value={p.model} onChange={e => update(p.id, { model: e.target.value })} placeholder={t('搜索或输入模型名', 'Search or type model name', lang)} />
-                      <datalist id={`models-${p.id}`}>
-                        {models.map(m => <option key={m} value={m} />)}
-                      </datalist>
-                      <div style={{ fontSize: 11, color: 'var(--hone-success)', marginTop: 4 }}>
-                        {t(`拉取成功，共 ${models.length} 个模型`, `Fetched ${models.length} models`, lang)}
-                      </div>
+                  {/* 统一用 datalist：合并 presets（fallback）+ fetchedModels（远端拉取）。
+                      用户始终能手动输入任意模型名，datalist 仅作为自动补全建议。 */}
+                  <input
+                    list={`models-${p.id}`}
+                    style={inputStyle}
+                    value={p.model}
+                    onChange={e => update(p.id, { model: e.target.value })}
+                    placeholder={presets[0] || t('搜索或输入模型名', 'Search or type model name', lang)}
+                  />
+                  <datalist id={`models-${p.id}`}>
+                    {presets.map(m => <option key={`preset-${m}`} value={m} />)}
+                    {models.map(m => <option key={`fetch-${m}`} value={m} />)}
+                  </datalist>
+                  {models.length > 0 && (
+                    <div style={{ fontSize: 11, color: 'var(--hone-success)', marginTop: 4 }}>
+                      {t(`已拉取 ${models.length} 个模型`, `Fetched ${models.length} models`, lang)}
                     </div>
-                  ) : (
-                    <div>
-                      <input style={inputStyle} value={p.model} onChange={e => update(p.id, { model: e.target.value })} placeholder={presets[0] || 'model-name'} />
-                      {presets.length > 0 && (
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
-                          {presets.map(m => (
-                            <button key={m} style={{ ...btnStyle, padding: '3px 10px', fontSize: 11, borderColor: p.model === m ? 'var(--hone-accent)' : 'var(--hone-border)' }} onClick={() => update(p.id, { model: m })}>{m}</button>
-                          ))}
-                        </div>
-                      )}
+                  )}
+                  {models.length === 0 && presets.length > 0 && (
+                    <div style={{ fontSize: 11, color: 'var(--hone-muted)', marginTop: 4 }}>
+                      {t('点击下方「拉取模型」获取完整列表', 'Click "Fetch Models" below for full list', lang)}
                     </div>
                   )}
                 </div>

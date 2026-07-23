@@ -80,13 +80,36 @@ function withoutCcdSpawnEnvKeys(
 }
 
 /**
+ * 当 Hone CLI 已经应用了自己的配置时，保护 Hone 管理的 provider/API key 变量
+ * 不被 Claude Code 的 settings.json env 覆盖。这些变量是 Hone 的权威配置来源，
+ * 必须由 ~/.hone/cli-config.json 和 HONE_SECRETS_FILE 控制。
+ */
+function withoutHoneManagedVars(
+  env: Record<string, string> | undefined,
+): Record<string, string> {
+  if (!env) return {}
+  if (!process.env.HONE_CONFIG_APPLIED) return env
+  const HONE_MANAGED_PREFIXES = ['HONE_', 'DEEPSEEK_', 'OPENAI_']
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(env)) {
+    if (HONE_MANAGED_PREFIXES.some(p => key.toUpperCase().startsWith(p))) {
+      continue
+    }
+    out[key] = value
+  }
+  return out
+}
+
+/**
  * Compose the strip filters applied to every settings-sourced env object.
  */
 function filterSettingsEnv(
   env: Record<string, string> | undefined,
 ): Record<string, string> {
   return withoutCcdSpawnEnvKeys(
-    withoutHostManagedProviderVars(withoutSSHTunnelVars(env)),
+    withoutHoneManagedVars(
+      withoutHostManagedProviderVars(withoutSSHTunnelVars(env)),
+    ),
   )
 }
 

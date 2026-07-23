@@ -1717,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "hone-desktop"
-version = "0.3.0-alpha"
+version = "2.1.90"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -1744,6 +1744,7 @@ dependencies = [
  "tungstenite",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -4065,6 +4066,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5367,6 +5374,7 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 
@@ -6528,6 +6536,9 @@ name = "zeroize"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "zerotrie"

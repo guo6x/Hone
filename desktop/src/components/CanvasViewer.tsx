@@ -3,6 +3,26 @@ import { type Lang, LANG } from '../i18n/translations';
 import { isTauri } from '../tauri/useTauri';
 import { canvasDocumentsList, type CanvasDocumentInfo } from '../tauri/api';
 
+/** 净化 LLM 产出的 HTML，防止 XSS 攻击（prompt injection → Tauri WebView RCE 链）。
+ *  - 移除 <script>、<iframe>、<object>、<embed> 等危险标签
+ *  - 移除所有 on* 事件处理器（onclick、onerror 等）
+ *  - 移除 javascript:、vbscript:、data:text/html 协议的 href/src
+ *  这是深度防御：理想情况下 LLM 不应产出恶意 HTML，但不能依赖这一点。 */
+function sanitizeHtml(input: string): string {
+  let s = input;
+  // 移除危险标签及其内容（script、style、iframe、object、embed、applet、meta、link、base、form）
+  s = s.replace(/<(script|style|iframe|object|embed|applet|meta|link|base|form)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '');
+  // 移除自闭合的危险标签（meta、link、base 单独出现）
+  s = s.replace(/<(meta|link|base)\b[^>]*\/?>/gi, '');
+  // 移除所有 on* 事件处理器：on\w+\s*=\s*"..." 或 on\w+\s*=\s*'...' 或 on\w+\s*=\s*[^\s>]+
+  s = s.replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+  // 净化 href/src 属性：移除 javascript:、vbscript:、data:text/html 等危险协议
+  s = s.replace(/(href|src)\s*=\s*(["']?)(javascript|vbscript|data:text\/html)[^"'\s>]*\2/gi, '$1="about:blank"$2');
+  // 移除 style 属性中的 expression()、url(javascript:) 等 IE 老式 XSS 向量
+  s = s.replace(/style\s*=\s*(["'])[^"']*expression\s*\([^"']*\)/gi, 'style=$1');
+  return s;
+}
+
 /** Minimal markdown → HTML converter. Handles headers, lists, code, bold, italic, links. */
 function mdToHtml(src: string): string {
   const escape = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -194,7 +214,11 @@ const CanvasViewer: React.FC<Props> = ({ lang, connection }) => {
 
   const html = useMemo(() => {
     if (!selected) return '';
-    if (selected.kind === 'html') return selected.text;
+    if (selected.kind === 'html') {
+      // 对 LLM 产出的 HTML 进行净化：移除 script、事件处理器、javascript: 协议，
+      // 防止 prompt injection 在 Tauri WebView 上下文执行任意代码（可调用 ssh_execute 等）。
+      return sanitizeHtml(selected.text);
+    }
     if (selected.kind === 'markdown') return mdToHtml(selected.text);
     return `<pre>${selected.text.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</pre>`;
   }, [selected]);

@@ -24,3 +24,37 @@ HONE_PRODUCT.md
 # Backup / build output
 *.backup
 *.vsix
+
+# Local runtime / debug data
+.hone/
+.trae/
+hone-pid.txt
+hone-ui-screenshot.png
+
+# NSIS installer artifacts (upload via GitHub Releases instead)
+*_安装包*.exe
+*_x64-setup.exe
+
+# npm lockfile (project uses bun)
+package-lock.json
+
+# Cloudflare Wrangler dev output
+relay/.wrangler/
+
+# One-off debug / scratch scripts
+temp-*/
+tmp-*/
+test-*.mjs
+test-*.cjs
+test-*.js
+test-*.ts
+test-*.ps1
+desktop/test-*
+e2e-test*
+e2e-verify*
+run-*.ps1
+desktop-chat-test.mjs
+fix-*.py
+read-*.py
+write-*.py
+monitor-*.ps1

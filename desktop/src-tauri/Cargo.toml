@@ -1,6 +1,6 @@
 [package]
 name = "hone-desktop"
-version = "0.3.0-alpha"
+version = "2.1.90"
 description = "Hone — 全功能 AI 编程控制台"
 authors = ["Hone Team"]
 edition = "2021"
@@ -25,8 +25,10 @@ tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 chrono = { version = "0.4", features = ["serde"] }
+# ssh2 0.9 是当前最新稳定主线（最新 patch 为 0.9.6，2026-06-30 发布），
+# 0.10+ 版本不存在。`"0.9"` 会自动拉取 0.9.x 的最新 patch。
 ssh2 = "0.9"
 mdns-sd = "0.11"
 tungstenite = "0.24"
@@ -39,6 +41,7 @@ dirs = "6"
 reqwest = { version = "0.12", features = ["json"] }
 portable-pty = "0.8"
 keyring = "4.1.4"
+zeroize = { version = "1", features = ["serde"] }
 
 [features]
 default = ["custom-protocol"]

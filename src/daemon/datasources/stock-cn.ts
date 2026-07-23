@@ -193,11 +193,13 @@ export async function fetchStockQuote(symbol: string): Promise<StockQuote | null
 
 /** Is the A-share market open right now? (Approximate: weekday + 9:30-11:30 / 13:00-15:00 CST) */
 export function isMarketOpen(now: Date = new Date()): boolean {
-  // Use Asia/Shanghai time
-  const tz = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }))
-  const day = tz.getDay()
+  // 直接用 UTC 偏移计算北京时间，避免 toLocaleString → new Date 的时区信息丢失。
+  // 北京时间 = UTC+8，无论用户本机时区如何都能得到正确的上海时间。
+  const beijingMs = now.getTime() + 8 * 3600_000
+  const beijing = new Date(beijingMs)
+  const day = beijing.getUTCDay()
   if (day === 0 || day === 6) return false // Sun, Sat
-  const mins = tz.getHours() * 60 + tz.getMinutes()
+  const mins = beijing.getUTCHours() * 60 + beijing.getUTCMinutes()
   return (mins >= 9 * 60 + 30 && mins <= 11 * 60 + 30) ||
          (mins >= 13 * 60 && mins <= 15 * 60)
 }

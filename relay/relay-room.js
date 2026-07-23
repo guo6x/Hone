@@ -1,6 +1,10 @@
 const TICK_INTERVAL_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 90_000;
-const GATEWAY_AWAY_GRACE_MS = 60_000;
+// Gateway 离线 grace period：原值 60_000 太短，短暂网络抖动（如重连 Wi-Fi、
+// ISP 抖动）就会导致 pending 消息被全部丢弃。延长到 5 分钟，覆盖大多数短暂断线场景。
+// 长时间离线（>5分钟）仍会清空，避免无限累积旧消息；同时 MAX_PENDING_MESSAGES=100
+// 会滚动淘汰最旧的消息，防止单端累积过多。
+const GATEWAY_AWAY_GRACE_MS = 5 * 60_000;
 const MAX_CLIENTS_PER_SESSION = 10;
 const UNAPPROVED_TIMEOUT_MS = 120_000;
 const MAX_REGISTER_ATTEMPTS = 10;
@@ -250,8 +254,16 @@ export class RelayRoom {
     await this.ctx.storage.delete(STORAGE_AWAY_SINCE);
     this._send(ws, { type: "registered", gatewayId, protocolVersion: 3 });
 
+    // 先持久化清空标记，再发送。若 _persistPending 抛错则不 splice，避免消息丢失。
+    // 失败时消息仍保留在 pendingMessages 中，下次 gateway 重连会再次尝试发送。
     const pending = this.pendingMessages.splice(0);
-    await this._persistPending();
+    try {
+      await this._persistPending();
+    } catch (err) {
+      // 持久化失败：把消息放回 pendingMessages，下次重连重试
+      this.pendingMessages.unshift(...pending);
+      throw err;
+    }
     for (const queued of pending) this._send(ws, queued);
 
     for (const [clientId, client] of this.clients) {
@@ -497,6 +509,8 @@ export class RelayRoom {
     const gatewayId = this._gatewayIdForSocket(ws);
     if (!gatewayId) return;
     const gateway = this.gateways.get(gatewayId);
+    // gateway 可能已被 _onTick 的超时清理删除（心跳与清理是不同事件，存在并发窗口）
+    if (!gateway) return;
     gateway.lastHeartbeat = Date.now();
     this._attach(ws, {
       version: 3,
@@ -528,6 +542,10 @@ export class RelayRoom {
     const gatewayId = this._gatewayIdForSocket(ws);
     if (gatewayId) {
       this.gateways.delete(gatewayId);
+      // gateway 路径也必须清理 registerAttempts：每次 gateway 重连都会
+      // 往 registerAttempts Map 插入新条目（key 是新 WebSocket 对象），
+      // 断开时不删会在 DO 生命周期内累积内存泄漏。
+      this.registerAttempts.delete(ws);
       if (this.gateways.size === 0) await this._onGatewayDisconnect();
       return;
     }

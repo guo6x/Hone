@@ -188,7 +188,7 @@ export default function App() {
     const defaults: SettingsData = {
       provider: 'deepseek',
       apiKey: '',
-      model: 'deepseek-chat',
+      model: 'deepseek-v4-pro',
       baseUrl: '',
       customProviderName: '',
       temperature: '',
@@ -233,11 +233,11 @@ export default function App() {
         relayUrl: tauriConfig.relay_url || GATEWAY_DEFAULTS.relayUrl,
         localPort: String(tauriConfig.local_port || GATEWAY_DEFAULTS.localPort),
         gatewayAutoStart: tauriConfig.auto_start ?? GATEWAY_DEFAULTS.gatewayAutoStart,
-        provider: tauriConfig.provider || 'deepseek',
-        apiKey: tauriConfig.api_key || '',
-        model: tauriConfig.model || 'deepseek-chat',
-        baseUrl: tauriConfig.base_url || '',
-        customProviderName: tauriConfig.custom_name || '',
+        provider: tauriConfig.provider || prev.provider || 'deepseek',
+        apiKey: tauriConfig.api_key || prev.apiKey || '',
+        model: tauriConfig.model || prev.model || 'deepseek-v4-pro',
+        baseUrl: tauriConfig.base_url || prev.baseUrl || '',
+        customProviderName: tauriConfig.custom_name || prev.customProviderName || '',
         temperature: tauriConfig.temperature ? String(tauriConfig.temperature) : '',
         maxTokens: tauriConfig.max_tokens ? String(tauriConfig.max_tokens) : '',
         browserEnabled: tauriConfig.browser_enabled ?? false,
@@ -835,13 +835,12 @@ export default function App() {
       case 'message':
         // Reaction to gateway messages — use functional update to avoid
         // depending on buddyState (keeps this callback's identity stable).
-        setBuddyState(prev => {
-          if (prev === 'idle') {
-            setTimeout(() => setBuddyState('idle'), 1000);
-            return 'thinking';
-          }
-          return prev;
-        });
+        // 注意：setState updater 必须是纯函数，不能在里面调用 setTimeout 副作用。
+        // 改为：updater 只负责状态转换，setTimeout 在 updater 外部调度。
+        setBuddyState(prev => prev === 'idle' ? 'thinking' : prev);
+        setTimeout(() => {
+          setBuddyState(prev => prev === 'thinking' ? 'idle' : prev);
+        }, 1000);
         break;
     }
   }, []);

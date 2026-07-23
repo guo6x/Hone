@@ -1,6 +1,6 @@
 {
   "name": "hone",
-  "version": "2.1.88",
+  "version": "2.1.90",
   "type": "module",
   "private": true,
   "engines": {

@@ -29,6 +29,25 @@ function normalize(code: string): string {
   return code.replace(/^(sh|sz)/i, '').padStart(6, '0')
 }
 
+/**
+ * 校验 A 股股票代码合法性。
+ * A 股代码规则：
+ *   - 沪市主板：600/601/603/605 开头
+ *   - 沪市科创板：688 开头
+ *   - 深市主板：000/001/002/003 开头
+ *   - 深市创业板：300/301 开头
+ *   - 北交所：8 开头（4/8 字头，部分 83/87/92 等）
+ * 简化为：6 位数字，且首位为 0/3/6/4/8 之一。
+ * 不合法的代码（如 999999、123456）会被拒绝，避免正则误匹配身份证号、订单号等。
+ */
+function isValidACode(code: string): boolean {
+  if (!/^\d{6}$/.test(code)) return false
+  const first = code[0]
+  // 排除明显不是股票代码的：首位 1/2/5/7/9 的 6 位数字（订单号、身份证段等）
+  if (!['0', '3', '4', '6', '8'].includes(first)) return false
+  return true
+}
+
 function fmtQuote(q: StockQuote): string {
   const sign = q.change >= 0 ? '+' : ''
   return `${q.name}(${q.symbol}) ${q.current.toFixed(2)} ${sign}${q.change.toFixed(2)} (${sign}${q.change_pct.toFixed(2)}%)`
@@ -44,6 +63,10 @@ export async function tryStockIntent(text: string): Promise<StockIntentResult | 
   const watchMatch = t.match(new RegExp(`^(?:帮我)?(?:盯[着住]?|关注|跟踪|监控)\\s*(?:股票|股|A股)?\\s*${CODE}(?:\\s*(.+))?$`, 'i'))
   if (watchMatch) {
     const code = normalize(watchMatch[1])
+    if (!isValidACode(code)) {
+      // 不合法的代码：不作为股票意图处理，让 LLM 接管
+      return null
+    }
     const userLabel = watchMatch[2]?.trim()
     const quote = await fetchStockQuote(code).catch(() => null)
     if (!quote) return { reply: `没拿到 ${code} 的行情，可能代码不对或网络问题。` }
@@ -67,20 +90,33 @@ export async function tryStockIntent(text: string): Promise<StockIntentResult | 
   }
 
   // 2. BUY: "我买了 1000 股 600519 @1500" / "买入 600519 1000股 1500"
-  const buyMatch = t.match(new RegExp(`(?:我)?(?:买[了入入])\\s*(?:了)?\\s*(\\d+)\\s*股?\\s*(?:.*?)${CODE}(?:.*?)(?:@|价|价格|股价|每股)?\\s*(\\d+(?:\\.\\d+)?)`, 'i'))
+  // 正则修复：
+  //   - 价格部分改为可选（用户可能只说"买了 1000 股 600519"未提成本价）
+  //   - `.*?` 改为 `[^\\d]*?`，禁止跨过其他数字贪婪匹配（避免误把订单号等当价格）
+  //   - 价格必须有明确标记（@/价/价格/股价/每股）或位于代码后空格分隔，避免误抓数字
+  const buyMatch = t.match(new RegExp(`(?:我)?(?:买[了入入])\\s*(?:了)?\\s*(\\d+)\\s*股?\\s*[^\\d]*?${CODE}(?:\\s*(?:@|价|价格|股价|每股)\\s*(\\d+(?:\\.\\d+)?))?`, 'i'))
   if (buyMatch) {
     const shares = Number(buyMatch[1])
     const code = normalize(buyMatch[2])
-    const avgCost = Number(buyMatch[3])
+    if (!isValidACode(code)) {
+      return null
+    }
+    // 价格可选：未提供时不计入均价（视为仅记录数量）
+    const hasPrice = typeof buyMatch[3] === 'string' && buyMatch[3].length > 0
+    const avgCost = hasPrice ? Number(buyMatch[3]) : 0
     const quote = await fetchStockQuote(code).catch(() => null)
     const existing = getTrackedItemByIdentifier('stock', code)
-    // If already a position, average in
+    // If already a position, average in (仅在有价格时才参与均价计算)
     let newShares = shares, newCost = avgCost
     if (existing?.user_position) {
       const p = existing.user_position as any
       if (p.shares) {
         const totalShares = p.shares + shares
-        newCost = ((p.shares * p.avg_cost) + (shares * avgCost)) / totalShares
+        if (hasPrice && p.avg_cost) {
+          newCost = ((p.shares * p.avg_cost) + (shares * avgCost)) / totalShares
+        } else {
+          newCost = p.avg_cost
+        }
         newShares = totalShares
       }
     }
@@ -98,14 +134,15 @@ export async function tryStockIntent(text: string): Promise<StockIntentResult | 
     if (quote) {
       recordObservation({
         item_id: id,
-        data: { ...quote, user_action: `bought ${shares} @ ${avgCost}` },
-        agent_assessment: `用户买入 ${shares} 股 @ ${avgCost}，当前价 ${quote.current}`,
+        data: { ...quote, user_action: `bought ${shares}${hasPrice ? ` @ ${avgCost}` : ''}` },
+        agent_assessment: `用户买入 ${shares} 股${hasPrice ? ` @ ${avgCost}` : ''}，当前价 ${quote.current}`,
       })
     }
     const item = getTrackedItemByIdentifier('stock', code)!
-    const pnl = quote ? ((quote.current - newCost) / newCost) * 100 : null
+    const pnl = (quote && newCost > 0) ? ((quote.current - newCost) / newCost) * 100 : null
     return {
-      reply: `记下了：${quote?.name || code} 持仓 ${newShares} 股，均价 ${newCost.toFixed(2)}` +
+      reply: `记下了：${quote?.name || code} 持仓 ${newShares} 股` +
+        (hasPrice ? `，均价 ${newCost.toFixed(2)}` : '') +
         (pnl !== null ? `（现价 ${quote!.current}，浮${pnl >= 0 ? '盈' : '亏'} ${pnl.toFixed(2)}%）` : '') +
         `\n我会继续监控，有动向告诉你。`,
       items_changed: [item],
@@ -114,9 +151,13 @@ export async function tryStockIntent(text: string): Promise<StockIntentResult | 
   }
 
   // 3. SELL: "卖了 600519" / "卖出 茅台 @1600"
-  const sellMatch = t.match(new RegExp(`(?:我)?(?:卖[了出])\\s*(?:了)?\\s*(?:.*?)${CODE}(?:.*?)(?:@|价|价格)?\\s*(\\d+(?:\\.\\d+)?)?`, 'i'))
+  // 正则修复：`.*?` 改为 `[^\\d]*?`；价格可选且必须有 @/价 标记
+  const sellMatch = t.match(new RegExp(`(?:我)?(?:卖[了出])\\s*(?:了)?\\s*[^\\d]*?${CODE}(?:\\s*(?:@|价|价格)\\s*(\\d+(?:\\.\\d+)?))?`, 'i'))
   if (sellMatch) {
     const code = normalize(sellMatch[1])
+    if (!isValidACode(code)) {
+      return null
+    }
     const sellPrice = sellMatch[2] ? Number(sellMatch[2]) : null
     const existing = getTrackedItemByIdentifier('stock', code)
     if (!existing) {
@@ -148,9 +189,13 @@ export async function tryStockIntent(text: string): Promise<StockIntentResult | 
   }
 
   // 4. QUOTE: "现在 600519 / 看 茅台 / 查一下 600519"
-  const quoteMatch = t.match(new RegExp(`^(?:现在|看一下|看看|查一下|查|盯一下|股价|行情)\\s*(?:.*?)${CODE}`, 'i'))
+  // 正则修复：`.*?` 改为 `[^\\d]*?` 防止跨过其他数字匹配到错误的代码
+  const quoteMatch = t.match(new RegExp(`^(?:现在|看一下|看看|查一下|查|盯一下|股价|行情)\\s*[^\\d]*?${CODE}`, 'i'))
   if (quoteMatch) {
     const code = normalize(quoteMatch[1])
+    if (!isValidACode(code)) {
+      return null
+    }
     const quote = await fetchStockQuote(code).catch(() => null)
     if (!quote) return { reply: `${code} 拿不到数据。` }
     const existing = getTrackedItemByIdentifier('stock', code)

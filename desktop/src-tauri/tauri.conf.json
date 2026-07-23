@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicedoc/tauri/refs/heads/dev/.schemas/config.schema.json",
   "productName": "Hone",
-  "version": "0.3.0-alpha",
+  "version": "2.1.90",
   "identifier": "dev.hone.desktop",
   "build": {
     "frontendDist": "../dist",

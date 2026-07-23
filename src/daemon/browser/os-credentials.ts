@@ -8,10 +8,8 @@
  * Falls back to AES-256-CBC with hostname-derived key when native tools
  * are unavailable.
  *
- * SECURITY NOTE (macOS): The `security` CLI requires the password via the -w
- * flag. We use spawnSync (no shell) to avoid shell injection, but the password
- * temporarily appears in the process' argv. Future: migrate to native Keychain
- * Services API via Node.js addon (napi-rs).
+ * SECURITY: macOS Keychain 使用 `security -i` 交互模式通过 stdin 传递密码，
+ * 避免密码出现在进程 argv 中（`ps aux` 不可见）。
  */
 import { spawnSync } from 'child_process'
 import { randomBytes, createCipheriv, createDecipheriv, scryptSync } from 'crypto'
@@ -51,6 +49,9 @@ function fallbackDecrypt(ciphertext: string): string {
 }
 
 // ── DPAPI (Windows) ──
+// 性能说明：每次加解密 spawn 新的 PowerShell 进程有开销（~100-200ms）。
+// 对于低频的凭据加解密（登录时）这是可接受的。如果未来需要高频调用，
+// 可考虑缓存 PowerShell 进程或使用 native addon 直接调用 DPAPI。
 
 function dpapiEncrypt(plaintext: string): string {
   const base64 = Buffer.from(plaintext, 'utf-8').toString('base64')
@@ -82,24 +83,24 @@ $unprotected = [System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $
 }
 
 // ── Keychain (macOS) ──
-// NOTE: security(1) -w flag requires the password as an argument.
-// We use spawnSync (not execSync) to avoid shell interpretation.
-// The password briefly lives in argv of a short-lived process.
+// 使用 `security -i` 交互模式通过 stdin 传递命令，密码不在进程 argv 中。
 
 function keychainEncrypt(plaintext: string): string {
   const id = `hone_cred_${Date.now()}`
-  const result = spawnSync('security', [
-    'add-generic-password',
-    '-a', 'hone',
-    '-s', id,
-    '-w', plaintext,
-    '-U',
-  ], { encoding: 'utf-8' })
+  // 转义密码中的特殊字符（双引号和反斜杠）
+  const escapedPassword = plaintext.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  // 使用 -i 模式通过 stdin 传递命令，密码不在 argv 中
+  const result = spawnSync('security', ['-i'], {
+    encoding: 'utf-8',
+    input: `add-generic-password -a hone -s ${id} -w "${escapedPassword}" -U\nquit\n`,
+  })
   if (result.error) throw result.error
+  if (result.status !== 0) throw new Error(`security add failed: ${result.stderr.trim()}`)
   return id
 }
 
 function keychainDecrypt(ciphertext: string): string {
+  // find-generic-password -w 输出密码到 stdout，密码不在 argv 中（只有 service name 在 argv）
   const result = spawnSync('security', [
     'find-generic-password',
     '-a', 'hone',

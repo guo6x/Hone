@@ -26,7 +26,7 @@ import { fetchStockQuotes } from './datasources/stock-cn.js'
 import { tryAutoExecute, listBrokerAdapters } from './brokers/adapter.js'
 import { getWebSocketProxyAgent, getWebSocketProxyUrl } from '../utils/proxy.js'
 import { getWebSocketTLSOptions } from '../utils/mtls.js'
-import { writeFile as fsWriteFile, mkdir as fsMkdir, readFile as fsReadFile } from 'fs/promises'
+import { writeFile as fsWriteFile, mkdir as fsMkdir, readFile as fsReadFile, rename as fsRename } from 'fs/promises'
 import { join as pathJoin } from 'path'
 
 const HEARTBEAT_INTERVAL_MS = 30_000
@@ -59,6 +59,8 @@ export interface GatewayState {
     description: string
     clientId?: string
     resolve: (approved: boolean) => void
+    /** 超时定时器引用：用户响应后立即 clearTimeout 清理，避免 120s 内残留 */
+    timer?: ReturnType<typeof setTimeout>
   }>
   pendingPairings: Map<string, { clientId: string; code: string; resolve: (approved: boolean) => void }>
   reconnectAttempts: number
@@ -83,7 +85,7 @@ export interface GatewayState {
   /** Originating device for an in-flight browser task, used for scoped prompts/events. */
   browserTaskOwners: Map<string, string | undefined>
   /** In-flight image uploads from mobile clients, keyed by imageId. */
-  imageChunks: Map<string, { chunks: (string | null)[]; received: number; total: number }>
+  imageChunks: Map<string, { chunks: (string | null)[]; received: number; total: number; createdAt: number }>
 }
 
 interface ClientInfo {
@@ -138,24 +140,77 @@ function isAllowedLocalOrigin(origin: string | undefined): boolean {
 }
 
 // Audit logging: write activity events to ~/.hone/logs/YYYY-MM-DD.json
-async function logActivity(type: ActivityLogEntry['type'], detail: string, extra?: { project?: string; duration?: number }): Promise<void> {
+// 内存缓存当日 activity log，避免每次 logActivity 都全量读写文件。
+// 跨日时缓存会自动失效（检测到日期变化时重新加载新一天文件）。
+// 注意：daemon 通常长时间运行，跨天时需要切换到新日志文件。
+let _activityLogCache: { date: string; entries: ActivityLogEntry[]; dirty: boolean } | null = null
+let _activityLogSaveTimer: ReturnType<typeof setTimeout> | null = null
+
+async function loadActivityLogForToday(): Promise<{ date: string; entries: ActivityLogEntry[]; logFile: string }> {
+  const home = os.homedir()
+  const logDir = pathJoin(home, '.hone', 'logs')
+  await fsMkdir(logDir, { recursive: true })
+  const today = new Date().toISOString().slice(0, 10)
+  const logFile = pathJoin(logDir, `${today}.json`)
+
+  // 缓存命中：同一天直接返回
+  if (_activityLogCache && _activityLogCache.date === today) {
+    return { date: today, entries: _activityLogCache.entries, logFile }
+  }
+
+  // 跨天或首次加载：先把旧的脏数据刷盘（如有），再加载新一天
+  await flushActivityLog()
+
+  let entries: ActivityLogEntry[] = []
+  try {
+    entries = JSON.parse(await fsReadFile(logFile, 'utf-8'))
+  } catch {}
+
+  _activityLogCache = { date: today, entries, dirty: false }
+  return { date: today, entries, logFile }
+}
+
+async function flushActivityLog(): Promise<void> {
+  if (_activityLogSaveTimer) {
+    clearTimeout(_activityLogSaveTimer)
+    _activityLogSaveTimer = null
+  }
+  if (!_activityLogCache || !_activityLogCache.dirty) return
   try {
     const home = os.homedir()
     const logDir = pathJoin(home, '.hone', 'logs')
-    await fsMkdir(logDir, { recursive: true })
+    const logFile = pathJoin(logDir, `${_activityLogCache.date}.json`)
+    // 原子写入：tmp + rename，防止崩溃时日志文件被截断
+    const tmp = `${logFile}.tmp`
+    await fsWriteFile(tmp, JSON.stringify(_activityLogCache.entries))
+    await fsRename(tmp, logFile)
+    _activityLogCache.dirty = false
+  } catch {}
+}
 
-    const today = new Date().toISOString().slice(0, 10)
-    const logFile = pathJoin(logDir, `${today}.json`)
+function scheduleActivityLogFlush(): void {
+  if (_activityLogSaveTimer) clearTimeout(_activityLogSaveTimer)
+  // 200ms debounce：合并连续的 log 调用，避免每次都触发文件 IO
+  _activityLogSaveTimer = setTimeout(() => {
+    _activityLogSaveTimer = null
+    void flushActivityLog()
+  }, 200)
+}
 
-    let entries: ActivityLogEntry[] = []
-    try {
-      entries = JSON.parse(await fsReadFile(logFile, 'utf-8'))
-    } catch {}
-
+async function logActivity(type: ActivityLogEntry['type'], detail: string, extra?: { project?: string; duration?: number }): Promise<void> {
+  try {
+    const { entries, logFile } = await loadActivityLogForToday()
     entries.push({ ts: Date.now(), type, detail, ...extra })
     // 上限 500 条/天，防止日志文件无限增长
-    if (entries.length > 500) entries = entries.slice(-500)
-    await fsWriteFile(logFile, JSON.stringify(entries))
+    if (entries.length > 500) {
+      // 直接 splice 原地修改，避免创建新数组
+      entries.splice(0, entries.length - 500)
+    }
+    if (_activityLogCache) _activityLogCache.dirty = true
+    // 触发 debounced flush；logFile 已在缓存中，不需要再次传递
+    scheduleActivityLogFlush()
+    // 引用 logFile 避免未使用警告（实际路径在缓存中）
+    void logFile
   } catch {}
 }
 
@@ -205,6 +260,10 @@ function sendToClient(state: GatewayState, clientId: string | undefined, message
   const targeted = { ...message, target: 'client', clientId }
   if (state.ws && state.ws.readyState === 1) { // 1 = OPEN
     sendJSON(state.ws, targeted)
+  }
+  // 桌面端通过本地 WebSocket 连接，不经过 relay。带 clientId 的任务事件也必须送达本地客户端。
+  for (const localClient of state.localClients) {
+    if (localClient.readyState === 1) sendJSON(localClient, targeted)
   }
 }
 
@@ -366,7 +425,16 @@ async function executeTaskJob(state: GatewayState, job: TaskJob): Promise<TaskRu
       }
       const timeout = setTimeout(() => {
         running.timedOut = true
+        // 先发 SIGTERM 优雅终止；5 秒后若进程仍在则 SIGKILL 强杀，
+        // 避免子进程忽略 SIGTERM 导致僵尸进程持续占用资源。
         child.kill('SIGTERM')
+        const killTimer = setTimeout(() => {
+          if (!child.killed) {
+            try { child.kill('SIGKILL') } catch {}
+          }
+        }, 5_000)
+        killTimer.unref()
+        child.once('close', () => clearTimeout(killTimer))
       }, TASK_TIMEOUT_MS)
 
       child.stdout?.on('data', chunk => append(chunk, 'stdout'))
@@ -412,13 +480,6 @@ async function requestUserConfirmation(
   clientId?: string,
 ): Promise<boolean> {
   return new Promise((resolve) => {
-    state.pendingConfirmations.set(confirmId, { description, clientId, resolve })
-    emitTask(state, clientId, {
-      type: 'confirmation_required',
-      confirmId,
-      description,
-      ts: new Date().toISOString(),
-    })
     // 120 秒超时自动拒绝；定时器追踪到 state 以便 stopGateway 清理
     const timer = setTimeout(() => {
       state.confirmationTimers.delete(timer)
@@ -428,6 +489,13 @@ async function requestUserConfirmation(
       }
     }, 120_000)
     state.confirmationTimers.add(timer)
+    state.pendingConfirmations.set(confirmId, { description, clientId, resolve, timer })
+    emitTask(state, clientId, {
+      type: 'confirmation_required',
+      confirmId,
+      description,
+      ts: new Date().toISOString(),
+    })
   })
 }
 
@@ -492,13 +560,6 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
   const onConfirm: ConfirmCallback = async (taskId, description) => {
     return new Promise((resolve) => {
       const clientId = state.browserTaskOwners.get(taskId)
-      state.pendingConfirmations.set(taskId, { description, clientId, resolve })
-      emitTask(state, clientId, {
-        type: 'browser_confirm_required',
-        taskId,
-        description,
-        ts: new Date().toISOString(),
-      })
       const timer = setTimeout(() => {
         state.confirmationTimers.delete(timer)
         if (state.pendingConfirmations.has(taskId)) {
@@ -507,6 +568,13 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
         }
       }, 60_000)
       state.confirmationTimers.add(timer)
+      state.pendingConfirmations.set(taskId, { description, clientId, resolve, timer })
+      emitTask(state, clientId, {
+        type: 'browser_confirm_required',
+        taskId,
+        description,
+        ts: new Date().toISOString(),
+      })
     })
   }
   const onStep: StepCallback = (taskId, step) => {
@@ -530,7 +598,7 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
     // of user-configured HONE_TEMPERATURE — but respects HONE_MAX_TOKENS upper bound.
     const envMax = Number(process.env.HONE_MAX_TOKENS)
     const resp = await provider.createMessage({
-      model: process.env.HONE_MODEL || 'deepseek-chat',
+      model: process.env.HONE_MODEL || 'deepseek-v4-pro',
       messages: [{ role: 'user', content: prompt }],
       maxTokens: Number.isFinite(envMax) && envMax > 0 ? Math.min(envMax, 512) : 512,
       temperature: 0.1,
@@ -809,7 +877,10 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
     if (!state.running) return
     runPatternCheck()
     state.patternTimer = setInterval(runPatternCheck, PATTERN_CHECK_MS)
+    // unref 防止 timer 阻止 Node.js 优雅退出（stopGateway 后即使忘 clear 也不会卡住进程）
+    state.patternTimer.unref()
   }, 5 * 60_000)
+  state.patternInitTimer.unref()
 
   // 记忆整理：每 24 小时运行一次，合并相似记忆、清理过期记忆
   try {
@@ -823,6 +894,7 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
         log(config, `Memory consolidation error: ${err}`)
       }
     }, 24 * 60 * 60_000) // 24 hours
+    state.memoryConsolidateTimer.unref()
   } catch (err) {
     log(config, `Memory consolidation init error: ${err}`)
   }
@@ -877,6 +949,7 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
 
       // Reuse patternTimer? No — use its own; piggyback on state for cleanup.
       state.pairingPollTimer = setInterval(tick, PAIRING_POLL_MS)
+      state.pairingPollTimer.unref()
     } catch (err) {
       log(config, `Pairing poll init error: ${err}`)
     }
@@ -894,13 +967,19 @@ export async function startGateway(config: GatewayConfig): Promise<GatewayState>
   const localAuthToken = config.localAuthToken
   try {
     const { WebSocketServer } = await import('ws')
+    // 显式绑定到 127.0.0.1。WebView2 中 `localhost` 可能解析为 ::1（IPv6）
+    // 或 127.0.0.1（IPv4），而 Node.js 的 WebSocketServer 默认只监听解析到的
+    // 其中一个地址，导致另一端解析到不同地址时连接超时（WS error: unknown）。
+    // Tauri CSP 已同时允许 ws://localhost:* 和 ws://127.0.0.1:*，所以桌面端
+    // 统一使用 ws://127.0.0.1:PORT，确保两端落在同一地址。
+    const localHost = process.env.HONE_GATEWAY_HOST || '127.0.0.1'
     const wss = new WebSocketServer({
       port: localPort,
-      host: '127.0.0.1',
+      host: localHost,
       maxPayload: MAX_GATEWAY_MESSAGE_BYTES,
     })
     state.localServer = wss
-    console.error(`[Gateway] 本地 WS 服务监听 127.0.0.1:${localPort}`)
+    console.error(`[Gateway] 本地 WS 服务监听 ${localHost}:${localPort}`)
     wss.on('connection', (ws: WebSocket, request: { headers?: Record<string, string | string[] | undefined> }) => {
       const originValue = request.headers?.origin
       const origin = Array.isArray(originValue) ? originValue[0] : originValue
@@ -1022,7 +1101,17 @@ async function connectToRelay(state: GatewayState, tools: any[]): Promise<void> 
           gatewayId: config.machineId,
           ts: new Date().toISOString(),
         })
+        // 清理超时未完成的 imageChunks（30 秒 TTL），防止恶意客户端只发 chunk
+        // 不发 complete 导致内存无限增长
+        const now = Date.now()
+        for (const [id, chunk] of state.imageChunks) {
+          if (now - chunk.createdAt > 30_000) {
+            state.imageChunks.delete(id)
+          }
+        }
       }, HEARTBEAT_INTERVAL_MS)
+      // unref：heartbeat 不应阻止进程退出；WebSocket 断开后进程应能优雅退出
+      state.heartbeatTimer.unref()
 
       console.error(`[Gateway] ✅ 已连接到中继`)
     }
@@ -1108,9 +1197,10 @@ async function handleMessage(
       // not require a hidden CLI command. Other requests still use the
       // explicit approval path unless God Mode is enabled.
       const godMode = String(process.env.HONE_GOD_MODE || '').toLowerCase()
+      const godModeEnabled = godMode === '1' || godMode === 'true' || godMode === 'yes'
       const qrChallengeApproved = typeof msg.pairingId === 'string'
         && msg.pairingId === config.pairingId
-      const autoApprove = qrChallengeApproved || godMode === '1' || godMode === 'true' || godMode === 'yes'
+      const autoApprove = qrChallengeApproved || godModeEnabled
       if (autoApprove) {
         sendJSON(state.ws!, {
           type: 'pairing_response',
@@ -1118,9 +1208,26 @@ async function handleMessage(
           approved: true,
         })
         log(config, `Approved pairing: ${clientId} (${qrChallengeApproved ? 'QR challenge' : 'God Mode'})`)
+        // God Mode 自动批准时广播显著警告，让所有连接的客户端知道
+        if (godModeEnabled && !qrChallengeApproved) {
+          console.error(`[Gateway] ⚠️⚠️⚠️ GOD MODE 自动批准配对: ${clientId} ⚠️⚠️⚠️`)
+          console.error(`[Gateway] God Mode 是全局信任开关，任何设备都能通过 relay 连接到本机。`)
+          console.error(`[Gateway] 调试完成后请立即关闭：unset HONE_GOD_MODE 或设为 0`)
+          try {
+            broadcast(state, {
+              type: 'god_mode_warning',
+              message: `God Mode 自动批准了来自 ${clientId} 的配对请求。请在调试完成后关闭 God Mode。`,
+              ts: new Date().toISOString(),
+            })
+          } catch {}
+        }
       } else {
-        log(config, `Pairing request from ${clientId}, code: ${msg.pairingCode}`)
-        console.error(`[Gateway] ⚠️ 新设备配对请求: ${clientId} | 码: ${msg.pairingCode}`)
+        // 安全：日志中只输出配对码的短 hash，不泄露完整凭据
+        const codeHash = msg.pairingCode
+          ? String(msg.pairingCode).slice(0, 2) + '****' + String(msg.pairingCode).slice(-2)
+          : '(none)'
+        log(config, `Pairing request from ${clientId}, code: ${codeHash}`)
+        console.error(`[Gateway] ⚠️ 新设备配对请求: ${clientId} | 码: ${codeHash}`)
         console.error(`[Gateway] 输入 hone gateway approve ${clientId} 批准`)
         // Persist a pending marker so /gateway pairings can list it
         try {
@@ -1129,6 +1236,7 @@ async function handleMessage(
           const dataDir = process.env.HONE_DATA_DIR || join(os.homedir(), '.hone')
           const pairDir = join(dataDir, 'pairings')
           await mkdir(pairDir, { recursive: true })
+          // mode 0o600：仅所有者可读写，防止其他用户读取配对凭据
           await writeFile(
             join(pairDir, `${clientId}.pending.json`),
             JSON.stringify({
@@ -1136,6 +1244,7 @@ async function handleMessage(
               pairingCode: msg.pairingCode,
               ts: new Date().toISOString(),
             }),
+            { mode: 0o600 },
           )
         } catch (err) {
           log(config, `Failed to write pending pairing: ${err}`)
@@ -1204,7 +1313,25 @@ async function handleMessage(
 
       try {
         broadcastBuddyEvent(state, 'thinking', '正在思考意图...')
-        const intent = await gatewayLLM(text, gatewayProviderTools)
+        // thinking 超时保护：LLM 调用卡住（网络问题、服务无响应）时，
+        // 客户端会一直显示 'thinking' 状态。这里用 Promise.race 强制
+        // 90s 超时，超时后广播错误并恢复 idle 状态，避免 UI 永久卡死。
+        const THINKING_TIMEOUT_MS = 90_000
+        let thinkingTimedOut = false
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          setTimeout(() => {
+            thinkingTimedOut = true
+            reject(new Error('LLM 响应超时（90s）— 请检查网络或模型服务可用性'))
+          }, THINKING_TIMEOUT_MS)
+        })
+        const intent = await Promise.race([
+          gatewayLLM(text, gatewayProviderTools),
+          timeoutPromise,
+        ])
+        if (thinkingTimedOut) {
+          // 超时分支已被 reject 走 catch，这里不会执行；保留作为类型守卫
+          break
+        }
 
         // 记录 token 用量并检查预算
         if (intent.usage) {
@@ -1283,6 +1410,8 @@ async function handleMessage(
               requireConfirmation: msg.from === 'client',
             })
             const result = await gatewayCtx.dispatchTask(intent.task || text)
+            // 任务完成后恢复 idle 状态，否则 buddy 会一直显示 working
+            broadcastBuddyEvent(state, 'idle')
             recordMessage({
               ts: Date.now(),
               direction: 'out',
@@ -1296,7 +1425,7 @@ async function handleMessage(
             // 如果 LLM 返回了结构化日程数据，真正创建日程
             if (intent.scheduleData) {
               const sd = intent.scheduleData
-              const id = `sched_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+              const id = `sched_${randomUUID()}`
               const scheduleEntry: ScheduleEntry = {
                 id,
                 text: sd.text,
@@ -1455,7 +1584,7 @@ async function handleMessage(
           break
         }
       }
-      const id = `sched_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+      const id = `sched_${randomUUID()}`
       const entry: import('./tools.js').ScheduleEntry = {
         id,
         text: String(payload.text || 'Untitled').slice(0, 500),
@@ -1699,6 +1828,11 @@ async function handleMessage(
       const clientId = typeof msg.clientId === 'string' ? msg.clientId : undefined
       if (pending && (!pending.clientId || pending.clientId === clientId)) {
         state.pendingConfirmations.delete(msg.taskId)
+        // 用户响应后立即清理超时定时器，避免 60s 内残留
+        if (pending.timer) {
+          clearTimeout(pending.timer)
+          state.confirmationTimers.delete(pending.timer)
+        }
         pending.resolve(!!msg.approved)
         log(config, `Browser confirm: ${msg.taskId} approved=${msg.approved}`)
       }
@@ -1711,6 +1845,11 @@ async function handleMessage(
       const clientId = typeof msg.clientId === 'string' ? msg.clientId : undefined
       if (pending && (!pending.clientId || pending.clientId === clientId)) {
         state.pendingConfirmations.delete(msg.confirmId)
+        // 用户响应后立即清理超时定时器，避免 120s 内残留
+        if (pending.timer) {
+          clearTimeout(pending.timer)
+          state.confirmationTimers.delete(pending.timer)
+        }
         pending.resolve(!!msg.approved)
         log(config, `Confirmation response: ${msg.confirmId} approved=${msg.approved}`)
       }
@@ -1730,13 +1869,21 @@ async function handleMessage(
     case 'image_chunk': {
       const { imageId, index, total, data } = msg.payload || msg
       if (!imageId || typeof index !== 'number' || typeof total !== 'number' || typeof data !== 'string') break
+      // 上限检查：防止恶意客户端通过超大 total 触发 OOM（1000 分片足够单张图片）
+      if (total <= 0 || total > 1000 || index < 0 || index >= total) break
+      // 单 chunk 大小限制：256KB base64 ≈ 192KB 实际数据，足够单张高清图分片
+      if (data.length > 256 * 1024) break
+      // 并发 imageId 数量上限：防止恶意客户端发 1000 个不同 imageId 各 1 chunk 撑爆内存
+      if (state.imageChunks.size >= 16 && !state.imageChunks.has(imageId)) break
+      // imageId 白名单：与 image_complete 一致，防止路径穿越
+      if (!/^[a-zA-Z0-9_-]{1,64}$/.test(imageId)) break
 
       let chunkData = state.imageChunks.get(imageId)
       if (!chunkData) {
-        chunkData = { chunks: new Array(total).fill(null), received: 0, total }
+        chunkData = { chunks: new Array(total).fill(null), received: 0, total, createdAt: Date.now() }
         state.imageChunks.set(imageId, chunkData)
       }
-      if (index < 0 || index >= total || chunkData.chunks[index]) break
+      if (chunkData.chunks[index]) break
 
       chunkData.chunks[index] = data
       chunkData.received++
@@ -1745,7 +1892,9 @@ async function handleMessage(
 
     case 'image_complete': {
       const imageId = typeof msg.imageId === 'string' ? msg.imageId : (msg.payload?.imageId)
-      if (!imageId) break
+      // 白名单校验：与 clientId 一致，防止 imageId = "../../../home/user/.bashrc"
+      // 等路径穿越攻击覆盖任意文件（后缀固定 .jpg 但仍可覆盖同名 jpg 资源）
+      if (!imageId || !/^[a-zA-Z0-9_-]{1,64}$/.test(imageId)) break
 
       const chunkData = state.imageChunks.get(imageId)
       if (!chunkData || chunkData.received !== chunkData.total) {
@@ -1855,5 +2004,8 @@ export async function stopGateway(state: GatewayState): Promise<void> {
   }
   // Close the SQLite database to checkpoint WAL and release file handles.
   closeDb()
+  // Flush activity log cache to disk before exit (otherwise last 200ms of
+  // log entries would be lost since debounced save hasn't fired yet).
+  await flushActivityLog()
   console.error(`[Gateway] Hone 已停止`)
 }

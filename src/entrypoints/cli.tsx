@@ -504,7 +504,9 @@ async function main(): Promise<void> {
       ? parseInt(portArg.slice('--port='.length), 10)
       : parseInt(process.env.HONE_PAIR_PORT || '18789', 10)
 
-    const code = String(Math.floor(100000 + Math.random() * 900000))
+    // 配对码使用 crypto.randomInt 生成，避免 Math.random() 的可预测性。
+    // 6 位数字（100000-999999），熵约 20 bit，配合 relay 端的尝试限流已足够防爆破。
+    const code = String(crypto.randomInt(100000, 1000000))
     const machineName = process.env.COMPUTERNAME || os.hostname() || 'unknown'
     const machineId = crypto.randomUUID()
     const pairedTokens = new Map<string, { token: string; ts: number }>()
@@ -636,7 +638,9 @@ async function main(): Promise<void> {
         res.end(JSON.stringify({ error: 'not found' }))
       } catch (err: any) {
         res.statusCode = 500
-        res.end(JSON.stringify({ error: err?.message || String(err) }))
+        // 安全：不向网络暴露内部错误详情，防止泄露路径/模块结构等敏感信息
+        console.error('[pairing server] error:', err)
+        res.end(JSON.stringify({ error: 'internal server error' }))
       }
     }
 
@@ -726,6 +730,51 @@ async function main(): Promise<void> {
 
   // Hone Gateway CLI subcommand: hone gateway [start|stop|status|approve|deny]
   if (args[0] === 'gateway') {
+    // Desktop 通过 HONE_SECRETS_FILE 临时文件传递敏感凭据（API Key 等），
+    // 避免通过环境变量暴露给子进程。gateway 分支直接启动 daemon，
+    // 因此需要在这里读取并注入到 process.env，否则 daemon 中 getProvider()
+    // 会找不到 API Key，导致 LLM 调用报“未设置 API Key”。
+    const secretsFile = process.env.HONE_SECRETS_FILE
+    if (secretsFile) {
+      try {
+        const fsSync = require('fs') as typeof import('fs')
+        if (fsSync.existsSync(secretsFile)) {
+          const content = fsSync.readFileSync(secretsFile, 'utf-8')
+          const secrets = JSON.parse(content) as [string, string][]
+          for (const [key, value] of secrets) {
+            // 空字符串不覆盖，避免 Desktop 传入空值时清空已有 key。
+            if (!value || value.trim() === '') continue
+            // HONE_SECRETS_FILE 是 Desktop 显式传递的权威凭据，必须覆盖
+            // 子进程继承的系统环境变量中可能残留的过期/无效 key。
+            const prev = process.env[key]
+            process.env[key] = value
+            if (prev && prev !== value && key.includes('API_KEY')) {
+              console.error(`[Gateway] ${key} 已由 HONE_SECRETS_FILE 更新（覆盖环境变量中的旧值）`)
+            }
+          }
+          try { fsSync.unlinkSync(secretsFile) } catch {}
+          delete process.env.HONE_SECRETS_FILE
+        }
+      } catch (err) {
+        console.error('[Gateway] 读取 secrets file 失败:', err)
+      }
+    }
+
+    // 如果 API key 仍然缺失，从 ~/.hone/cli-config.json 读取（凭据管理器可能为空）
+    if (!process.env.HONE_DEEPSEEK_API_KEY && !process.env.DEEPSEEK_API_KEY &&
+        !process.env.OPENAI_API_KEY && !process.env.HONE_OPENAI_API_KEY) {
+      try {
+        const { loadConfig, applyConfigToEnv } = await import('../utils/honeConfig.js')
+        const cliConfig = await loadConfig()
+        if (cliConfig.deepseekApiKey || cliConfig.openaiApiKey) {
+          applyConfigToEnv(cliConfig)
+          console.error('[Gateway] 从 ~/.hone/cli-config.json 加载了 API 凭据')
+        }
+      } catch (err) {
+        console.error('[Gateway] 读取 cli-config.json 失败:', err)
+      }
+    }
+
     const pidFile =
       process.env.HONE_PID_FILE ||
       `${process.env.HONE_DATA_DIR || `${process.env.HOME || process.env.USERPROFILE || '.'}/.hone`}/gateway.pid`
@@ -925,6 +974,33 @@ async function main(): Promise<void> {
 
   // Fast-path for --gateway-mode: run the Hone Gateway daemon (internal)
   if (args.includes('--gateway-mode')) {
+    // Desktop 可能通过 HONE_SECRETS_FILE 传递敏感凭据，加载后再启动 daemon
+    const secretsFile = process.env.HONE_SECRETS_FILE
+    if (secretsFile) {
+      try {
+        const fsSync = require('fs') as typeof import('fs')
+        if (fsSync.existsSync(secretsFile)) {
+          const content = fsSync.readFileSync(secretsFile, 'utf-8')
+          const secrets = JSON.parse(content) as [string, string][]
+          for (const [key, value] of secrets) {
+            // 空字符串不覆盖，避免 Desktop 传入空值时清空已有 key。
+            if (!value || value.trim() === '') continue
+            // HONE_SECRETS_FILE 是 Desktop 显式传递的权威凭据，必须覆盖
+            // 子进程继承的系统环境变量中可能残留的过期/无效 key。
+            const prev = process.env[key]
+            process.env[key] = value
+            if (prev && prev !== value && key.includes('API_KEY')) {
+              console.error(`[Gateway] ${key} 已由 HONE_SECRETS_FILE 更新（覆盖环境变量中的旧值）`)
+            }
+          }
+          try { fsSync.unlinkSync(secretsFile) } catch {}
+          delete process.env.HONE_SECRETS_FILE
+        }
+      } catch (err) {
+        console.error('[Gateway] 读取 secrets file 失败:', err)
+      }
+    }
+
     const relayUrl =
       process.env.HONE_RELAY_URL ||
       'wss://hone-relay.marsailleippi79.workers.dev/connect'

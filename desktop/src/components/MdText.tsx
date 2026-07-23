@@ -33,7 +33,9 @@ function escapeHtml(input: string): string {
 }
 
 function renderInline(src: string): string {
-  return src
+  // 先转义 HTML 特殊字符，防止 XSS（攻击者通过 relay 发送 <img onerror=...> 等注入脚本）
+  // 之后再应用 Markdown 替换，替换会插入受信任的 HTML 标签，标签内的用户文本已被转义
+  return escapeHtml(src)
     .replace(/`([^`]+)`/g, '<code style="padding:1px 4px;border-radius:4px;background:rgba(99,102,241,0.12);font-family:JetBrains Mono,monospace;font-size:0.92em;">$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/\*([^*]+)\*/g, '<em>$1</em>')

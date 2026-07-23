@@ -104,7 +104,7 @@ function AskUserQuestionResultMessage(t0) {
 }
 function _temp(t0) {
   const [questionText, answer] = t0;
-  return <Text key={questionText} color="inactive">路 {questionText} ->{answer}</Text>;
+  return <Text key={questionText} color="inactive">路 {questionText} -{'>'}{answer}</Text>;
 }
 export const AskUserQuestionTool: Tool<InputSchema, Output> = buildTool({
   name: ASK_USER_QUESTION_TOOL_NAME,

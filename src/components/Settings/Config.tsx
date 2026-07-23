@@ -1651,7 +1651,7 @@ export function Config({
         minimum_version_set: choice === 'stay'
       });
     }} /> : <Box flexDirection="column" gap={1} marginY={insideModal ? undefined : 1}>
-placeholder="Search settings..." />
+          <SearchBox query={searchQuery} cursorOffset={searchCursorOffset} placeholder="Search settings..." isFocused={isSearchMode} isTerminalFocused={isTerminalFocused} />
           <Box flexDirection="column">
             {filteredSettingsItems.length === 0 ? <Text dimColor italic>
                 No settings match &quot;{searchQuery}&quot;

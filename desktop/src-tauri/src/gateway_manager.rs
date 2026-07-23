@@ -197,10 +197,103 @@ pub struct ProviderProfile {
     pub is_default: bool,
 }
 
+/// Apply the default provider profile (is_default && enabled) onto the legacy
+/// single-provider fields so that env vars and cli-config.json stay consistent.
+pub fn apply_default_provider_profile(config: &mut GatewayConfig) {
+    if let Some(default_p) = config.providers.iter().find(|p| p.is_default && p.enabled) {
+        if !default_p.kind.is_empty() { config.provider = default_p.kind.clone(); }
+        if !default_p.api_key.is_empty() { config.api_key = default_p.api_key.clone(); }
+        if !default_p.base_url.is_empty() { config.base_url = default_p.base_url.clone(); }
+        if !default_p.model.is_empty() { config.model = default_p.model.clone(); }
+        if default_p.temperature > 0.0 { config.temperature = default_p.temperature; }
+        if default_p.max_tokens > 0 { config.max_tokens = default_p.max_tokens; }
+    }
+}
+
+/// DeepSeek 旧版/无效模型名映射到当前旗舰模型 deepseek-v4-pro。
+/// - deepseek-v4 是无效名称（官方只有 v4-pro / v4-flash）
+/// - deepseek-chat / deepseek-reasoner 已在 2026-07-24 废弃
+fn normalize_model_name(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower == "deepseek-v4" || lower == "deepseek-chat" || lower == "deepseek-reasoner" {
+        "deepseek-v4-pro".to_string()
+    } else {
+        model.to_string()
+    }
+}
+
+/// Return provider-related env vars that the CLI expects.
+/// Caller should call `apply_default_provider_profile` first when the effective
+/// profile should override legacy fields.
+pub fn provider_env_vars(config: &GatewayConfig) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    // 标记 Hone 配置已由 Desktop 主动注入，后续 CLI 初始化时 managedEnv.ts
+    // 会跳过 Claude Code settings.json 中的 HONE_* / DEEPSEEK_* / OPENAI_* 变量，
+    // 防止 settings.json 里残留的旧 API key 覆盖当前桌面设置。
+    vars.push(("HONE_CONFIG_APPLIED".to_string(), "1".to_string()));
+    if !config.provider.is_empty() {
+        vars.push(("HONE_PROVIDER".to_string(), config.provider.clone()));
+    }
+    // 只有 api_key 非空时才传递；否则 sensitive_vars 会写入空字符串到 HONE_SECRETS_FILE，
+    // 导致 CLI gateway 分支用空值覆盖 cli-config.json 或凭据管理器中的有效 key。
+    if !config.api_key.trim().is_empty() {
+        match config.provider.as_str() {
+            "openai" => {
+                vars.push(("OPENAI_API_KEY".to_string(), config.api_key.clone()));
+                if !config.base_url.is_empty() {
+                    vars.push(("HONE_OPENAI_BASE_URL".to_string(), config.base_url.clone()));
+                }
+                if !config.model.is_empty() {
+                    vars.push(("HONE_OPENAI_MODEL".to_string(), config.model.clone()));
+                }
+            }
+            "custom" => {
+                vars.push(("HONE_CUSTOM_API_KEY".to_string(), config.api_key.clone()));
+                if !config.base_url.is_empty() {
+                    vars.push(("HONE_CUSTOM_BASE_URL".to_string(), config.base_url.clone()));
+                }
+                if !config.model.is_empty() {
+                    vars.push(("HONE_CUSTOM_MODEL".to_string(), config.model.clone()));
+                }
+                if !config.custom_name.is_empty() {
+                    vars.push(("HONE_CUSTOM_NAME".to_string(), config.custom_name.clone()));
+                }
+            }
+            _ => {
+                vars.push(("DEEPSEEK_API_KEY".to_string(), config.api_key.clone()));
+                vars.push(("HONE_DEEPSEEK_API_KEY".to_string(), config.api_key.clone()));
+                if !config.base_url.is_empty() {
+                    vars.push(("HONE_DEEPSEEK_BASE_URL".to_string(), config.base_url.clone()));
+                }
+                if !config.model.is_empty() {
+                    vars.push(("HONE_DEEPSEEK_MODEL".to_string(), config.model.clone()));
+                }
+            }
+        }
+    }
+    if !config.model.is_empty() {
+        vars.push(("HONE_MODEL".to_string(), normalize_model_name(&config.model)));
+    }
+    if config.temperature > 0.0 {
+        vars.push(("HONE_TEMPERATURE".to_string(), config.temperature.to_string()));
+    }
+    if config.max_tokens > 0 {
+        vars.push(("HONE_MAX_TOKENS".to_string(), config.max_tokens.to_string()));
+    }
+    vars
+}
+
 fn default_true() -> bool { true }
 fn default_max_steps() -> u32 { 15 }
 
+/// 默认 relay URL。可通过 `HONE_RELAY_URL` 环境变量覆盖，
+/// 用于私有部署或测试环境切换 relay 服务器，避免硬编码到代码中。
 fn default_relay_url() -> String {
+    if let Ok(url) = std::env::var("HONE_RELAY_URL") {
+        if !url.is_empty() {
+            return url;
+        }
+    }
     "wss://hone-relay.marsailleippi79.workers.dev/connect".to_string()
 }
 
@@ -213,7 +306,22 @@ fn random_token() -> String {
 }
 
 fn default_relay_room() -> String { random_token() }
-fn default_secret_id() -> String { Uuid::new_v4().to_string() }
+fn default_secret_id() -> String {
+    // Use a stable per-machine-per-user identifier so credentials survive
+    // reinstalls and directory moves. Previously this was a random UUID, which
+    // meant every fresh install created a new keyring record and the user's
+    // saved API key appeared to disappear.
+    let machine = std::env::var("COMPUTERNAME").unwrap_or_default();
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    if machine.is_empty() && user.is_empty() {
+        return Uuid::new_v4().to_string();
+    }
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_DNS,
+        format!("{}@{}@hone", user, machine).as_bytes(),
+    )
+    .to_string()
+}
 fn default_pairing_id() -> String { Uuid::new_v4().to_string() }
 
 fn default_pairing_code() -> String {
@@ -323,9 +431,13 @@ impl GatewayManager {
                 warn!("Failed to parse {}, keeping defaults", path.display());
             }
         }
-        self.normalize_internal_config();
+        // 顺序很重要：先从 keyring 加载旧凭据（可能包含空的 local_auth_token），
+        // 再用 normalize_internal_config 为缺失的安全字段生成新值，最后持久化。
+        // 如果先 normalize 再 hydrate，keyring 中的空 token 会覆盖刚刚生成的新值。
+        self.config_path = Some(path.clone());
         self.hydrate_secrets();
-        self.config_path = Some(path);
+        self.normalize_internal_config();
+        self.persist();
     }
 
     fn normalize_internal_config(&mut self) {
@@ -410,12 +522,22 @@ impl GatewayManager {
         format!("{}/{}", base, self.config.relay_room)
     }
 
-    fn persist(&self) {
+    fn persist(&mut self) {
         if let Some(p) = &self.config_path {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
+            // 确保 keyring 中始终保存有效的 local_auth_token，避免 Desktop 前端
+            // 因 token 为空而无法通过 WebSocket 认证 Gateway。
+            if self.config.local_auth_token.len() < 32 {
+                self.config.local_auth_token = random_token();
+            }
             let secrets = secret_store::extract(&self.config);
+            info!(
+                "Persisting secrets: api_key_present={}, local_auth_token_len={}",
+                !secrets.api_key.is_empty(),
+                secrets.local_auth_token.len()
+            );
             let mut persisted = self.config.clone();
             if let Err(error) = secret_store::save(&persisted.secret_id, &secrets) {
                 warn!(
@@ -424,6 +546,7 @@ impl GatewayManager {
                 );
                 return;
             }
+            info!("Saved secrets to credential store for secret_id {}", persisted.secret_id);
             secret_store::redact(&mut persisted);
             match serde_json::to_vec_pretty(&persisted) {
                 Ok(bytes) => {
@@ -473,6 +596,10 @@ impl GatewayManager {
         self.status = GatewayStatus::Starting;
         info!("Starting Hone Gateway (relay room: {})", self.config.relay_room);
 
+        // 收集 spawn 失败时需要执行的清理动作（如删除已写入的 secrets 临时文件）。
+        // spawn 成功后这些闭包不会被调用；spawn 失败或 daemon 立即退出时会逐个执行。
+        let mut spawn_failure_cleanup: Vec<Box<dyn FnOnce()>> = Vec::new();
+
         let mut cmd = Command::new(node_path);
         cmd.arg(format!("{}/dist/cli.js", hone_path))
             .arg("gateway")
@@ -500,68 +627,28 @@ impl GatewayManager {
             );
 
         // 2026 multi-provider: use the default profile to override legacy fields
-        if let Some(default_p) = self.config.providers.iter().find(|p| p.is_default && p.enabled) {
-            if !default_p.kind.is_empty() { self.config.provider = default_p.kind.clone(); }
-            if !default_p.api_key.is_empty() { self.config.api_key = default_p.api_key.clone(); }
-            if !default_p.base_url.is_empty() { self.config.base_url = default_p.base_url.clone(); }
-            if !default_p.model.is_empty() { self.config.model = default_p.model.clone(); }
-            if default_p.temperature > 0.0 { self.config.temperature = default_p.temperature; }
-            if default_p.max_tokens > 0 { self.config.max_tokens = default_p.max_tokens; }
-        }
+        apply_default_provider_profile(&mut self.config);
 
-        // Pass provider settings as env vars for the CLI daemon
-        // The CLI provider system reads HONE_PROVIDER to select the provider,
-        // and provider-specific API key env vars (DEEPSEEK_API_KEY etc.)
-        if !self.config.provider.is_empty() {
-            cmd.env("HONE_PROVIDER", &self.config.provider);
-        }
-        if !self.config.api_key.is_empty() {
-            // Map generic api_key to provider-specific env var that CLI checks
-            match self.config.provider.as_str() {
-                "openai" => {
-                    cmd.env("OPENAI_API_KEY", &self.config.api_key);
-                    if !self.config.base_url.is_empty() {
-                        cmd.env("HONE_OPENAI_BASE_URL", &self.config.base_url);
-                    }
-                    if !self.config.model.is_empty() {
-                        cmd.env("HONE_OPENAI_MODEL", &self.config.model);
-                    }
-                }
-                "custom" => {
-                    cmd.env("HONE_CUSTOM_API_KEY", &self.config.api_key);
-                    if !self.config.base_url.is_empty() {
-                        cmd.env("HONE_CUSTOM_BASE_URL", &self.config.base_url);
-                    }
-                    if !self.config.model.is_empty() {
-                        cmd.env("HONE_CUSTOM_MODEL", &self.config.model);
-                    }
-                    if !self.config.custom_name.is_empty() {
-                        cmd.env("HONE_CUSTOM_NAME", &self.config.custom_name);
-                    }
-                }
-                _ => {
-                    // deepseek (default) or unknown
-                    cmd.env("DEEPSEEK_API_KEY", &self.config.api_key);
-                    cmd.env("HONE_DEEPSEEK_API_KEY", &self.config.api_key);
-                    if !self.config.base_url.is_empty() {
-                        cmd.env("HONE_DEEPSEEK_BASE_URL", &self.config.base_url);
-                    }
-                    if !self.config.model.is_empty() {
-                        cmd.env("HONE_DEEPSEEK_MODEL", &self.config.model);
-                    }
-                }
+        // Pass provider settings as env vars for the CLI daemon.
+        // 敏感变量（API Key）通过临时文件传递，避免通过环境变量泄露给子进程
+        // （Linux /proc/{pid}/environ 可读、CLI 子进程继承环境变量扩大暴露面）。
+        let sensitive_keys: &[&str] = &[
+            "OPENAI_API_KEY",
+            "HONE_OPENAI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "HONE_DEEPSEEK_API_KEY",
+            "HONE_CUSTOM_API_KEY",
+            "HONE_GUI_MODEL_KEY",
+        ];
+        let mut sensitive_vars: Vec<(String, String)> = Vec::new();
+        for (key, value) in provider_env_vars(&self.config) {
+            if sensitive_keys.contains(&key.as_str()) {
+                sensitive_vars.push((key, value));
+            } else {
+                cmd.env(key, value);
             }
         }
-        if !self.config.model.is_empty() {
-            cmd.env("HONE_MODEL", &self.config.model);
-        }
-        if self.config.temperature > 0.0 {
-            cmd.env("HONE_TEMPERATURE", self.config.temperature.to_string());
-        }
-        if self.config.max_tokens > 0 {
-            cmd.env("HONE_MAX_TOKENS", self.config.max_tokens.to_string());
-        }
-        // Browser automation env vars
+        // Browser automation env vars (non-sensitive)
         if self.config.browser_enabled {
             cmd.env("HONE_BROWSER_ENABLED", "true");
         }
@@ -572,7 +659,32 @@ impl GatewayManager {
             cmd.env("HONE_GUI_MODEL_NAME", &self.config.gui_model_name);
         }
         if !self.config.gui_model_key.is_empty() {
-            cmd.env("HONE_GUI_MODEL_KEY", &self.config.gui_model_key);
+            sensitive_vars.push(("HONE_GUI_MODEL_KEY".to_string(), self.config.gui_model_key.clone()));
+        }
+        // 写入临时文件传递敏感凭据，避免通过环境变量暴露。
+        // 临时文件在 daemon 读取后由 main.ts 的 loadSecretsFile() 立即 unlink，
+        // 仅在 spawn→read 窗口期短暂存在。写入失败会自动清理。
+        if !sensitive_vars.is_empty() {
+            let secrets_file = std::env::temp_dir().join(format!(".hone-secrets-{}.json", uuid::Uuid::new_v4()));
+            let secrets_json = serde_json::to_string(&sensitive_vars)
+                .map_err(|e| GatewayError::SpawnFailed(format!("serialize secrets: {}", e)))?;
+            // 写入失败时清理半成品文件，避免残留 secrets
+            if let Err(e) = std::fs::write(&secrets_file, &secrets_json) {
+                let _ = std::fs::remove_file(&secrets_file);
+                return Err(GatewayError::SpawnFailed(format!("write secrets file: {}", e)));
+            }
+            // Unix: 设置 0600 权限，仅所有者可读写
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&secrets_file, std::fs::Permissions::from_mode(0o600));
+            }
+            cmd.env("HONE_SECRETS_FILE", secrets_file.to_string_lossy().to_string());
+            // 注册 spawn 失败时的清理闭包：如果 spawn 失败，daemon 不会启动，
+            // 也不会走到 main.ts 的 unlink 逻辑，需要在这里主动清理。
+            spawn_failure_cleanup.push(Box::new(move || {
+                let _ = std::fs::remove_file(&secrets_file);
+            }));
         }
         if !self.config.browser_headless {
             cmd.env("HONE_BROWSER_HEADLESS", "false");
@@ -606,19 +718,30 @@ impl GatewayManager {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            self.status = GatewayStatus::Error(e.to_string());
-            warn!("Failed to spawn gateway: {}", e);
-            GatewayError::SpawnFailed(e.to_string())
-        })?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = GatewayStatus::Error(e.to_string());
+                warn!("Failed to spawn gateway: {}", e);
+                // spawn 失败时执行清理（删除已写入但 daemon 不会读取的 secrets 文件）
+                for cleanup in spawn_failure_cleanup {
+                    cleanup();
+                }
+                return Err(GatewayError::SpawnFailed(e.to_string()));
+            }
+        };
 
         // Give the Node.js runtime a brief moment to bootstrap, then check
         // whether the process died immediately (startup failure — e.g. wrong
-        // node path, missing cli.js, syntax error). 250ms is enough to catch
+        // node path, missing cli.js, syntax error). 100ms is enough to catch
         // an immediate exit without artificially slowing down every start by
-        // 800ms; the daemon's actual readiness is reflected later via
+        // 250ms; the daemon's actual readiness is reflected later via
         // gateway_status polling on the frontend.
-        std::thread::sleep(Duration::from_millis(250));
+        //
+        // 锁竞争缓解：gateway_status / gateway_uptime 已改用 try_lock，不会在此
+        // sleep 期间被阻塞；gateway_stop 是用户主动操作，等待 100ms 可接受。
+        // 配合外层 block_in_place，tokio 其他 task 仍可被调度到别的 worker thread。
+        std::thread::sleep(Duration::from_millis(100));
 
         match child.try_wait() {
             Ok(Some(exit)) => {
@@ -640,6 +763,10 @@ impl GatewayManager {
                 };
                 self.status = GatewayStatus::Error(msg.clone());
                 warn!("{}", msg);
+                // daemon 立即退出：daemon 不会执行 main.ts 的 unlink，需手动清理 secrets 文件
+                for cleanup in spawn_failure_cleanup {
+                    cleanup();
+                }
                 Err(GatewayError::ProcessError(msg))
             }
             Ok(None) => {
@@ -784,12 +911,22 @@ impl GatewayManager {
     /// 导致新启动的 Gateway 无法绑定端口（EADDRINUSE）。
     fn kill_orphan_gateway(&self) {
         let port = self.config.local_port;
+        let port_suffix = format!(":{}", port);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            // 用 netstat 查找占用端口的 PID，然后 taskkill 杀掉
-            if let Ok(output) = Command::new("cmd")
-                .args(["/C", &format!("netstat -ano | findstr :{}", port)])
+            // 用 netstat -ano -p TCP 列出所有 TCP 监听，在 Rust 侧精确匹配端口，
+            // 避免 `findstr :18789` 子串匹配到 `:187890` / `:187891` 等误杀。
+            // 某些环境（如被 TRAE 启动的 PowerShell）PATH 被截断，不包含
+            // System32，因此优先使用 netstat.exe 的绝对路径；找不到再回退到 PATH。
+            let netstat_paths = [
+                std::path::PathBuf::from(r"C:\Windows\System32\netstat.exe"),
+                std::path::PathBuf::from(r"C:\Windows\SysWOW64\netstat.exe"),
+                std::path::PathBuf::from("netstat.exe"),
+            ];
+            let netstat_cmd = netstat_paths.iter().find(|p| p.exists()).cloned().unwrap_or_else(|| std::path::PathBuf::from("netstat.exe"));
+            if let Ok(output) = Command::new(&netstat_cmd)
+                .args(["-ano", "-p", "TCP"])
                 .creation_flags(0x08000000) // CREATE_NO_WINDOW
                 .output()
             {
@@ -800,20 +937,59 @@ impl GatewayManager {
                         continue;
                     }
                     // netstat 行格式: Proto LocalAddress ForeignAddress State PID
+                    let cols: Vec<&str> = line.split_whitespace().collect();
+                    if cols.len() < 5 {
+                        continue;
+                    }
+                    let local_addr = cols[1];
+                    // 验证本地地址确实以 :{port} 结尾（精确匹配，防止子串误杀）
+                    // 同时处理 IPv4 (0.0.0.0:18789) 和 IPv6 ([::]:18789) 两种格式
+                    if !local_addr.ends_with(&port_suffix) {
+                        continue;
+                    }
+                    // 进一步验证：端口后无多余数字（防止 :187890 误匹配）
+                    // local_addr 形如 "0.0.0.0:18789" 或 "[::]:18789"，分割最后一个 ':'
+                    if let Some(addr_only) = local_addr.rsplit(':').next() {
+                        if addr_only != port.to_string() {
+                            continue;
+                        }
+                    }
                     // 取最后一列作为 PID
-                    if let Some(pid_str) = line.split_whitespace().last() {
+                    if let Some(pid_str) = cols.last() {
                         if let Ok(pid) = pid_str.parse::<u32>() {
                             // 不杀自己（当前进程）
                             if pid == std::process::id() {
                                 continue;
                             }
+                            // 验证进程映像名：只杀 node.exe / hone.exe / hone.exe，
+                            // 防止用户把 localPort 设为 3306/5432/8080 时误杀 MySQL/PostgreSQL/开发服务器。
+                            if !is_safe_gateway_process_windows(pid) {
+                                log::warn!(
+                                    "Port {} occupied by PID {} but process image is not node/hone, skipping kill",
+                                    port,
+                                    pid
+                                );
+                                continue;
+                            }
                             log::info!("Killing orphan process on port {}: PID {}", port, pid);
-                            let _ = Command::new("taskkill")
+                            let taskkill_paths = [
+                                std::path::PathBuf::from(r"C:\Windows\System32\taskkill.exe"),
+                                std::path::PathBuf::from(r"C:\Windows\SysWOW64\taskkill.exe"),
+                                std::path::PathBuf::from("taskkill.exe"),
+                            ];
+                            let taskkill_cmd = taskkill_paths
+                                .iter()
+                                .find(|p| p.exists())
+                                .cloned()
+                                .unwrap_or_else(|| std::path::PathBuf::from("taskkill.exe"));
+                            let _ = Command::new(&taskkill_cmd)
                                 .args(["/T", "/F", "/PID", &pid.to_string()])
                                 .creation_flags(0x08000000)
                                 .output();
-                            // 给系统一点时间释放端口
-                            std::thread::sleep(Duration::from_millis(500));
+                            // 给系统时间释放端口：500ms 太短（Windows TCP stack 默认 TIME_WAIT 240s，
+                            // 虽然 SO_REUSEADDR 应该能绕过，但 daemon 重启有时仍会 EADDRINUSE）。
+                            // 1.5s 在慢机器上够用，又不至于让用户觉得卡顿。
+                            std::thread::sleep(Duration::from_millis(1500));
                         }
                     }
                 }
@@ -832,11 +1008,21 @@ impl GatewayManager {
                         if pid == std::process::id() {
                             continue;
                         }
+                        // 验证进程映像名：只杀 node/hone，防止误杀其他服务
+                        if !is_safe_gateway_process_unix(pid) {
+                            log::warn!(
+                                "Port {} occupied by PID {} but process is not node/hone, skipping kill",
+                                port,
+                                pid
+                            );
+                            continue;
+                        }
                         log::info!("Killing orphan process on port {}: PID {}", port, pid);
                         let _ = Command::new("kill")
                             .args(["-9", &pid.to_string()])
                             .output();
-                        std::thread::sleep(Duration::from_millis(500));
+                        // 与 Windows 端保持一致的端口释放等待时间
+                        std::thread::sleep(Duration::from_millis(1500));
                     }
                 }
             }
@@ -881,6 +1067,9 @@ impl GatewayManager {
 
     /// Apply a new config. If the Gateway is running, restart it with the new settings.
     /// Also persists to disk so config survives app restarts.
+    ///
+    /// 回滚策略：如果应用新配置后重启 Gateway 失败，恢复旧配置并尝试用旧配置重启，
+    /// 保证用户至少能继续使用之前的可用配置，而不是处于"已停止且新配置不可用"的状态。
     pub fn apply_config(
         &mut self,
         node_path: &str,
@@ -888,6 +1077,7 @@ impl GatewayManager {
         hone_path: &str,
     ) -> Result<(), GatewayError> {
         let was_running = self.is_running();
+        let old_config = self.config.clone();
         if was_running {
             self.stop()?;
         }
@@ -897,7 +1087,23 @@ impl GatewayManager {
         self.persist();
         if was_running {
             let relay = self.config.relay_url.clone();
-            self.start(node_path, hone_path, &relay)?;
+            match self.start(node_path, hone_path, &relay) {
+                Ok(()) => {}
+                Err(start_err) => {
+                    // 重启失败：回滚到旧配置并尝试用旧配置重启
+                    log::warn!("Gateway 重启失败，回滚到旧配置: {}", start_err);
+                    self.config = old_config.clone();
+                    self.persist();
+                    let old_relay = old_config.relay_url.clone();
+                    // 用旧配置尝试重启，如果还失败则返回原始错误
+                    if let Err(rollback_err) = self.start(node_path, hone_path, &old_relay) {
+                        log::error!("回滚重启也失败: {}", rollback_err);
+                        return Err(start_err);
+                    }
+                    // 回滚成功，但仍向上层报告原始错误，让 UI 可以提示用户配置未生效
+                    return Err(start_err);
+                }
+            }
         }
         Ok(())
     }
@@ -963,11 +1169,67 @@ fn kill_child(child: &mut Child) {
     // 用 taskkill /T 递归终止进程树，给 daemon 及其子进程（CLI 任务等）清理机会。
     // 直接 TerminateProcess（child.kill）相当于 SIGKILL，会导致 daemon 正在写的
     // 文件（schedules.json 等）损坏，且子进程变孤儿。
+    // 某些启动环境（如被 TRAE 启动的 PowerShell）PATH 被截断，不包含 System32，
+    // 因此优先使用 taskkill.exe 的绝对路径；找不到再回退到 PATH。
     let pid = child.id();
     use std::os::windows::process::CommandExt;
-    let _ = Command::new("taskkill")
+    let taskkill_paths = [
+        std::path::PathBuf::from(r"C:\Windows\System32\taskkill.exe"),
+        std::path::PathBuf::from(r"C:\Windows\SysWOW64\taskkill.exe"),
+        std::path::PathBuf::from("taskkill.exe"),
+    ];
+    let taskkill_cmd = taskkill_paths
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from("taskkill.exe"));
+    let _ = Command::new(&taskkill_cmd)
         .args(["/T", "/PID", &pid.to_string()])
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .output();
     let _ = child.wait();
+}
+
+/// 验证 Windows 进程映像名是否为 Hone Gateway 相关（node.exe / hone.exe）。
+/// 在按端口杀进程之前调用，防止用户把 localPort 配置成 3306/5432/8080 时
+/// 误杀 MySQL/PostgreSQL/开发服务器。
+#[cfg(windows)]
+pub(crate) fn is_safe_gateway_process_windows(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    // 用 wmic 查询进程名。wmic 在新版 Windows 11 已弃用但默认仍可用；
+    // 不可用时回退到 PowerShell Get-Process。
+    if let Ok(output) = Command::new("wmic")
+        .args(["process", "where", &format!("ProcessId={}", pid), "get", "Name", "/value"])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        // wmic 输出形如 "Name=node.exe\r\n"
+        for line in stdout.lines() {
+            if let Some(name) = line.trim().strip_prefix("name=") {
+                let name = name.trim();
+                return name == "node.exe" || name == "hone.exe";
+            }
+        }
+    }
+    // 查询失败时保守返回 false：宁可漏杀孤儿进程（用户可手动处理），
+    // 不可误杀用户其他服务。
+    false
+}
+
+/// 验证 Unix 进程映像名是否为 Hone Gateway 相关（node / hone）。
+#[cfg(unix)]
+pub(crate) fn is_safe_gateway_process_unix(pid: u32) -> bool {
+    // 用 ps -p PID -o comm= 查询进程名
+    if let Ok(output) = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    {
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // comm= 可能返回带路径或仅基名，统一取最后一段
+        let basename = name.rsplit('/').next().unwrap_or(&name);
+        return basename == "node" || basename == "hone";
+    }
+    // 查询失败时保守返回 false
+    false
 }

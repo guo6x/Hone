@@ -47,13 +47,23 @@ export interface VisionModelConfig {
 export function visionConfigFromEnv(): VisionModelConfig | null {
   const url = process.env.HONE_GUI_MODEL_URL
   if (!url || !url.trim()) return null
+  // API Key 降级链（按优先级）：
+  //   1. HONE_GUI_MODEL_KEY  — vision 专用 key（推荐）
+  //   2. ARK_API_KEY         — 火山方舟（豆包视觉模型）
+  //   3. MOONSHOT_API_KEY    — Kimi 月之暗面
+  //   4. OPENAI_API_KEY      — OpenAI GPT-4V
+  // 注：使用哪个 key 不打印（避免日志泄露 key 来源），但会记录是否找到 key。
+  const apiKey = process.env.HONE_GUI_MODEL_KEY
+    || process.env.ARK_API_KEY
+    || process.env.MOONSHOT_API_KEY
+    || process.env.OPENAI_API_KEY
+  if (!apiKey) {
+    console.error(`[GUI Model] ⚠️ 未配置 API Key，vision model 调用可能返回 401: ${url.trim()}`)
+  }
   return {
     url: url.trim(),
     model: process.env.HONE_GUI_MODEL_NAME || '',
-    apiKey: process.env.HONE_GUI_MODEL_KEY
-      || process.env.ARK_API_KEY
-      || process.env.MOONSHOT_API_KEY
-      || process.env.OPENAI_API_KEY,
+    apiKey,
   }
 }
 

@@ -218,7 +218,7 @@ export function saveSchedules(schedules: Map<string, ScheduleEntry>): void {
     // 原子写入：先写临时文件再 rename，防止崩溃时 schedules.json 被截断/损坏
     const storePath = getStorePath()
     const tmp = storePath + '.tmp'
-    fs.writeFileSync(tmp, JSON.stringify(entries, null, 2), 'utf-8')
+    fs.writeFileSync(tmp, JSON.stringify(entries, null, 2), { encoding: 'utf-8', mode: 0o600 })
     fs.renameSync(tmp, storePath)
   } catch (err) {
     console.error(`[Scheduler] 保存日程失败: ${err}`)
@@ -276,6 +276,16 @@ function refreshSchedulesFromStore(state: SchedulerState): void {
   if (currentMtime <= state.storeMtimeMs) return
 
   const stored = loadSchedules()
+  // 磁盘返回空但内存非空时跳过本次 reload：避免外部编辑或半截写入导致
+  // schedules.json 损坏时，loadSchedules 静默返回空 Map，refresh 清空内存，
+  // 下次 saveSchedules 把空数组持久化覆盖磁盘，所有日程永久丢失。
+  if (stored.size === 0 && state.schedules.size > 0) {
+    console.error(
+      `[Scheduler] 磁盘 schedules.json 为空但内存有 ${state.schedules.size} 条日程，跳过 reload（可能磁盘文件损坏）`,
+    )
+    state.storeMtimeMs = currentMtime
+    return
+  }
   state.schedules.clear()
   for (const [id, entry] of stored) state.schedules.set(id, entry)
   state.cronCache.clear()
@@ -293,6 +303,8 @@ function checkAll(state: SchedulerState): void {
     if (!entry.enabled) continue
 
     let shouldTrigger = false
+    // 如果是 catch-up 触发，记录匹配时间点（用于更新 lastTriggeredAt）
+    let catchUpTriggeredAt: number | null = null
 
     if (entry.trigger.type === 'cron') {
       let matcher = state.cronCache.get(entry.trigger.cron)
@@ -303,21 +315,31 @@ function checkAll(state: SchedulerState): void {
         state.cronCache.set(entry.trigger.cron, fn)
       }
       shouldTrigger = matcher(now)
-      // catch-up：回溯检查错过的触发（最多回溯 60 分钟）
+      // catch-up：回溯检查错过的触发。
+      // 限制延长到 24 小时（原 60 分钟太短，笔记本睡眠一晚后会丢失所有早间任务）。
+      // 仍只触发一次（不重复补做），避免大量积压任务一次性涌入。
       if (!shouldTrigger && entry.lastTriggeredAt) {
         const gapMs = now.getTime() - entry.lastTriggeredAt
         if (gapMs > 60_000) {
           const cursor = new Date(entry.lastTriggeredAt)
           cursor.setSeconds(0, 0)
-          const maxBacktrack = Math.min(gapMs, 60 * 60_000)
+          const maxBacktrack = Math.min(gapMs, 24 * 60 * 60_000)
           const endTime = cursor.getTime() + maxBacktrack
           for (let t = cursor.getTime() + 60_000; t <= now.getTime() && t <= endTime; t += 60_000) {
             if (matcher(new Date(t))) {
               shouldTrigger = true
+              catchUpTriggeredAt = t
               break
             }
           }
         }
+      }
+      // 如果是 catch-up 触发，把 lastTriggeredAt 设为匹配点（而非 now），
+      // 这样如果错过多次（如每 30 分钟的 cron 错过 2 小时），下次 tick
+      // 会从匹配点继续 catch-up，逐步补做剩余的错过触发。
+      // 但为了避免一次 tick 内连续触发多次，仍只触发一次。
+      if (shouldTrigger && catchUpTriggeredAt !== null) {
+        entry.lastTriggeredAt = catchUpTriggeredAt
       }
     } else if (entry.trigger.type === 'interval') {
       const lastTrigger = entry.lastTriggeredAt || 0
@@ -350,7 +372,12 @@ function checkAll(state: SchedulerState): void {
         if (nowMs - lastTrigger < 60_000) continue
       }
 
-      entry.lastTriggeredAt = nowMs
+      // 如果是 catch-up 触发，lastTriggeredAt 已被设为匹配点（见上方 catch-up 逻辑），
+      // 保留该值以便下次 tick 继续补做剩余的错过触发；
+      // 否则设为 nowMs（常规触发）。
+      if (!catchUpTriggeredAt) {
+        entry.lastTriggeredAt = nowMs
+      }
       entry.lastStatus = undefined
       void state.onTrigger(entry).then(() => {
         // Persist after each trigger

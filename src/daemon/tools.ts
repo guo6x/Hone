@@ -2,6 +2,7 @@
  * L1 Gateway tools — scheduling and dispatch only.
  * Gateway NEVER touches files or runs shell commands directly.
  */
+import { randomUUID } from 'crypto'
 import type { Tool } from '../Tool.js'
 import { getMemoryTool } from '../memory/auto-memory.js'
 import { getSkillCreateTool } from '../skills/skill_create.js'
@@ -101,7 +102,7 @@ export function getGatewayTools(ctx: GatewayContext): Tool[] {
         if (!validateCron(input.trigger)) {
           return { content: [{ type: 'text', text: `无效的 cron 表达式: "${input.trigger}"。请使用 5 段标准格式，如 "0 9 * * *"。` }] }
         }
-        const id = `sched_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+        const id = `sched_${randomUUID()}`
         const entry: ScheduleEntry = {
           id,
           text: input.text,
@@ -163,7 +164,7 @@ export function getGatewayTools(ctx: GatewayContext): Tool[] {
     },
     {
       name: 'dispatch_task',
-      description: 'Dispatch a task to a CLI instance for execution',
+      description: 'Dispatch a task to a CLI instance for execution. Use this whenever the user asks about current status, progress, results, or wants to check/inspect something. Do not just say you will check — actually call this tool.',
       input_schema: {
         type: 'object',
         properties: {
@@ -244,6 +245,10 @@ export function getGatewayTools(ctx: GatewayContext): Tool[] {
       checkPermissions: async () => ({ behavior: 'passthrough' as const }),
       execute: async (input: any) => {
         if (!ctx.browserAgent) return { content: [{ type: 'text', text: '浏览器代理未启用。请设置 HONE_BROWSER_ENABLED=true' }] }
+        // startUrl 必须是 http/https，防止 javascript:/file:/ 等危险协议被 LLM 注入
+        if (input.startUrl && !validateUrlProtocol(input.startUrl)) {
+          return { content: [{ type: 'text', text: `无效的 startUrl: "${input.startUrl}"。只允许 http/https 协议。` }] }
+        }
         const result = await ctx.browserAgent.executeTask({
           id: `browser_${Date.now()}`,
           profileName: input.profile || 'default',

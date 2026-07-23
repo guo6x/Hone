@@ -24,6 +24,11 @@ const GATEWAY_SYSTEM_PROMPT_BASE = `你是 Hone，用户的私人总管与最高
 
 当用户要求做代码/文件/命令相关操作时，必须使用 dispatch_task 分派给 CLI，禁止直接操作。
 
+**关键规则——不要只说空话：**
+- 当用户询问当前状态、进展、结果，或使用"检查一下"、"现在怎么样"、"怎么样了"、"看看"等表达时，**你必须调用 dispatch_task 让 CLI 真正去执行检查**，而不是只回复一句"我先检查一下"。
+- 如果用户没有指定具体检查项，调用 dispatch_task 时请让 CLI 检查：系统整体状态、日程任务、最近活动、以及用户可能关心的追踪项。
+- CLI 返回结果后，你要把结果总结成简洁的中文回复给用户。
+
 关于股票、基金、加密货币等投资话题：你可以基于公开信息进行分析、比较、趋势判断，并给出参考性观点。你的观点仅供用户参考，用户需自行决策，必要时可在回复末尾简短声明“仅供参考，不构成投资建议”。不要以“合规”“职责范围”等理由拒绝正常讨论。
 
 回复用中文，简洁、得体、有主人翁意识。`
@@ -173,10 +178,15 @@ export async function gatewayLLM(userMessage: string, providerTools?: ProviderTo
     const temperature = Number.isFinite(envTemp) && envTemp >= 0
       ? Math.min(envTemp, 0.5)
       : 0.3
+    // 工具调用需要足够的空间生成 tool_use JSON。
+    // 旧值 512 太小，DeepSeek 经常在生成 tool_use 块之前就达到长度上限，
+    // 导致 LLM 只返回 "我先检查一下" 这类半截文本，根本没有 tool_use 块。
+    // 推理模型（deepseek-v4-pro / o1）需要更大空间：reasoning_content 和 content 共享
+    // max_tokens，2048 常被推理消耗完导致 content 为空。默认 4096，上限 8192。
     const envMax = Number(process.env.HONE_MAX_TOKENS)
     const maxTokens = Number.isFinite(envMax) && envMax > 0
-      ? Math.min(envMax, 1024)
-      : 512
+      ? Math.min(envMax, 8192)
+      : 4096
 
     const history = buildHistory()
     const messages = [
@@ -185,7 +195,7 @@ export async function gatewayLLM(userMessage: string, providerTools?: ProviderTo
     ]
 
     const response = await provider.createMessage({
-      model: process.env.HONE_MODEL || process.env.DEEPSEEK_MODEL || 'deepseek-chat',
+      model: process.env.HONE_MODEL || process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro',
       messages,
       system: buildSystemPrompt(),
       maxTokens,
@@ -264,10 +274,21 @@ function extractText(response: any): string {
   if (response.content) {
     if (typeof response.content === 'string') return response.content
     if (Array.isArray(response.content)) {
-      return response.content
+      // 优先提取 text 内容
+      const textParts = response.content
         .filter((c: any) => c.type === 'text')
         .map((c: any) => c.text)
-        .join('\n')
+      const text = textParts.join('\n')
+      if (text.trim()) return text
+
+      // 推理模型（deepseek-v4-pro、o1 等）的 content 可能为空，
+      // reasoning_content 全部消耗了 max_tokens。fallback 到 thinking，
+      // 截断到 2000 字符防止上下文窗口过载。
+      const thinkingParts = response.content
+        .filter((c: any) => c.type === 'thinking')
+        .map((c: any) => c.thinking)
+      const thinking = thinkingParts.join('\n')
+      if (thinking.trim()) return '[思考中...]\n' + thinking.slice(0, 2000)
     }
   }
   return JSON.stringify(response)

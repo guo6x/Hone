@@ -937,12 +937,22 @@
     html = html.replace(/\*([^\*\n]+)\*/g, '<em>$1</em>');
     html = html.replace(/_([^_\n]+)_/g, '<em>$1</em>');
 
-    // links
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    // links — 校验协议，拒绝 javascript:/vbscript:/data:text/html 等 XSS 向量
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, text, url) => {
+      const trimmedUrl = String(url).trim();
+      const isSafe = /^(https?:|mailto:|tel:|ftp:|\/|#|\.)/i.test(trimmedUrl)
+        || !/^[a-z][a-z0-9+.\-]*:/i.test(trimmedUrl); // 允许相对路径（无协议）
+      if (!isSafe) return text; // 不安全协议：只显示文本，不渲染链接
+      return `<a href="${trimmedUrl}" target="_blank" rel="noopener">${text}</a>`;
+    });
 
     // plain image urls (data:image or http image)
     html = html.replace(/(https?:\/\/[^\s<>"]+\.(?:png|jpe?g|gif|webp|svg)(?:\?[^\s<>"]*)?)/gi, '<img src="$1" alt="image" loading="lazy">');
-    html = html.replace(/(data:image\/[a-zA-Z0-9+.-]+;base64,[A-Za-z0-9+/=]+)/g, '<img src="$1" alt="image">');
+    // data:image base64：限制 256KB 防止内存耗尽攻击
+    html = html.replace(/(data:image\/[a-zA-Z0-9+.-]+;base64,[A-Za-z0-9+/=]+)/g, (match, url) => {
+      if (url.length > 256 * 1024) return '[image too large]';
+      return `<img src="${url}" alt="image">`;
+    });
 
     // unordered lists (simple)
     html = html.replace(/(?:^|\n)([-*])\s+([^\n]*)/g, '<li class="md-li">$2</li>');

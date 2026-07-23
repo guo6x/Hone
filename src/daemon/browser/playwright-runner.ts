@@ -54,12 +54,17 @@ export async function getContext(
 
   const { chromium } = await import('playwright')
   const headless = opts.headless ?? config.headless
+  // 移除 --no-sandbox：桌面应用应使用 Chromium 默认沙箱隔离，防止恶意网页逃逸。
+  // 仅在容器环境（Docker/CI）下才需要 --no-sandbox，通过 HONE_BROWSER_NO_SANDBOX 环境变量启用。
+  const browserArgs: string[] = []
+  if (process.env.HONE_BROWSER_NO_SANDBOX === 'true' || process.env.HONE_BROWSER_NO_SANDBOX === '1') {
+    browserArgs.push('--no-sandbox', '--disable-setuid-sandbox')
+  }
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    args: browserArgs,
     viewport: { width: 1280, height: 800 },
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    // 移除硬编码 UA，使用 Playwright 内置的默认 UA（随 Chromium 版本更新）
   })
 
   contexts.set(profileName, context)
@@ -129,7 +134,10 @@ export async function navigate(
 ): Promise<BrowserState> {
   validateUrl(url)
   const page = await getPage(config, profileName)
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.defaultTimeout })
+  // 使用 'load' 而非 'domcontentloaded'，确保 JS 渲染的页面在截图时内容完整
+  await page.goto(url, { waitUntil: 'load', timeout: config.defaultTimeout })
+  // 额外等待 500ms 让动态 JS 渲染完成
+  await page.waitForTimeout(500)
 
   const title = await page.title()
   const screenshot = await page.screenshot({ type: 'jpeg', quality: config.screenshotQuality })
@@ -208,7 +216,8 @@ export async function executeAction(
     case 'navigate': {
       if (action.url) {
         validateUrl(action.url)
-        await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: config.defaultTimeout })
+        await page.goto(action.url, { waitUntil: 'load', timeout: config.defaultTimeout })
+        await page.waitForTimeout(500)
       }
       break
     }

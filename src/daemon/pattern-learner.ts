@@ -16,6 +16,7 @@
  */
 
 import * as fs from 'fs'
+import * as os from 'os'
 import * as path from 'path'
 
 // ── Types ──
@@ -114,9 +115,15 @@ function weekdayHistogram(entries: ActivityLogEntry[], type: string): Map<number
 
 /**
  * Find the key with the highest value in a histogram
+ *
+ * 返回值的 count 为 -1 表示输入 hist 为空（调用方应判断 count < 0）。
+ * 默认 key 为 -1 而非 0，避免空数据被误判为"凌晨 0 点有活动"。
  */
 function findPeak(hist: Map<number, number>): { key: number; count: number } {
-  let bestKey = 0
+  if (hist.size === 0) {
+    return { key: -1, count: -1 }
+  }
+  let bestKey = -1
   let bestCount = -1
   for (const [k, c] of hist) {
     if (c > bestCount) {
@@ -162,8 +169,16 @@ export function detectPatterns(logs?: ActivityLogEntry[]): DetectedPattern[] {
       'cli_session'
     )
     const peak = findPeak(hist)
-    if (peak.count >= 3) {
-      const confidence = Math.min(0.9, peak.count / cliStarts.length + dataAgeDays / 30)
+    if (peak.count >= 3 && peak.key >= 0) {
+      // 置信度公式修正：
+      // - 主因子：模式强度（peak.count / total），表示峰值的稳定性 [0,1]
+      // - 辅助因子：数据年龄（最多加 0.15，覆盖 30 天数据 +0.15）
+      // - 总上限 0.9（保留人工确认空间）
+      // 原公式 `peak.count / cliStarts.length + dataAgeDays / 30` 中 dataAgeDays/30 无上限，
+      // 数据年龄 27 天时已逼近 0.9，导致置信度几乎完全由年龄决定。
+      const patternStrength = peak.count / cliStarts.length
+      const ageBonus = Math.min(0.15, dataAgeDays / 30 * 0.15)
+      const confidence = Math.min(0.9, patternStrength * 0.85 + ageBonus)
       patterns.push({
         type: 'work_start_time',
         description: `用户通常在 ${peak.key}:00 开始工作`,
@@ -187,20 +202,29 @@ export function detectPatterns(logs?: ActivityLogEntry[]): DetectedPattern[] {
   if (deployActions.length >= 3) {
     const dayHist = weekdayHistogram(deployActions, 'tool_call')
     const peak = findPeak(dayHist)
-    const weekdayNames = ['日', '一', '二', '三', '四', '五', '六']
-    patterns.push({
-      type: 'deployment_day',
-      description: `用户经常在周${weekdayNames[peak.key]}进行部署`,
-      confidence: Math.min(0.7, deployActions.length / 5 + dataAgeDays / 30),
-      evidence: deployActions.slice(0, 3).map(e =>
-        `  ${new Date(e.ts).toISOString()} — ${e.detail.slice(0, 80)}`
-      ),
-      suggestedSchedule: {
-        text: `每${weekdayNames[peak.key] === '日' || weekdayNames[peak.key] === '六' ? '个工作日' : '周' + weekdayNames[peak.key]}部署提醒`,
-        task: '检查部署状态并通知',
-        cron: `0 10 * * ${peak.key}`,
-      },
-    })
+    // peak.key 可能是 -1（hist 为空时）
+    if (peak.key >= 0) {
+      const weekdayNames = ['日', '一', '二', '三', '四', '五', '六']
+      // 置信度公式修正：原公式 deployActions.length/5 无上限（>5 时 >1），
+      // 加 dataAgeDays/30 后被 Math.min(0.7) 限制，几乎总是 0.7。
+      // 改为：主因子 = peak 占比，辅因子 = 数据年龄
+      const patternStrength = peak.count / deployActions.length
+      const ageBonus = Math.min(0.1, dataAgeDays / 30 * 0.1)
+      const confidence = Math.min(0.7, patternStrength * 0.6 + ageBonus)
+      patterns.push({
+        type: 'deployment_day',
+        description: `用户经常在周${weekdayNames[peak.key]}进行部署`,
+        confidence,
+        evidence: deployActions.slice(0, 3).map(e =>
+          `  ${new Date(e.ts).toISOString()} — ${e.detail.slice(0, 80)}`
+        ),
+        suggestedSchedule: {
+          text: `每${weekdayNames[peak.key] === '日' || weekdayNames[peak.key] === '六' ? '个工作日' : '周' + weekdayNames[peak.key]}部署提醒`,
+          task: '检查部署状态并通知',
+          cron: `0 10 * * ${peak.key}`,
+        },
+      })
+    }
   }
 
   // Pattern 3: Common projects (detect frequently used directories)

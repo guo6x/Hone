@@ -2,7 +2,7 @@
 ; Uses NSIS 3.08 (already installed) instead of Tauri's auto-downloaded 3.11
 
 !define APP_NAME "Hone"
-!define APP_VERSION "0.3.0-alpha"
+!define APP_VERSION "2.1.90"
 !define APP_PUBLISHER "Hone"
 !define APP_EXE "hone-desktop.exe"
 !define APP_ID "dev.hone.desktop"
@@ -41,6 +41,10 @@ RequestExecutionLevel user
 ; Installer Section
 Section "Install"
   SetOutPath "$INSTDIR"
+  
+  ; 强制覆盖已存在的文件，避免旧版本 cli.js / node.exe 等残留导致用户
+  ; 重装后仍运行旧代码。
+  SetOverwrite on
   
   ; Main executable
   File "target\release\${APP_EXE}"

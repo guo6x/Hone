@@ -116,8 +116,11 @@ function parseNL(text: string): NLResult {
       const timeMatch = lower.match(/(\d+)\s*[点:：]\s*(\d+)?|at\s+(\d+)(?::(\d+))?\s*(am|pm)?/);
       let hour = 9, minute = 0;
       if (timeMatch) {
-        hour = parseInt(timeMatch[1] || timeMatch[3], 10);
-        minute = parseInt(timeMatch[2] || timeMatch[4] || '0', 10);
+        // parseInt 可能返回 NaN（capture group 未匹配且无默认值），需检查
+        const parsedHour = parseInt(timeMatch[1] || timeMatch[3] || '', 10);
+        const parsedMinute = parseInt(timeMatch[2] || timeMatch[4] || '0', 10);
+        if (!Number.isNaN(parsedHour)) hour = parsedHour;
+        if (!Number.isNaN(parsedMinute)) minute = parsedMinute;
         const ampm = timeMatch[5];
         if (ampm === 'pm' && hour < 12) hour += 12;
         if (ampm === 'am' && hour === 12) hour = 0;
@@ -131,8 +134,10 @@ function parseNL(text: string): NLResult {
     const timeMatch = lower.match(/(\d+)\s*[点:：]\s*(\d+)?|at\s+(\d+)(?::(\d+))?\s*(am|pm)?/);
     let hour = 9, minute = 0;
     if (timeMatch) {
-      hour = parseInt(timeMatch[1] || timeMatch[3], 10);
-      minute = parseInt(timeMatch[2] || timeMatch[4] || '0', 10);
+      const parsedHour = parseInt(timeMatch[1] || timeMatch[3] || '', 10);
+      const parsedMinute = parseInt(timeMatch[2] || timeMatch[4] || '0', 10);
+      if (!Number.isNaN(parsedHour)) hour = parsedHour;
+      if (!Number.isNaN(parsedMinute)) minute = parsedMinute;
       const ampm = timeMatch[5];
       if (ampm === 'pm' && hour < 12) hour += 12;
       if (ampm === 'am' && hour === 12) hour = 0;
@@ -144,8 +149,10 @@ function parseNL(text: string): NLResult {
   // "早上8点", "下午3点半", "每天9:30", "at 9:30am"
   m = lower.match(/(\d+)\s*[点:：]\s*(\d+)?\s*(半)?|(?:at\s+)?(\d+)(?::(\d+))?\s*(am|pm)/);
   if (m) {
-    let hour = parseInt(m[1] || m[4], 10);
-    let minute = m[3] ? 30 : parseInt(m[2] || m[5] || '0', 10);
+    // parseInt NaN 防护：capture group 未匹配时回退到默认值
+    const parsedHour = parseInt(m[1] || m[4] || '', 10);
+    let hour = Number.isNaN(parsedHour) ? 9 : parsedHour;
+    let minute = m[3] ? 30 : (parseInt(m[2] || m[5] || '0', 10) || 0);
     const ampm = m[6];
     // Chinese time-of-day context
     if (/下午|傍晚/.test(lower) && hour < 12) hour += 12;

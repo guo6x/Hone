@@ -22,6 +22,10 @@ pub struct PtySession {
     /// reliable way to reap it. Cloned from the child before the child is moved
     /// into the reader thread.
     pub killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    /// 直接子进程的 PID。close 时用 taskkill /T /F 递归杀整个进程树，
+    /// 避免 k.kill()（只杀直接子进程）导致孙进程继续持有 pty slave 写端，
+    /// reader 的 read() 不返回 EOF → reader 线程泄漏 → 孙进程变孤儿。
+    pub child_pid: Option<u32>,
 }
 
 #[derive(Default)]
@@ -45,16 +49,16 @@ impl PtyManager {
         rows: u16,
         env: Vec<(String, String)>,
     ) -> Result<(), String> {
-        // Idempotent: if a session with this id already exists, do nothing.
-        // Without this, a page reload or re-mount of the XtermPanel would spawn
-        // a second node.exe under the same key, orphaning the first.
-        {
-            let sessions = self.sessions.lock().map_err(|e| format!("lock: {}", e))?;
-            if sessions.contains_key(&id) {
-                log::info!("pty_open: session {} already exists, skipping spawn", id);
-                return Ok(());
-            }
+        // 持锁贯穿整个 spawn 流程，避免两个并发 open 同 id 都通过 contains_key
+        // 检查后各自 spawn 一个进程，导致第一个变成孤儿（React StrictMode / 组件
+        // remount / XtermPanel 快速重新打开都会触发）。
+        // openpty + spawn_command 是同步的，但通常 < 50ms，不会显著阻塞其他锁竞争者。
+        let mut sessions = self.sessions.lock().map_err(|e| format!("lock: {}", e))?;
+        if sessions.contains_key(&id) {
+            log::info!("pty_open: session {} already exists, skipping spawn", id);
+            return Ok(());
         }
+
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -81,6 +85,8 @@ impl PtyManager {
         // Take an independent killer BEFORE moving `child` into the reader thread.
         // Without this we'd have no way to reach the child from close().
         let killer = child.clone_killer();
+        // 记录 PID 用于 close 时 taskkill /T 递归杀进程树
+        let child_pid = child.process_id();
 
         let writer = pair
             .master
@@ -124,11 +130,9 @@ impl PtyManager {
             writer: Arc::new(Mutex::new(writer)),
             master: Arc::new(Mutex::new(pair.master)),
             killer: Arc::new(Mutex::new(killer)),
+            child_pid,
         };
-        self.sessions
-            .lock()
-            .map_err(|e| format!("lock: {}", e))?
-            .insert(id, session);
+        sessions.insert(id, session);
         Ok(())
     }
 
@@ -157,9 +161,7 @@ impl PtyManager {
         // On Windows ConPTY this is the only reliable way to reap node.exe;
         // dropping the master alone leaves a zombie in some scenarios.
         if let Some(session) = sessions.remove(id) {
-            if let Ok(mut k) = session.killer.lock() {
-                let _ = k.kill();
-            }
+            kill_pty_process_tree(&session);
         }
         Ok(())
     }
@@ -168,10 +170,39 @@ impl PtyManager {
     pub fn close_all(&self) {
         if let Ok(mut sessions) = self.sessions.lock() {
             for (_, session) in sessions.drain() {
-                if let Ok(mut k) = session.killer.lock() {
-                    let _ = k.kill();
-                }
+                kill_pty_process_tree(&session);
             }
         }
+    }
+}
+
+/// 递归杀 PTY 进程树。
+/// k.kill() 只杀直接子进程，孙进程会继续持有 pty slave 写端导致 reader 不返回 EOF。
+/// Windows 用 taskkill /T /F 递归杀整个进程树；其他平台先 k.kill() 再用 pkill -P。
+fn kill_pty_process_tree(session: &PtySession) {
+    // Windows: taskkill /T /F /PID <pid> 递归杀进程树
+    #[cfg(windows)]
+    {
+        if let Some(pid) = session.child_pid {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .output();
+            return;
+        }
+    }
+    // Unix: 先杀直接子进程，再用 pkill -P 递归杀孙进程
+    #[cfg(unix)]
+    {
+        if let Some(pid) = session.child_pid {
+            let _ = std::process::Command::new("pkill")
+                .args(["-9", "-P", &pid.to_string()])
+                .output();
+        }
+    }
+    // Fallback：用 portable-pty 的 killer（只杀直接子进程）
+    if let Ok(mut k) = session.killer.lock() {
+        let _ = k.kill();
     }
 }

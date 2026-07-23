@@ -113,10 +113,15 @@ impl MdnsDiscovery {
                 }
             }
 
-            // Shutdown the daemon when done
-            if let Err(e) = daemon.shutdown() {
-                log::warn!("Error shutting down mDNS daemon: {}", e);
-            }
+            // Shutdown the daemon when done.
+            // daemon.shutdown() 是阻塞 I/O（join 内部线程），在 async task 中
+            // 直接调用会阻塞 tokio worker。用 spawn_blocking 包裹避免阻塞。
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = daemon.shutdown() {
+                    log::warn!("Error shutting down mDNS daemon: {}", e);
+                }
+            })
+            .await;
         });
 
         Ok(rx)
