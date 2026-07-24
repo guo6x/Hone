@@ -44,8 +44,9 @@ export function createOpenAIProvider(config?: { apiKey?: string; baseUrl?: strin
       const body: any = {
         model,
         messages,
-        max_tokens: params.maxTokens || 4096,
+        max_tokens: params.maxTokens || 16384,
         temperature: params.temperature ?? 0.7,
+        top_p: params.topP ?? undefined,
       }
 
       if (params.tools?.length) {
@@ -133,8 +134,9 @@ export function createOpenAIProvider(config?: { apiKey?: string; baseUrl?: strin
       const body: any = {
         model,
         messages,
-        max_tokens: params.maxTokens || 4096,
+        max_tokens: params.maxTokens || 16384,
         temperature: params.temperature ?? 0.7,
+        top_p: params.topP ?? undefined,
         stream: true,
       }
 

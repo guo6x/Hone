@@ -194,12 +194,16 @@ export async function gatewayLLM(userMessage: string, providerTools?: ProviderTo
       { role: 'user' as const, content: userMessage },
     ]
 
+    // 推理模型（deepseek-v4-pro）默认开启 full thinking。
+    // 默认 thinking_budget=32768，temperature=1.0，top_p=1.0（DeepSeek 官方推荐）。
+    // Gateway 意图分类不需要最大推理力度，故 reasoningEffort 留空走 provider 默认。
     const response = await provider.createMessage({
       model: process.env.HONE_MODEL || process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro',
       messages,
       system: buildSystemPrompt(),
       maxTokens,
       temperature,
+      enableThinking: true,
       tools: providerTools,
       toolChoice: providerTools ? 'auto' : undefined,
     })

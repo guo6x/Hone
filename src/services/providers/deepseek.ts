@@ -17,7 +17,7 @@ export function createDeepSeekProvider(): AIProvider {
   const defaultModel =
     process.env.HONE_DEEPSEEK_MODEL ||
     process.env.DEEPSEEK_MODEL ||
-    'deepseek-chat'
+    'deepseek-v4-pro'
 
   return {
     name: 'DeepSeek',
@@ -39,11 +39,29 @@ export function createDeepSeekProvider(): AIProvider {
         })),
       ]
 
+      // 推理模型（deepseek-v4-pro）需要的 token 预算远大于非推理模型。
+      // 思考 token 和输出 token 共享 max_tokens 配额，4096 在思考阶段就被耗尽。
+      // 默认 65536 保证充足推理空间；非推理调用方（如 Gateway 意图分类）会传入自有的 maxTokens。
+      const isReasoningModel = model.includes('v4-pro') || model.includes('reasoner')
       const body: any = {
         model,
         messages,
-        max_tokens: params.maxTokens || 4096,
-        temperature: params.temperature ?? 0.7,
+        max_tokens: params.maxTokens || (isReasoningModel ? 65536 : 16384),
+        temperature: params.temperature ?? (isReasoningModel ? 1.0 : 0.7),
+        top_p: params.topP ?? (isReasoningModel ? 1.0 : undefined),
+      }
+
+      // 推理模式：DeepSeek v4-pro 的 enable_thinking + thinking_budget
+      if (isReasoningModel) {
+        if (params.enableThinking !== false) {
+          body.enable_thinking = true
+          body.thinking_budget = params.thinkingBudget || 32768
+          if (params.reasoningEffort) {
+            body.reasoning_effort = params.reasoningEffort
+          }
+        } else {
+          body.enable_thinking = false
+        }
       }
 
       // 工具调用
@@ -127,12 +145,27 @@ export function createDeepSeekProvider(): AIProvider {
         })),
       ]
 
+      // 推理模型默认值对齐 createMessage
+      const isReasoningModel = model.includes('v4-pro') || model.includes('reasoner')
       const body: any = {
         model,
         messages,
-        max_tokens: params.maxTokens || 4096,
-        temperature: params.temperature ?? 0.7,
+        max_tokens: params.maxTokens || (isReasoningModel ? 65536 : 16384),
+        temperature: params.temperature ?? (isReasoningModel ? 1.0 : 0.7),
+        top_p: params.topP ?? (isReasoningModel ? 1.0 : undefined),
         stream: true,
+      }
+
+      if (isReasoningModel) {
+        if (params.enableThinking !== false) {
+          body.enable_thinking = true
+          body.thinking_budget = params.thinkingBudget || 32768
+          if (params.reasoningEffort) {
+            body.reasoning_effort = params.reasoningEffort
+          }
+        } else {
+          body.enable_thinking = false
+        }
       }
 
       if (params.tools?.length) {

@@ -23,6 +23,13 @@ export interface CreateMessageParams {
   system?: string
   maxTokens?: number
   temperature?: number
+  topP?: number
+  /** DeepSeek v4-pro 推理模式：enable_thinking 开启思维链 */
+  enableThinking?: boolean
+  /** DeepSeek v4-pro 推理预算（token 数），与 maxTokens 共享上下文窗口 */
+  thinkingBudget?: number
+  /** OpenAI 风格推理力度：none | low | medium | high | max */
+  reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'max'
   tools?: ProviderTool[]
   toolChoice?: 'auto' | 'required' | 'none' | { type: 'function'; function: { name: string } }
 }
